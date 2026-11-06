@@ -147,7 +147,7 @@ export default {
         id: 'nav',
         area: SIDEBAR_NAV_AREA,
         order: 40,
-        data: { path: ROUTE, label: 'Butler', codicon: 'walktown' }
+        data: { path: ROUTE, label: 'Butler', codicon: 'project' }
       },
       {
         id: 'open',
