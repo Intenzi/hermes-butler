@@ -15,6 +15,9 @@ import time
 import uuid
 
 from butler_core import capture as bp_capture
+from butler_core import overlay as bp_overlay
+
+_OVERLAY = bp_overlay.Overlay()
 
 DATA_DIR = None
 DEFAULT_POLL = 1.5
@@ -115,6 +118,7 @@ def _poll_once(s):
         s["current_box"] = best["box"]
         s["current_label"] = best.get("label")
         s["overlay"] = "ringing"
+        bp_overlay._OVERLAY.publish(s)
     if verdict["verified"]:
         s["verifications"].append({"step": idx, "reason": verdict["reason"],
                                    "verified_at": time.time()})
@@ -127,6 +131,7 @@ def _poll_once(s):
         else:
             nxt = s["steps"][idx]
             s["state"]["say"] = nxt["say"]
+        bp_overlay._OVERLAY.publish(s)
         return
     opened_at = s["state"].get("opened_at") or s["steps"][0].get("_t0") or time.time()
     if time.time() - opened_at > step_timeout():
@@ -161,6 +166,8 @@ def guide_start(args, unattended=False):
         if _thread is None or not _thread.is_alive():
             _thread = threading.Thread(target=_loop, name="butler-poll", daemon=True)
             _thread.start()
+        ok, detail = bp_overlay._OVERLAY.start()
+        guide["overlay"] = ("unavailable:%s" % detail) if not ok else "ringing"
         first = bp_capture.capture(max_elements=120, depth=8)
         best = bp_capture.best_match(first.get("elements", []), steps[0]["find"]["label"],
                                      steps[0]["find"].get("role"))
@@ -199,6 +206,7 @@ def guide_stop(reason="stopped"):
         _session["state"]["note"] = reason
         _session["current_box"] = None
         stopped = dict(_session)
+        bp_overlay._OVERLAY.quit()
         stopped["overlay"] = "stopped"
         _save_session()
         _session = None
