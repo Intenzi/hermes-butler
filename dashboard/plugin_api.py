@@ -5,14 +5,12 @@
 """
 from __future__ import annotations
 
-import logging
 import json
 import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter
-
 
 
 router = APIRouter()
@@ -31,10 +29,12 @@ def _read_state() -> dict[str, Any]:
         if not path.exists():
             continue
         try:
-            with open(path) as f:
-                return json.load(f)
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
         except Exception:
             continue
+        if isinstance(data, dict):
+            return data
     return {}
 
 
