@@ -7,7 +7,7 @@ coordinates for the butler's element-list format.
 import re
 import tempfile
 
-from butler_core import capture as bp_capture
+from . import capture as bp_capture
 
 def _quartz():
     try:
@@ -23,6 +23,18 @@ def preflight_screen_record():
     if q is None:
         return False
     try:
+        return bool(q.CGPreflightScreenCaptureAccess())
+    except Exception:
+        return False
+
+
+def request_screen_record():
+    """Pop macOS' Screen Recording grant dialog. Returns preflight after asking."""
+    q = _quartz()
+    if q is None:
+        return False
+    try:
+        q.CGRequestScreenCaptureAccess()
         return bool(q.CGPreflightScreenCaptureAccess())
     except Exception:
         return False

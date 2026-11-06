@@ -14,8 +14,8 @@ import threading
 import time
 import uuid
 
-from butler_core import capture as bp_capture
-from butler_core import overlay as bp_overlay
+from . import capture as bp_capture
+from . import overlay as bp_overlay
 
 _OVERLAY = bp_overlay.Overlay()
 

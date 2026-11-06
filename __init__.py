@@ -8,9 +8,9 @@ import json
 import logging
 import os
 
-from butler_core import capture as bp_capture
-from butler_core import doctor as bp_doctor
-from butler_core import engine as bp_engine
+from .butler_core import capture as bp_capture
+from .butler_core import doctor as bp_doctor
+from .butler_core import engine as bp_engine
 
 logger = logging.getLogger("hermes.plugins.butler")
 
@@ -113,6 +113,31 @@ def tool_stop(args, **kwargs):
         return _out({"error": str(exc)})
 
 
+def butler_cli_setup(parser):
+    sub = parser.add_subparsers(dest="butler_cmd", required=True)
+    doc = sub.add_parser("doctor", help="grants, overlay build, OCR availability")
+    doc.add_argument("--ask", action="store_true",
+                     help="raise the macOS grant dialogs and deep-link the settings panes")
+    cap = sub.add_parser("capture", help="element list of the focused app")
+    cap.add_argument("target", nargs="?", help="optional app name substring")
+    sub.add_parser("status", help="current guide status")
+
+
+def butler_cli_command(args, **kwargs):
+    """Runtime handler for `hermes butler <sub>`."""
+    import json as _json
+    cmd = (getattr(args, "butler_cmd", "") or "").split()
+    sub = cmd[0] if cmd else ""
+    rest = cmd[1:]
+    if sub == "doctor":
+        return _json.dumps(bp_doctor.report(ask=bool(getattr(args, "ask", False))), ensure_ascii=False)
+    if sub == "capture":
+        return _json.dumps(bp_capture.capture(target=(rest[0] if rest else None)), ensure_ascii=False)
+    if sub == "status":
+        return _json.dumps(bp_engine.guide_status(), ensure_ascii=False)
+    return "unknown butler command: %s" % sub
+
+
 def cli_butler(args: str, **kwargs):
     """hermes butler capture|status|doctor [target...]"""
     parts = (args or "").split()
@@ -139,8 +164,10 @@ def register(ctx):
                       handler=tool_capture, description="Element list (roles, labels, boxes) of a focused or named app's screen.", emoji="👁")
     ctx.register_tool(name="butler_stop", toolset="butler", schema=STOP_SCHEMA,
                       handler=tool_stop, description="End the active butler guide.", emoji="🎩")
-    ctx.register_cli_command(name="butler", handler=cli_butler,
-                             description="Butler guide status / capture / doctor")
+    ctx.register_cli_command(
+        name="butler", help="Butler guide status / capture / doctor",
+        setup_fn=butler_cli_setup,
+        handler_fn=butler_cli_command)
     try:
         bp_engine.init(ctx.plugin_data_dir())
     except Exception:

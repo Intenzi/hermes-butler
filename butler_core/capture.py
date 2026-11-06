@@ -29,6 +29,17 @@ def trusted():
     return bool(AS.AXIsProcessTrusted())
 
 
+def _ask_accessibility():
+    """Pop macOS' own Accessibility grant dialog for this process. Best-effort."""
+    if not HAS_MAC:
+        return False
+    try:
+        opts = {AS.kAXTrustedCheckOptionPrompt: True}
+        return bool(AS.AXIsProcessTrustedWithOptions(opts))
+    except Exception:
+        return False
+
+
 def _window_count(app):
     try:
         return len(app.windows())
@@ -138,9 +149,15 @@ def capture(target=None, max_elements=DEFAULT_MAX, depth=DEFAULT_DEPTH):
     result = {"trusted": trusted(), "app": None, "window": None,
               "count": 0, "with_box": 0, "elements": []}
     if not result["trusted"]:
+        prompted = _ask_accessibility()
+        if prompted:
+            # a dialog requires a user click; this call stays empty this round
+            result["trusted"] = trusted()
+        result["prompted"] = prompted
+    if not result["trusted"]:
         result["note"] = "Accessibility not granted to this process"
-        result["fix"] = ("System Settings > Privacy & Security > Accessibility: "
-                         "grant to the host process running Hermes; run `hermes butler doctor` after granting")
+        result["fix"] = ("A system dialog was raised (or use `hermes butler doctor --ask`). "
+                         "After granting, restart the Hermes host process.")
         return result
     pid, name = find_running_app(target)
     if pid is None:
