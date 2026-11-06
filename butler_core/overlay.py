@@ -22,7 +22,7 @@ def binary_path():
     return os.path.join(here, "services", "ButlerOverlay")
 
 
-def binarY_source_path():
+def binary_source_path():
     return os.path.join(os.path.dirname(__file__), "overlay_swift", "ButlerOverlay.swift")
 
 
@@ -31,7 +31,7 @@ def build_if_needed():
     exe = binary_path()
     if os.path.exists(exe) and os.access(exe, os.X_OK):
         return True, "present"
-    src = binarY_source_path()
+    src = binary_source_path()
     if not os.path.exists(src):
         return False, "source_missing"
     if shutil.which("swiftc") is None:
