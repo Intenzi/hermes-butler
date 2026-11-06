@@ -15,10 +15,12 @@ import {
   PALETTE_AREA,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
+  cn,
   host,
   useQuery
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
+import { useEffect } from 'react'
 
 const ID = 'butler'
 const ROUTE = '/butler'
@@ -26,6 +28,8 @@ const REFRESH_MS = 1500
 const VERIFIED_CHIP_LIMIT = 6
 
 let rest = null
+let petCtx = null
+let lastSaid = null
 
 function h(type, props, ...children) {
   let key = undefined
@@ -121,6 +125,19 @@ function ButlerApp() {
   const currentLabel = asText(guide && guide.current_label)
 
   const sayLine = asText(step && step.say) || asText(state.say)
+
+  // Pet speech bubble: speak each step's say-line exactly once via ctx.pet.say.
+  // The Hermes pet canvas is app-owned; plugins only get the bubble API.
+  useEffect(() => {
+    const text = sayLine
+    if (!text || text === lastSaid) return
+    lastSaid = text
+    try {
+      if (petCtx && typeof petCtx.say === 'function') {
+        petCtx.say(text, { tone: 'info' })
+      }
+    } catch (err) { /* pet not visible or bubble api unavailable */ }
+  }, [sayLine])
   const stallNote = asText(state.note) || (stalled
     ? `Step ${currentStep + 1} is still unverified. The butler is waiting on the OS layer; ask the agent to revise or skip this step.`
     : overlay && overlay.startsWith('unavailable')
@@ -206,6 +223,7 @@ export default {
   defaultEnabled: true,
   register(ctx) {
     rest = ctx.rest
+    try { petCtx = ctx.pet || null } catch (err) { petCtx = null }
     ctx.registerMany([
       {
         id: 'page',

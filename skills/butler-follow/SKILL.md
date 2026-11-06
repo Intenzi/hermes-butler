@@ -30,8 +30,14 @@ before advancing.
   "open settings", but "Click Network".
 - `find.label`: the exact expected control text; fall back with a second
   short guide if the capture reports a stall.
+- Launch steps ("open System Settings first"): use `"find": {}` with no
+  label - a hands-off step. The butler does not ring anything; it verifies
+  the transition through `expect` (`{"app": "System Settings"}`) once the app
+  is actually open. Never hunt for app icons inside other apps' windows.
 - `expect`: any observable change; `{"app": "System Settings"}` for app opens,
-  `{"visible": "..."}` for panes, `{"focus":"..."}` for selection changes.
+  `{"visible": "..."}` for panes, `{"focus": "..."}` for selection changes.
+- Status `capture_failed`: the OS read itself failed (missing grant). Fix the
+  grant (doctor --ask) and restart; do NOT rewrite the plan.
 - If `butler_guide_status` reports stalled: rewrite the stalled step with a
   better `find.label` and start a fresh short guide; never repeat the same
   failing step verbatim.

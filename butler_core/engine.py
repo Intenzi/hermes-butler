@@ -109,8 +109,17 @@ def _poll_once(s):
     idx = s["state"]["idx"]
     step = s["steps"][idx]
     snap = bp_capture.capture(max_elements=200, depth=12)
-    best = bp_capture.best_match(snap.get("elements", []), step["find"]["label"],
-                                 step["find"].get("role"))
+    if snap.get("error") or (snap.get("trusted") is False):
+        s["state"] = dict(s["state"], status="capture_failed")
+        s["capture_note"] = snap.get("note") or snap.get("error")
+        s["fix"] = snap.get("fix")
+        return
+    find = step.get("find") or {}
+    label_needle = find.get("label")
+    best = None
+    if label_needle:
+        best = bp_capture.best_match(snap.get("elements", []), label_needle,
+                                     find.get("role"))
     verdict = bp_capture.expect_pending(step.get("expect") or {}, snap, best)
     s["last_capture_app"] = snap.get("app")
     s["last_captured_at"] = time.time()
@@ -119,6 +128,11 @@ def _poll_once(s):
         s["current_label"] = best.get("label")
         s["overlay"] = "ringing"
         _OVERLAY.publish(s)
+    elif not label_needle:
+        # hands-off step (e.g. open an app): nothing to ring, just verify
+        s["current_box"] = None
+        s["current_label"] = None
+        s["overlay"] = "waiting"
     if verdict["verified"]:
         s["verifications"].append({"step": idx, "reason": verdict["reason"],
                                    "verified_at": time.time()})
@@ -169,7 +183,16 @@ def guide_start(args, unattended=False):
         ok, detail = _OVERLAY.start()
         guide["overlay"] = ("unavailable:%s" % detail) if not ok else "ringing"
         first = bp_capture.capture(max_elements=200, depth=12)
-        best = bp_capture.best_match(first.get("elements", []), steps[0]["find"]["label"],
+        if first.get("error") or (first.get("trusted") is False):
+            guide["state"] = dict(guide["state"], status="capture_failed")
+            guide["capture_note"] = first.get("note") or first.get("error")
+            guide["fix"] = first.get("fix")
+            _save_session()
+            _write_state()
+            return {"guide_id": guide["id"], "title": guide["title"],
+                    "state": guide["state"], "capture_note": guide["capture_note"],
+                    "fix": guide["fix"], "total_steps": len(steps)}
+        best = bp_capture.best_match(first.get("elements", []), steps[0]["find"].get("label"),
                                      steps[0]["find"].get("role"))
         guide["last_capture_app"] = first.get("app")
         if best is not None and best.get("box"):

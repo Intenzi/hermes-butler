@@ -1,0 +1,34 @@
+{
+ "id": "352c634dbe",
+ "title": "Guide",
+ "steps": [
+  {
+   "expect": {
+    "app": "System Settings"
+   },
+   "find": {
+    "app": "System Settings"
+   },
+   "say": "Open System Settings (Spotlight or Apple menu > System Settings)"
+  },
+  {
+   "expect": {
+    "visible": "Network"
+   },
+   "find": {
+    "label": "Network"
+   },
+   "say": "Click Network in the sidebar"
+  }
+ ],
+ "state": {
+  "idx": 0,
+  "status": "stopped",
+  "say": "Open System Settings (Spotlight or Apple menu > System Settings)",
+  "note": "stopped by agent"
+ },
+ "verifications": [],
+ "overlay": "ringing",
+ "started_at": 1793971207.088516,
+ "current_box": null
+}
