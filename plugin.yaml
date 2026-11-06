@@ -1,0 +1,34 @@
+name: butler
+version: 0.1.0
+description: >
+  Butler — a Follow-mode guide for Hermes: the agent plans, the butler walks
+  your screen step by step (ring on the real control, one-line bubbles, live
+  progress), verifying each step from the macOS Accessibility layer. macOS in
+  v1; capture and overlay are swappable modules for later platforms.
+requires_hermes: ">=0.22.5"
+provides_tools:
+  - butler_guide_start
+  - butler_guide_status
+  - butler_capture
+  - butler_stop
+provides_hooks: []
+config_schema:
+  guide_poll_seconds:
+    type: number
+    default: 1.5
+    description: How often the butler re-captures the screen while waiting on a step.
+  guide_step_timeout_seconds:
+    type: number
+    default: 120
+    description: How long a step stays open before the butler reports a stall.
+  overlay_enabled:
+    type: boolean
+    default: true
+    description: Spawn the click-through companion overlay for rings outside the Hermes window.
+  ocr_fallback_enabled:
+    type: boolean
+    default: true
+    description: Use on-device Apple Vision OCR when the AX tree is empty (Chromium tabs, canvas apps).
+python_dependencies:
+  - "pyobjc-core>=10.3,<12"
+  - "pyobjc>=10.3,<12; platform_system=='Darwin'"
