@@ -1,0 +1,251 @@
+{
+ "trusted": true,
+ "app": "Opera GX",
+ "window": "(1567) Discord | #\ud83d\udcdc\u250amemes | RIFT",
+ "count": 22,
+ "elements": [
+  {
+   "role": "AXWindow",
+   "label": "(1567) Discord | #\ud83d\udcdc\u250amemes | RIFT",
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 0
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    12,
+    44,
+    16,
+    16
+   ],
+   "id": 1
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    12,
+    67,
+    16,
+    16
+   ],
+   "id": 2
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    12,
+    90,
+    16,
+    16
+   ],
+   "id": 3
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    13,
+    91,
+    14,
+    14
+   ],
+   "id": 4
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    13,
+    91,
+    14,
+    14
+   ],
+   "id": 5
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 6
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 7
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 8
+  },
+  {
+   "role": "AXGroup",
+   "label": "Browser client",
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 9
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 10
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 11
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 12
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 13
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 14
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    41,
+    29,
+    1239,
+    803
+   ],
+   "id": 15
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    41,
+    29,
+    1239,
+    803
+   ],
+   "id": 16
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    41,
+    803
+   ],
+   "id": 17
+  },
+  {
+   "role": "AXGroup",
+   "label": "Browser sidebar",
+   "box": [
+    4,
+    137,
+    33,
+    679
+   ],
+   "id": 18
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    13,
+    45,
+    14,
+    60
+   ],
+   "id": 19
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    41,
+    66,
+    1239,
+    12
+   ],
+   "id": 20
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    41,
+    66,
+    4,
+    766
+   ],
+   "id": 21
+  }
+ ],
+ "with_box": 22
+}

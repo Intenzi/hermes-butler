@@ -1,0 +1,449 @@
+{
+ "trusted": true,
+ "app": "Safari",
+ "window": "Go | OpenCode",
+ "count": 40,
+ "elements": [
+  {
+   "role": "AXWindow",
+   "label": "Go | OpenCode",
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 0
+  },
+  {
+   "role": "AXSplitGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 1
+  },
+  {
+   "role": "AXTabGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 2
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    803
+   ],
+   "id": 3
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    -2,
+    27,
+    102,
+    56
+   ],
+   "id": 4
+  },
+  {
+   "role": "AXToolbar",
+   "label": null,
+   "box": [
+    0,
+    29,
+    1280,
+    52
+   ],
+   "id": 5
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    92,
+    29,
+    75,
+    52
+   ],
+   "id": 6
+  },
+  {
+   "role": "AXButton",
+   "label": "show sidebar",
+   "box": [
+    95,
+    36,
+    41,
+    38
+   ],
+   "id": 7
+  },
+  {
+   "role": "AXMenuButton",
+   "label": "Tab Group picker",
+   "box": [
+    134,
+    36,
+    20,
+    38
+   ],
+   "id": 8
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    167,
+    29,
+    81,
+    52
+   ],
+   "id": 9
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    170,
+    36,
+    75,
+    38
+   ],
+   "id": 10
+  },
+  {
+   "role": "AXButton",
+   "label": "Go back",
+   "box": [
+    171,
+    37,
+    36,
+    36
+   ],
+   "id": 11
+  },
+  {
+   "role": "AXButton",
+   "label": "Go forward",
+   "box": [
+    208,
+    37,
+    36,
+    36
+   ],
+   "id": 12
+  },
+  {
+   "role": "AXUnknown",
+   "label": "1Password",
+   "box": [
+    325,
+    29,
+    44,
+    52
+   ],
+   "id": 13
+  },
+  {
+   "role": "AXUnknown",
+   "label": "1Password",
+   "box": [
+    328,
+    36,
+    38,
+    38
+   ],
+   "id": 14
+  },
+  {
+   "role": "AXButton",
+   "label": "1Password",
+   "box": [
+    328,
+    36,
+    38,
+    38
+   ],
+   "id": 15
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    377,
+    29,
+    525,
+    52
+   ],
+   "id": 16
+  },
+  {
+   "role": "AXButton",
+   "label": "Page Menu",
+   "box": [
+    381,
+    41,
+    30,
+    29
+   ],
+   "id": 17
+  },
+  {
+   "role": "AXButton",
+   "label": "Add page to Reading List",
+   "box": [
+    403,
+    40,
+    24,
+    30
+   ],
+   "id": 18
+  },
+  {
+   "role": "AXTextField",
+   "label": "smart search field",
+   "box": [
+    404,
+    47,
+    463,
+    31
+   ],
+   "id": 19
+  },
+  {
+   "role": "AXButton",
+   "label": "Reload this page",
+   "box": [
+    873,
+    41,
+    23,
+    29
+   ],
+   "id": 20
+  },
+  {
+   "role": "AXButton",
+   "label": "Share",
+   "box": [
+    1155,
+    29,
+    41,
+    52
+   ],
+   "id": 21
+  },
+  {
+   "role": "AXButton",
+   "label": "New Tab",
+   "box": [
+    1196,
+    29,
+    37,
+    52
+   ],
+   "id": 22
+  },
+  {
+   "role": "AXButton",
+   "label": "new tab",
+   "box": [
+    1195,
+    36,
+    38,
+    38
+   ],
+   "id": 23
+  },
+  {
+   "role": "AXButton",
+   "label": "add",
+   "box": [
+    1195,
+    36,
+    38,
+    38
+   ],
+   "id": 24
+  },
+  {
+   "role": "AXButton",
+   "label": "Tab Overview",
+   "box": [
+    1233,
+    29,
+    43,
+    52
+   ],
+   "id": 25
+  },
+  {
+   "role": "AXOpaqueProviderGroup",
+   "label": "Tab bar, 3 tabs",
+   "box": [
+    0,
+    81,
+    1280,
+    38
+   ],
+   "id": 26
+  },
+  {
+   "role": "AXRadioButton",
+   "label": "My usage | Activity",
+   "box": [
+    8,
+    81,
+    421,
+    32
+   ],
+   "id": 27
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    150,
+    87,
+    20,
+    20
+   ],
+   "id": 28
+  },
+  {
+   "role": "AXStaticText",
+   "label": "My usage | Activity",
+   "box": [
+    172,
+    88,
+    116,
+    18
+   ],
+   "id": 29
+  },
+  {
+   "role": "AXRadioButton",
+   "label": "opencode where do i get my api key - Google Search",
+   "box": [
+    430,
+    81,
+    421,
+    32
+   ],
+   "id": 30
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    468,
+    87,
+    20,
+    20
+   ],
+   "id": 31
+  },
+  {
+   "role": "AXStaticText",
+   "label": "opencode where do i get my api key - Google Search",
+   "box": [
+    490,
+    88,
+    322,
+    18
+   ],
+   "id": 32
+  },
+  {
+   "role": "AXRadioButton",
+   "label": "Go | OpenCode",
+   "box": [
+    852,
+    81,
+    420,
+    32
+   ],
+   "id": 33
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    1004,
+    87,
+    20,
+    20
+   ],
+   "id": 34
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Go | OpenCode",
+   "box": [
+    1026,
+    88,
+    94,
+    18
+   ],
+   "id": 35
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    18,
+    47,
+    16,
+    16
+   ],
+   "id": 36
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    64,
+    47,
+    16,
+    16
+   ],
+   "id": 37
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    65,
+    48,
+    14,
+    14
+   ],
+   "id": 38
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    41,
+    47,
+    16,
+    16
+   ],
+   "id": 39
+  }
+ ],
+ "with_box": 40
+}

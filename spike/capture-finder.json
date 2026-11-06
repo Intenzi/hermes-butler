@@ -1,0 +1,2209 @@
+{
+ "trusted": true,
+ "app": "Finder",
+ "window": "logs",
+ "count": 200,
+ "elements": [
+  {
+   "role": "AXWindow",
+   "label": "logs",
+   "box": [
+    180,
+    110,
+    920,
+    464
+   ],
+   "id": 0
+  },
+  {
+   "role": "AXSplitGroup",
+   "label": null,
+   "box": [
+    180,
+    110,
+    920,
+    464
+   ],
+   "id": 1
+  },
+  {
+   "role": "AXScrollArea",
+   "label": null,
+   "box": [
+    188,
+    162,
+    139,
+    404
+   ],
+   "id": 2
+  },
+  {
+   "role": "AXOutline",
+   "label": "sidebar",
+   "box": [
+    187,
+    161,
+    141,
+    684
+   ],
+   "id": 3
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    162,
+    139,
+    32
+   ],
+   "id": 4
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    162,
+    119,
+    32
+   ],
+   "id": 5
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Recents",
+   "box": [
+    233,
+    169,
+    77,
+    18
+   ],
+   "id": 6
+  },
+  {
+   "role": "AXImage",
+   "label": "clock",
+   "box": [
+    206,
+    173,
+    22,
+    11
+   ],
+   "id": 7
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    194,
+    139,
+    32
+   ],
+   "id": 8
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    194,
+    119,
+    32
+   ],
+   "id": 9
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Shared",
+   "box": [
+    233,
+    201,
+    77,
+    18
+   ],
+   "id": 10
+  },
+  {
+   "role": "AXImage",
+   "label": "Shared Folder",
+   "box": [
+    203,
+    205,
+    25,
+    11
+   ],
+   "id": 11
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    239,
+    139,
+    19
+   ],
+   "id": 12
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    239,
+    119,
+    19
+   ],
+   "id": 13
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Favourites",
+   "box": [
+    203,
+    238,
+    121,
+    21
+   ],
+   "id": 14
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    258,
+    139,
+    32
+   ],
+   "id": 15
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    258,
+    119,
+    32
+   ],
+   "id": 16
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Applications",
+   "box": [
+    233,
+    265,
+    77,
+    18
+   ],
+   "id": 17
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    205,
+    269,
+    22,
+    11
+   ],
+   "id": 18
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    290,
+    139,
+    32
+   ],
+   "id": 19
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    290,
+    119,
+    32
+   ],
+   "id": 20
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Desktop",
+   "box": [
+    233,
+    297,
+    77,
+    18
+   ],
+   "id": 21
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    204,
+    301,
+    25,
+    11
+   ],
+   "id": 22
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    322,
+    139,
+    32
+   ],
+   "id": 23
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    322,
+    119,
+    32
+   ],
+   "id": 24
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Documents",
+   "box": [
+    233,
+    329,
+    77,
+    18
+   ],
+   "id": 25
+  },
+  {
+   "role": "AXImage",
+   "label": "document",
+   "box": [
+    207,
+    333,
+    20,
+    11
+   ],
+   "id": 26
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    354,
+    139,
+    32
+   ],
+   "id": 27
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    354,
+    119,
+    32
+   ],
+   "id": 28
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Downloads",
+   "box": [
+    233,
+    361,
+    77,
+    18
+   ],
+   "id": 29
+  },
+  {
+   "role": "AXImage",
+   "label": "Arrow Down Circle",
+   "box": [
+    206,
+    365,
+    22,
+    11
+   ],
+   "id": 30
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    399,
+    139,
+    19
+   ],
+   "id": 31
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    399,
+    119,
+    19
+   ],
+   "id": 32
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Locations",
+   "box": [
+    203,
+    398,
+    121,
+    21
+   ],
+   "id": 33
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    418,
+    139,
+    32
+   ],
+   "id": 34
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    418,
+    119,
+    32
+   ],
+   "id": 35
+  },
+  {
+   "role": "AXStaticText",
+   "label": "iCloud\u00a0Drive",
+   "box": [
+    233,
+    425,
+    77,
+    18
+   ],
+   "id": 36
+  },
+  {
+   "role": "AXImage",
+   "label": "iCloud",
+   "box": [
+    204,
+    429,
+    26,
+    11
+   ],
+   "id": 37
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    450,
+    139,
+    32
+   ],
+   "id": 38
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    450,
+    119,
+    32
+   ],
+   "id": 39
+  },
+  {
+   "role": "AXStaticText",
+   "label": "tenzi",
+   "box": [
+    233,
+    457,
+    77,
+    18
+   ],
+   "id": 40
+  },
+  {
+   "role": "AXImage",
+   "label": "home",
+   "box": [
+    204,
+    461,
+    26,
+    11
+   ],
+   "id": 41
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    482,
+    139,
+    32
+   ],
+   "id": 42
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    482,
+    119,
+    32
+   ],
+   "id": 43
+  },
+  {
+   "role": "AXStaticText",
+   "label": "AirDrop",
+   "box": [
+    233,
+    489,
+    77,
+    18
+   ],
+   "id": 44
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    205,
+    493,
+    23,
+    11
+   ],
+   "id": 45
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    514,
+    139,
+    32
+   ],
+   "id": 46
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    514,
+    119,
+    32
+   ],
+   "id": 47
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Bin",
+   "box": [
+    233,
+    521,
+    77,
+    18
+   ],
+   "id": 48
+  },
+  {
+   "role": "AXImage",
+   "label": "bin",
+   "box": [
+    206,
+    525,
+    21,
+    11
+   ],
+   "id": 49
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    559,
+    139,
+    19
+   ],
+   "id": 50
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    559,
+    119,
+    19
+   ],
+   "id": 51
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Tags",
+   "box": [
+    203,
+    558,
+    121,
+    21
+   ],
+   "id": 52
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    578,
+    139,
+    32
+   ],
+   "id": 53
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    578,
+    119,
+    32
+   ],
+   "id": 54
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Red",
+   "box": [
+    233,
+    585,
+    77,
+    18
+   ],
+   "id": 55
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    208,
+    589,
+    18,
+    11
+   ],
+   "id": 56
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    610,
+    139,
+    32
+   ],
+   "id": 57
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    610,
+    119,
+    32
+   ],
+   "id": 58
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Orange",
+   "box": [
+    233,
+    617,
+    77,
+    18
+   ],
+   "id": 59
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    208,
+    621,
+    18,
+    11
+   ],
+   "id": 60
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    642,
+    139,
+    32
+   ],
+   "id": 61
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    642,
+    119,
+    32
+   ],
+   "id": 62
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Yellow",
+   "box": [
+    233,
+    649,
+    77,
+    18
+   ],
+   "id": 63
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    208,
+    653,
+    18,
+    11
+   ],
+   "id": 64
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    674,
+    139,
+    32
+   ],
+   "id": 65
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    674,
+    119,
+    32
+   ],
+   "id": 66
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Green",
+   "box": [
+    233,
+    681,
+    77,
+    18
+   ],
+   "id": 67
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    208,
+    685,
+    18,
+    11
+   ],
+   "id": 68
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    706,
+    139,
+    32
+   ],
+   "id": 69
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    706,
+    119,
+    32
+   ],
+   "id": 70
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Blue",
+   "box": [
+    233,
+    713,
+    77,
+    18
+   ],
+   "id": 71
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    208,
+    717,
+    18,
+    11
+   ],
+   "id": 72
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    738,
+    139,
+    32
+   ],
+   "id": 73
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    738,
+    119,
+    32
+   ],
+   "id": 74
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Purple",
+   "box": [
+    233,
+    745,
+    77,
+    18
+   ],
+   "id": 75
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    208,
+    749,
+    18,
+    11
+   ],
+   "id": 76
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    770,
+    139,
+    32
+   ],
+   "id": 77
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    770,
+    119,
+    32
+   ],
+   "id": 78
+  },
+  {
+   "role": "AXStaticText",
+   "label": "Grey",
+   "box": [
+    233,
+    777,
+    77,
+    18
+   ],
+   "id": 79
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    208,
+    781,
+    18,
+    11
+   ],
+   "id": 80
+  },
+  {
+   "role": "AXRow",
+   "label": null,
+   "box": [
+    188,
+    802,
+    139,
+    32
+   ],
+   "id": 81
+  },
+  {
+   "role": "AXCell",
+   "label": null,
+   "box": [
+    198,
+    802,
+    119,
+    32
+   ],
+   "id": 82
+  },
+  {
+   "role": "AXStaticText",
+   "label": "All Tags\u2026",
+   "box": [
+    233,
+    809,
+    77,
+    18
+   ],
+   "id": 83
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    205,
+    813,
+    22,
+    11
+   ],
+   "id": 84
+  },
+  {
+   "role": "AXColumn",
+   "label": null,
+   "box": [
+    198,
+    162,
+    119,
+    682
+   ],
+   "id": 85
+  },
+  {
+   "role": "AXScrollBar",
+   "label": null,
+   "box": [
+    309,
+    161,
+    19,
+    396
+   ],
+   "id": 86
+  },
+  {
+   "role": "AXValueIndicator",
+   "label": null,
+   "box": [
+    318,
+    165,
+    6,
+    239
+   ],
+   "id": 87
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    310,
+    162,
+    0,
+    0
+   ],
+   "id": 88
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    310,
+    162,
+    0,
+    0
+   ],
+   "id": 89
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    318,
+    405,
+    6,
+    148
+   ],
+   "id": 90
+  },
+  {
+   "role": "AXButton",
+   "label": null,
+   "box": [
+    318,
+    165,
+    6,
+    0
+   ],
+   "id": 91
+  },
+  {
+   "role": "AXSplitter",
+   "label": null,
+   "box": [
+    327,
+    162,
+    0,
+    412
+   ],
+   "id": 92
+  },
+  {
+   "role": "AXSplitGroup",
+   "label": null,
+   "box": [
+    180,
+    110,
+    920,
+    464
+   ],
+   "id": 93
+  },
+  {
+   "role": "AXBrowser",
+   "label": "column view",
+   "box": [
+    179,
+    109,
+    922,
+    466
+   ],
+   "id": 94
+  },
+  {
+   "role": "AXScrollArea",
+   "label": null,
+   "box": [
+    327,
+    110,
+    773,
+    436
+   ],
+   "id": 95
+  },
+  {
+   "role": "AXScrollArea",
+   "label": null,
+   "box": [
+    125,
+    162,
+    245,
+    384
+   ],
+   "id": 96
+  },
+  {
+   "role": "AXList",
+   "label": null,
+   "box": [
+    124,
+    -231,
+    246,
+    1535
+   ],
+   "id": 97
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -225,
+    206,
+    23
+   ],
+   "id": 98
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -202,
+    0,
+    0
+   ],
+   "id": 99
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zsh_history",
+   "box": [
+    140,
+    -203,
+    2,
+    2
+   ],
+   "id": 100
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -203,
+    206,
+    23
+   ],
+   "id": 101
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -180,
+    0,
+    0
+   ],
+   "id": 102
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zcompdump-Ritviks-MacBook-Air-5.9.zwc",
+   "box": [
+    140,
+    -181,
+    2,
+    2
+   ],
+   "id": 103
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -181,
+    206,
+    23
+   ],
+   "id": 104
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -177,
+    16,
+    16
+   ],
+   "id": 105
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zcompdump-Ritviks-MacBook-Air-5.9",
+   "box": [
+    161,
+    -179,
+    184,
+    18
+   ],
+   "id": 106
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -159,
+    206,
+    23
+   ],
+   "id": 107
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -155,
+    16,
+    16
+   ],
+   "id": 108
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zcompdump",
+   "box": [
+    161,
+    -157,
+    85,
+    18
+   ],
+   "id": 109
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -137,
+    206,
+    23
+   ],
+   "id": 110
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -133,
+    16,
+    16
+   ],
+   "id": 111
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zcompdump.Ritviks-MacBook-Air.local.68271",
+   "box": [
+    161,
+    -135,
+    184,
+    18
+   ],
+   "id": 112
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -115,
+    206,
+    23
+   ],
+   "id": 113
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -111,
+    16,
+    16
+   ],
+   "id": 114
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zcompdump.Ritviks-MacBook-Air.local.2569",
+   "box": [
+    161,
+    -113,
+    184,
+    18
+   ],
+   "id": 115
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -93,
+    206,
+    23
+   ],
+   "id": 116
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -89,
+    16,
+    16
+   ],
+   "id": 117
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zcompdump.Ritviks-MacBook-Air.local.38349",
+   "box": [
+    161,
+    -91,
+    184,
+    18
+   ],
+   "id": 118
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -71,
+    206,
+    23
+   ],
+   "id": 119
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -67,
+    16,
+    16
+   ],
+   "id": 120
+  },
+  {
+   "role": "AXTextField",
+   "label": ".viminfo",
+   "box": [
+    161,
+    -69,
+    184,
+    18
+   ],
+   "id": 121
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -49,
+    206,
+    23
+   ],
+   "id": 122
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -45,
+    16,
+    16
+   ],
+   "id": 123
+  },
+  {
+   "role": "AXTextField",
+   "label": ".v8flags.13.6.233.10-node.28.6b318ce887cf3b4078d2f7e33417a69b.json",
+   "box": [
+    161,
+    -47,
+    184,
+    18
+   ],
+   "id": 124
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -27,
+    206,
+    23
+   ],
+   "id": 125
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -23,
+    16,
+    16
+   ],
+   "id": 126
+  },
+  {
+   "role": "AXTextField",
+   "label": ".v8flags.8.4.371.23-node.88.6b318ce887cf3b4078d2f7e33417a69b.json",
+   "box": [
+    161,
+    -25,
+    184,
+    18
+   ],
+   "id": 127
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    -5,
+    206,
+    23
+   ],
+   "id": 128
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    -1,
+    16,
+    16
+   ],
+   "id": 129
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zshrc",
+   "box": [
+    161,
+    -3,
+    43,
+    18
+   ],
+   "id": 130
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    17,
+    206,
+    23
+   ],
+   "id": 131
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    20,
+    16,
+    16
+   ],
+   "id": 132
+  },
+  {
+   "role": "AXTextField",
+   "label": ".v8flags.6.8.275.32-node.59.6b318ce887cf3b4078d2f7e33417a69b.json",
+   "box": [
+    161,
+    19,
+    43,
+    18
+   ],
+   "id": 133
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    39,
+    206,
+    23
+   ],
+   "id": 134
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    42,
+    16,
+    16
+   ],
+   "id": 135
+  },
+  {
+   "role": "AXTextField",
+   "label": ".gitconfig",
+   "box": [
+    161,
+    41,
+    63,
+    18
+   ],
+   "id": 136
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    61,
+    206,
+    23
+   ],
+   "id": 137
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    64,
+    16,
+    16
+   ],
+   "id": 138
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zshrc.pre-oh-my-zsh",
+   "box": [
+    161,
+    63,
+    63,
+    18
+   ],
+   "id": 139
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    83,
+    206,
+    23
+   ],
+   "id": 140
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    86,
+    16,
+    16
+   ],
+   "id": 141
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zprofile",
+   "box": [
+    161,
+    85,
+    63,
+    18
+   ],
+   "id": 142
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    105,
+    206,
+    23
+   ],
+   "id": 143
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    108,
+    16,
+    16
+   ],
+   "id": 144
+  },
+  {
+   "role": "AXTextField",
+   "label": ".zshenv",
+   "box": [
+    161,
+    107,
+    53,
+    18
+   ],
+   "id": 145
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    127,
+    206,
+    23
+   ],
+   "id": 146
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    130,
+    16,
+    16
+   ],
+   "id": 147
+  },
+  {
+   "role": "AXTextField",
+   "label": ".node_repl_history",
+   "box": [
+    161,
+    129,
+    120,
+    18
+   ],
+   "id": 148
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    149,
+    206,
+    23
+   ],
+   "id": 149
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    152,
+    16,
+    16
+   ],
+   "id": 150
+  },
+  {
+   "role": "AXTextField",
+   "label": ".python_history",
+   "box": [
+    161,
+    151,
+    101,
+    18
+   ],
+   "id": 151
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    171,
+    206,
+    23
+   ],
+   "id": 152
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    174,
+    16,
+    16
+   ],
+   "id": 153
+  },
+  {
+   "role": "AXTextField",
+   "label": ".mysql_history",
+   "box": [
+    161,
+    173,
+    95,
+    18
+   ],
+   "id": 154
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    193,
+    206,
+    23
+   ],
+   "id": 155
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    196,
+    16,
+    16
+   ],
+   "id": 156
+  },
+  {
+   "role": "AXTextField",
+   "label": ".CFUserTextEncoding",
+   "box": [
+    161,
+    195,
+    136,
+    18
+   ],
+   "id": 157
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    215,
+    206,
+    23
+   ],
+   "id": 158
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    218,
+    16,
+    16
+   ],
+   "id": 159
+  },
+  {
+   "role": "AXTextField",
+   "label": ".bash_history",
+   "box": [
+    161,
+    217,
+    89,
+    18
+   ],
+   "id": 160
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    237,
+    206,
+    23
+   ],
+   "id": 161
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    240,
+    16,
+    16
+   ],
+   "id": 162
+  },
+  {
+   "role": "AXTextField",
+   "label": ".aftman",
+   "box": [
+    161,
+    239,
+    52,
+    18
+   ],
+   "id": 163
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    259,
+    206,
+    23
+   ],
+   "id": 164
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    262,
+    16,
+    16
+   ],
+   "id": 165
+  },
+  {
+   "role": "AXTextField",
+   "label": ".android",
+   "box": [
+    161,
+    261,
+    56,
+    18
+   ],
+   "id": 166
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    281,
+    206,
+    23
+   ],
+   "id": 167
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    284,
+    16,
+    16
+   ],
+   "id": 168
+  },
+  {
+   "role": "AXTextField",
+   "label": ".antigravity_cockpit",
+   "box": [
+    161,
+    283,
+    125,
+    18
+   ],
+   "id": 169
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    303,
+    206,
+    23
+   ],
+   "id": 170
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    306,
+    16,
+    16
+   ],
+   "id": 171
+  },
+  {
+   "role": "AXTextField",
+   "label": ".antigravity-ide",
+   "box": [
+    161,
+    305,
+    98,
+    18
+   ],
+   "id": 172
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    325,
+    206,
+    23
+   ],
+   "id": 173
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    328,
+    16,
+    16
+   ],
+   "id": 174
+  },
+  {
+   "role": "AXTextField",
+   "label": ".cache",
+   "box": [
+    161,
+    327,
+    46,
+    18
+   ],
+   "id": 175
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    347,
+    206,
+    23
+   ],
+   "id": 176
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    350,
+    16,
+    16
+   ],
+   "id": 177
+  },
+  {
+   "role": "AXTextField",
+   "label": ".cagent",
+   "box": [
+    161,
+    349,
+    52,
+    18
+   ],
+   "id": 178
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    369,
+    206,
+    23
+   ],
+   "id": 179
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    372,
+    16,
+    16
+   ],
+   "id": 180
+  },
+  {
+   "role": "AXTextField",
+   "label": ".code-review-graph",
+   "box": [
+    161,
+    371,
+    127,
+    18
+   ],
+   "id": 181
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    391,
+    206,
+    23
+   ],
+   "id": 182
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    394,
+    16,
+    16
+   ],
+   "id": 183
+  },
+  {
+   "role": "AXTextField",
+   "label": ".composer",
+   "box": [
+    161,
+    393,
+    70,
+    18
+   ],
+   "id": 184
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    413,
+    206,
+    23
+   ],
+   "id": 185
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    416,
+    16,
+    16
+   ],
+   "id": 186
+  },
+  {
+   "role": "AXTextField",
+   "label": ".config",
+   "box": [
+    161,
+    415,
+    48,
+    18
+   ],
+   "id": 187
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    435,
+    206,
+    23
+   ],
+   "id": 188
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    438,
+    16,
+    16
+   ],
+   "id": 189
+  },
+  {
+   "role": "AXTextField",
+   "label": ".copilot",
+   "box": [
+    161,
+    437,
+    51,
+    18
+   ],
+   "id": 190
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    457,
+    206,
+    23
+   ],
+   "id": 191
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    460,
+    16,
+    16
+   ],
+   "id": 192
+  },
+  {
+   "role": "AXTextField",
+   "label": ".docker",
+   "box": [
+    161,
+    459,
+    52,
+    18
+   ],
+   "id": 193
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    479,
+    206,
+    23
+   ],
+   "id": 194
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    482,
+    16,
+    16
+   ],
+   "id": 195
+  },
+  {
+   "role": "AXTextField",
+   "label": ".dsh",
+   "box": [
+    161,
+    481,
+    32,
+    18
+   ],
+   "id": 196
+  },
+  {
+   "role": "AXGroup",
+   "label": null,
+   "box": [
+    141,
+    501,
+    206,
+    23
+   ],
+   "id": 197
+  },
+  {
+   "role": "AXImage",
+   "label": null,
+   "box": [
+    141,
+    504,
+    16,
+    16
+   ],
+   "id": 198
+  },
+  {
+   "role": "AXTextField",
+   "label": ".gemini",
+   "box": [
+    161,
+    503,
+    50,
+    18
+   ],
+   "id": 199
+  }
+ ],
+ "with_box": 200
+}

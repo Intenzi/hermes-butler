@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.venv/
+spike/out.json
+.DS_Store
