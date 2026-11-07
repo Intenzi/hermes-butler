@@ -193,3 +193,22 @@ def test_start_sends_no_pet_op_when_no_pets(tmp_path: Path, monkeypatch) -> None
 
     assert overlay.Overlay().start()[0] is True
     assert proc.stdin.data == b""
+
+
+def test_capture_request_spawns_without_a_pet_double(tmp_path: Path, monkeypatch) -> None:
+    """A companion spawned only to read the screen must not park a pet double."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _make_pet(tmp_path, "robotocat")
+    _write_config(tmp_path, "display:\n  pet:\n    slug: robotocat\n    scale: 0.5\n")
+
+    proc = _FakeProc()
+    monkeypatch.setattr(overlay, "build_if_needed", lambda: (True, "present"))
+    monkeypatch.setattr(overlay.subprocess, "Popen", lambda *args, **kwargs: proc)
+
+    # The capture transport restarts a dead companion on demand.
+    overlay.Overlay().request({"op": "axcapture", "target": None})
+
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    ops = [json.loads(line)["op"] for line in lines]
+    assert "pet" not in ops
+    assert ops == ["axcapture"]

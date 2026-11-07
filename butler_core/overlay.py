@@ -238,7 +238,13 @@ class Overlay:
         except Exception:
             return False
 
-    def start(self):
+    def start(self, show_pet=True):
+        """Spawn the companion.
+
+        ``show_pet=False`` is the capture-only path: a companion spawned just to
+        read the screen must not park a pet double on the user's desktop, and
+        without a pet window the idle watchdog can retire that process too.
+        """
         with self._io_lock:
             if self._is_running():
                 return True, "already running pid %d" % self.proc.pid
@@ -259,12 +265,13 @@ class Overlay:
                 self.starting = False
                 # Send the pet once, before any ring can arrive, so the double is
                 # already loaded when the first step is highlighted.
-                try:
-                    pet_op = resolve_pet_op()
-                    if pet_op is not None:
-                        self._send(pet_op)
-                except Exception:  # noqa: BLE001
-                    pass
+                if show_pet:
+                    try:
+                        pet_op = resolve_pet_op()
+                        if pet_op is not None:
+                            self._send(pet_op)
+                    except Exception:  # noqa: BLE001
+                        pass
                 return True, "spawned pid %d" % self.proc.pid
             except Exception as exc:  # noqa: BLE001
                 self.proc = None
@@ -285,7 +292,7 @@ class Overlay:
             deadline = time.monotonic() + budget
             try:
                 if not self._is_running():
-                    ok, _detail = self.start()
+                    ok, _detail = self.start(show_pet=False)
                     if not ok:
                         return None
                 remaining = deadline - time.monotonic()
