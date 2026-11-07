@@ -109,3 +109,24 @@ Rules:
 - Shippability gate for every TCC or grant change: the walkthrough must
   survive `plugin install → grant → walkthrough` on a machine that has
   never seen the repo.
+
+## 5. Pet double parity and companion lifetime
+
+The companion draws a copy of the user's desktop pet, so it must animate like
+one and it must not outlive the work it was spawned for.
+
+- Step the sprite `loopMs / frameCount(row)` — LOOP_MS is 1100 in
+  `agent/pet/constants.py`, and a `pet.json` may carry its own `loopMs`.
+  Never hardcode a frame rate: the old fixed 0.125 s made the double blink
+  ~1.5x faster than the real pet, which the user reads as a rendering bug in
+  *their* pet.
+- A finished guide fades the double AND exits the process. `guide_stop()` is
+  not the only end path, so the farewell itself schedules the exit, and a
+  ~10 min idle watchdog covers the paths that leave no windows.
+- Capture-only spawns pass `show_pet=False`: reading the screen must not park
+  a pet on the user's desktop, and a petless companion is one the watchdog can
+  retire. A guide start re-asserts the pet op on an already-running companion,
+  or the second guide of a session shows no double at all.
+- Before "the pet animates wrong" becomes code, check the artwork: count
+  closed-eye frames per loop in the sheet (terminal-ghost-2 has 2 of 6, i.e.
+  two blinks per 1.1 s loop) and confirm the rate with the user first.
