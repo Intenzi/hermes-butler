@@ -59,22 +59,16 @@ text only when the work calls for it.
   implementation conventions, for anyone doing butler board or code work
   (agents picking up kanban tasks from the `butler` board, plus human
   contributors). The kanban worker prompt points new worker sessions at it.
-  It covers the board's six hard conventions:
+  It covers the plugin's four hard conventions:
   1. Flat step keys — one flat dict per guide step (`say` + `find.*` /
      `expect.*`); never nested or hierarchical step identifiers.
   2. Restart batching — land a whole changeset and request exactly one
      gateway restart, never dribble one fix per restart.
-  3. verify-worker-rule — a worker's completion summary is a claim, not a
-     result; verify tests and diffs directly with tools before building
-     on or reporting it.
-  4. Checklist page shape — the live checklist / closed-details pane
+  3. Checklist page shape — the live checklist / closed-details pane
      layout is frozen by design decision; do not regress it.
-  5. TCC single-subject design — all macOS screen access lives in the
+  4. TCC single-subject design — all macOS screen access lives in the
      plugin's own bundled Swift companion so TCC grants stay stable across
      updates.
-  6. Board etiquette — the board notes feed the executor: how to write,
-     promote, comment, and complete cards on the butler kanban board
-     without stranding parallel runs.
 
 ## Disclosure
 

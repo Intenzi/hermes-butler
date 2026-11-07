@@ -1,6 +1,6 @@
 ---
 name: conventions
-description: "Butler plugin dev conventions: flat step keys, restart batching, verify-worker-rule, checklist shape, TCC scope, board etiquette. Load for any butler board or code work."
+description: "Butler plugin dev conventions: flat step keys, restart batching, checklist page shape, TCC single-subject design. Load for butler plugin code work."
 ---
 
 # Butler implementation conventions
@@ -59,26 +59,7 @@ it carries.
   was supposed to load the fix can blow the 10 s plugin load budget
   (`plugins.load_timeout_seconds`, raised to 30 in config).
 
-## 3. Verify-worker-rule (never trust self-report)
-
-A worker's completion summary is a CLAIM, not a result. Every delegated
-outcome gets verified directly with tools before anything is reported or
-built on:
-
-- Check the worktree/repo themselves: `git status`, `git diff` against the
-  branch you asked for, file existence and `mtime`. Known failure: the
-  worker's sandbox could NOT commit inside a git worktree — the commit must
-  be made from an outside shell and tests re-verified in the MAIN tree.
-- Run the tests yourself. "27 tests pass" in a report counts zero until the
-  suite passes in your shell.
-- A run that merely echoes the brief back = a no-op. Symptom and cause we
-  hit: dispatching with an inline heredoc quoted into the command; the fix
-  is to write the brief to a FILE and have the worker read it, then
-  re-dispatch.
-- Verify assertions specific to the deliverable (a binary compiled, an
-  endpoint added, a smoke run's stderr clean), not just a green summary.
-
-## 4. Checklist page shape (canonical)
+## 3. Checklist page shape (canonical)
 
 The butler surface renders every guide as a vertical task checklist. This
 shape is frozen by user decision — do not regress it to chip strips or an
@@ -103,7 +84,7 @@ Empty state: exact string "No butler task running".
 Mapping: a guide plan (max six steps per `butler:follow`) maps 1:1 onto
 rows — flat step keys from convention 1 are what this shape consumes.
 
-## 5. TCC single-subject design
+## 4. TCC single-subject design
 
 macOS TCC trust attaches per binary, so a one-off fix that performs screen
 access in whichever Python/Node binary happens to host it re-breaks grants
@@ -128,42 +109,3 @@ Rules:
 - Shippability gate for every TCC or grant change: the walkthrough must
   survive `plugin install → grant → walkthrough` on a machine that has
   never seen the repo.
-
-## 6. Card etiquette (board notes feed the executor)
-
-Writing and maintaining kanban cards on the `butler` board:
-
-Body
-- Board notes feed the executor: a card body is a standalone spec the next
-  worker executes with zero sibling context — file paths, acceptance
-  criteria, and every decision it depends on written INTO the body. If two
-  cards would each decide the same
-  question, decide it once and write the answer into BOTH bodies.
-- One card = one deliverable with checkable acceptance criteria. Never a
-  "tracking" card that grows new scope mid-run; spawn children instead.
-
-Board flow
-- Keep parked backlog cards BLOCKED. The dispatcher auto-claims READY
-  tasks and spawns workers, so a one-off stray promotion unleashes a
-  parallel run on the user's machine. Promote ONE card at a time and only
-  with the user's go-ahead.
-- Comments carry durable facts only: handoffs, rationale, blocking context.
-  Reasoning-in-progress and echo stay out. Flag collisions as
-  `hotspot: <path> — <one-line reason>` so the file gets decomposed before
-  more work lands on it.
-- Never hand-edit board state you did not create; use the kanban tools
-  (`kanban_comment`, `kanban_block`, `kanban_link`), not shell SQL.
-
-Lifecycle
-- Long ops (builds, crawls): heartbeat every few minutes so a >1 h run is
-  not reclaimed as stale.
-- Blocked? `kanban_block` with kind (`dependency` / `needs_input` /
-  `capability` / `transient`) and a reason that says what you need — one or
-  two sentences, never the whole conversation. Do not block on anything
-  you could resolve yourself.
-- Completion: `kanban_complete` with a 1-3 sentence `summary`, structured
-  `metadata` (files, tests, findings), and absolute `artifacts` paths that
-  exist on disk at completion (scratch workspaces are deleted when the
-  task completes). List `created_cards` ONLY with real ids returned by
-  `kanban_create`. Never complete a task you did not finish or verify —
-  block it instead; review requests are requests, not silent closures.

@@ -12,13 +12,16 @@ EXPECTED_SKILLS = {
     "butler-conventions": {
         "flat step keys",
         "restart batching",
-        "verify-dsh-rule",
         "checklist page shape",
         "tcc single-subject design",
-        "card etiquette",
         "conventions",
     },
 }
+
+# Orchestrator-facing conventions moved to the agent-side
+# kanban-worker-conventions skill; they must not come back into the
+# shipped, user-facing copy.
+ORCHESTRATOR_ONLY = ("verify-dsh-rule", "verify-worker-rule", "card etiquette")
 
 
 def _frontmatter(skill_md: Path) -> dict[str, str]:
@@ -50,12 +53,14 @@ def test_each_bundled_skill_manifest_loads_on_demand() -> None:
         assert len(description) >= 20, f"{skill_md}: description too short to trigger loads"
 
 
-def test_conventions_skill_document_all_six_conventions() -> None:
+def test_conventions_skill_documents_all_conventions() -> None:
     body = (ROOT / "skills" / "butler-conventions" / "SKILL.md").read_text(
         encoding="utf-8"
     ).lower()
     for topic in EXPECTED_SKILLS["butler-conventions"]:
         assert topic in body, f"conventions skill missing section: {topic}"
+    for term in ORCHESTRATOR_ONLY:
+        assert term not in body, f"orchestrator-facing content back in shipped copy: {term}"
 
 
 def test_conventions_skill_carries_concrete_examples() -> None:
@@ -65,7 +70,6 @@ def test_conventions_skill_carries_concrete_examples() -> None:
     # every convention section pairs guidance with at least one fenced example
     fenced = re.findall(r"```jsonc", body)
     assert len(fenced) >= 1, "expected fenced DO/DON'T examples"
-    assert "kanban_block" in body and "kanban_complete" in body
     assert "No butler task running" in body
 
 
