@@ -44,10 +44,36 @@ CLI equivalents from a terminal:
     hermes butler status
     hermes butler doctor [--ask]
 
-The bundled skill `butler:follow` teaches your agent when to offer a guide,
-how to pace the steps, and when not to run one at all. Guides are talk-through,
-never type-through: butler shows and verifies, the user's hands stay on the
-mouse and keyboard.
+## Skills
+
+The plugin bundles two skills. Skills load on demand: they are not eaten
+by the agent's context at session start — a fresh agent session sees only
+their names in the skills index, and `skill_view(name=...)` pulls the full
+text only when the work calls for it.
+
+- `butler:follow` (source: `skills/butler-follow/SKILL.md`) — teaches the
+  agent when to offer a guide, how to pace the steps, and when not to run
+  one at all. Guides are talk-through, never type-through: butler shows and
+  verifies, the user's hands stay on the mouse and keyboard.
+- `butler:conventions` (source: `skills/butler-conventions/SKILL.md`) —
+  implementation conventions, for anyone doing butler board or code work
+  (agents picking up kanban tasks from the `butler` board, plus human
+  contributors). The kanban worker prompt points new worker sessions at it.
+  It covers the board's six hard conventions:
+  1. Flat step keys — one flat dict per guide step (`say` + `find.*` /
+     `expect.*`); never nested or hierarchical step identifiers.
+  2. Restart batching — land a whole changeset and request exactly one
+     gateway restart, never dribble one fix per restart.
+  3. verify-dsh-rule — a dsh (DeepSeek Harness) completion summary is a
+     claim, not a result; verify tests and diffs directly before building
+     on or reporting it.
+  4. Checklist page shape — the live checklist / closed-details pane
+     layout is frozen by design decision; do not regress it.
+  5. TCC single-subject design — all macOS screen access lives in the
+     plugin's own bundled Swift companion so TCC grants stay stable across
+     updates.
+  6. Card etiquette — how to write, promote, comment, and complete cards
+     on the butler kanban board without stranding parallel runs.
 
 ## Disclosure
 

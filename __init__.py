@@ -2,7 +2,7 @@
 
 Tools: butler_guide_start, butler_guide_status, butler_capture, butler_stop.
 CLI: hermes butler capture|status|doctor.
-Skill: butler:follow.
+Skills: butler:follow (guide authoring), butler:conventions (dev conventions).
 """
 import json
 import logging
@@ -179,4 +179,11 @@ def register(ctx):
                            description="Follow-mode workflow: when and how to drive butler guides.")
     except Exception:
         logger.exception("butler:follow skill registration failed")
-    logger.info("Butler plugin registered: 4 tools, CLI 'butler', 1 skill")
+    try:
+        conventions_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "skills", "butler-conventions", "SKILL.md")
+        ctx.register_skill(name="conventions", path=conventions_path,
+                           description="Butler plugin dev conventions: flat step keys, restart batching, verify-dsh-rule, checklist shape, TCC scope, card etiquette. Load for any butler board or code work.")
+    except Exception:
+        logger.exception("butler:conventions skill registration failed")
+    logger.info("Butler plugin registered: 4 tools, CLI 'butler', 2 skills")

@@ -67,3 +67,13 @@ def test_conventions_skill_carries_concrete_examples() -> None:
     assert len(fenced) >= 1, "expected fenced DO/DON'T examples"
     assert "kanban_block" in body and "kanban_complete" in body
     assert "No butler task running" in body
+
+
+def test_plugin_registers_every_bundled_skill() -> None:
+    """A skill dir the loader never registers via ctx.register_skill is dead
+    weight: this is a Python (plugin.yaml) plugin, not a portable plugin.json
+    package, so skills do NOT auto-discover from the skills/ dir."""
+    source = (ROOT / "__init__.py").read_text(encoding="utf-8")
+    registered = set(re.findall(r'ctx\.register_skill\(\s*\n?\s*name="([^"]+)"', source))
+    expected = {name.removeprefix("butler-") for name in EXPECTED_SKILLS}
+    assert registered >= expected, f"plugin register(ctx) must register {expected}, found {registered}"
