@@ -12,7 +12,9 @@
 //  Protocol (one JSON object per line, EOF-terminated):
 //    {"op":"ring","box":[x,y,w,h],"label":"...","say":"...","step":n,"total":m}
 //    {"op":"chip","step":n}
-//    {"op":"pet","frames_dir":"...","scale":0.33}
+//    {"op":"pet","frames_dir":"...","scale":0.33,"pet_enabled":true}
+//    {"op":"launcher"}
+//    {"op":"done"}
 //    {"op":"axtrusted","prompt":true}
 //    {"op":"axcapture","target":null,"max_elements":150,"depth":10}
 //    {"op":"idle"}
@@ -516,7 +518,7 @@ private func axCaptureSnapshot(target: String?,
     guard (result["trusted"] as? Bool) == true else {
         result["prompted"] = false
         result["note"] = "Accessibility not granted to this process"
-        result["fix"] = "Grant Accessibility to \"Butler companion (the butler plugin's bundled helper)\" in System Settings -> Privacy & Security -> Accessibility, then try the guide again."
+        result["fix"] = "Grant Accessibility to \"Butler companion - the butler plugin's bundled helper\" in System Settings -> Privacy & Security -> Accessibility, then try the guide again. Because the butler reads the screen through its own small helper, macOS asks once and remembers across updates."
         return result
     }
 
@@ -604,12 +606,15 @@ private struct RingSpec {
 private struct PetSpec {
     let framesDir: String
     let scale: CGFloat
+    let enabled: Bool
 }
 
 private enum OverlayCommand {
     case ring(RingSpec)
     case chip(Int)
     case pet(PetSpec)
+    case launcher
+    case done
     case axtrusted(prompt: Bool)
     case axcapture(AXCaptureSpec)
     case idle
@@ -718,7 +723,22 @@ private func parseCommand(line: String) -> OverlayCommand? {
             // Keep a hostile payload from allocating an absurd window.
             scale = CGFloat(min(4.0, max(0.1, rawScale)))
         }
-        return .pet(PetSpec(framesDir: framesDir, scale: scale))
+        var enabled = true
+        if let rawEnabled = object["pet_enabled"], !(rawEnabled is NSNull) {
+            guard let parsedEnabled = rawEnabled as? Bool else {
+                logMalformedOnce(line: line,
+                                 reason: "pet has an invalid pet_enabled")
+                return nil
+            }
+            enabled = parsedEnabled
+        }
+        return .pet(PetSpec(framesDir: framesDir, scale: scale, enabled: enabled))
+
+    case "launcher":
+        return .launcher
+
+    case "done":
+        return .done
 
     case "axtrusted":
         var prompt = false
@@ -1183,6 +1203,7 @@ private final class PetView: NSView {
     var row: Int = 0
     var frameIndex: Int = 0
     var mirrored: Bool = false
+    var spriteOpacity: CGFloat = 0.75
 
     init(frame: NSRect, sheet: PetSheet) {
         self.sheet = sheet
@@ -1222,13 +1243,77 @@ private final class PetView: NSView {
         sheet.image.draw(in: bounds,
                          from: source,
                          operation: .sourceOver,
-                         fraction: 1.0,
+                         fraction: max(0.0, min(1.0, spriteOpacity)),
                          respectFlipped: true,
                          hints: [.interpolation: NSImageInterpolation.high.rawValue])
 
         if mirrored {
             NSGraphicsContext.restoreGraphicsState()
         }
+    }
+}
+
+// MARK: - Pet launcher nameplate
+
+/// The small "butler" chip above the double. It is its own borderless window so
+/// the sprite window can stay click-through: only this chip ever accepts clicks.
+private final class NameplateView: NSView {
+    private let text: String
+    private let font: NSFont
+    var onClick: (() -> Void)?
+
+    init(frame: NSRect, text: String, font: NSFont) {
+        self.text = text
+        self.font = font
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override var isFlipped: Bool {
+        return true
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let background = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: background, xRadius: 5.0, yRadius: 5.0)
+        NSColor(red: 22.0 / 255.0,
+                green: 23.0 / 255.0,
+                blue: 26.0 / 255.0,
+                alpha: 0.9).setFill()
+        path.fill()
+        NSColor(white: 1.0, alpha: 0.10).setStroke()
+        path.lineWidth = 1.0
+        path.stroke()
+
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: style
+        ]
+        let textHeight = (text as NSString).size(withAttributes: attributes).height
+        let textRect = NSRect(x: 4.0,
+                              y: (bounds.height - textHeight) / 2.0,
+                              width: max(0.0, bounds.width - 8.0),
+                              height: textHeight)
+        (text as NSString).draw(in: textRect, withAttributes: attributes)
     }
 }
 
@@ -1259,6 +1344,31 @@ private final class OverlayController {
     private var petFrameIndex = 0
     private var petLastFrameAdvance: TimeInterval = 0.0
     private var lastRingBox: CGRect?
+
+    // Moving and parked are distinct alpha states, eased over the same 1.2s as
+    // the walk so the double never snaps between them.
+    private let petMovingOpacity: CGFloat = 0.55
+    private let petParkedOpacity: CGFloat = 0.75
+    private let petOpacityDuration: TimeInterval = 1.2
+    private var petOpacity: CGFloat = 0.75
+    private var petOpacityStart: CGFloat = 0.75
+    private var petOpacityTarget: CGFloat = 0.75
+    private var petOpacityStartTime: TimeInterval = 0.0
+
+    // The nameplate is a separate, tiny window: the sprite window must stay
+    // click-through at all times.
+    private var nameplateWindow: NSWindow?
+    private var nameplateView: NameplateView?
+    private var launcherActive = false
+
+    // "done" is a farewell: wave for ~0.8s, then fade the double (and its
+    // nameplate) out over ~1.5s before closing the window.
+    private let petWaveDuration: TimeInterval = 0.8
+    private let petFadeDuration: TimeInterval = 1.5
+    private var petFarewell = false
+    private var petFading = false
+    private var petFadeStartTime: TimeInterval = 0.0
+    private var petFadeFromAlpha: CGFloat = 1.0
 
     func start() {
         guard stdinThread == nil else {
@@ -1305,6 +1415,10 @@ private final class OverlayController {
             showChip(step: step)
         case .pet(let spec):
             showPet(spec)
+        case .launcher:
+            showLauncher()
+        case .done:
+            petDone()
         case .axtrusted(let prompt):
             writeAXResponse(axTrustedResponse(prompt: prompt))
         case .axcapture(let spec):
@@ -1537,6 +1651,13 @@ private final class OverlayController {
         guard !isShuttingDown else {
             return
         }
+        guard spec.enabled else {
+            // display.pet.enabled is false: keep the ring/chip overlay alive,
+            // but never draw a companion double.
+            closePetWindow()
+            petSheet = nil
+            return
+        }
         guard let primaryHeight = primaryScreenHeight(), !NSScreen.screens.isEmpty else {
             logPetFailureOnce(framesDir: spec.framesDir, reason: "no attached screens")
             return
@@ -1556,6 +1677,12 @@ private final class OverlayController {
         petRow = parkedPetRow(for: sheet)
         petFrameIndex = 0
         petLastFrameAdvance = ProcessInfo.processInfo.systemUptime
+        petFarewell = false
+        petFading = false
+        petOpacity = petParkedOpacity
+        petOpacityStart = petParkedOpacity
+        petOpacityTarget = petParkedOpacity
+        petOpacityStartTime = petLastFrameAdvance
 
         let size = CGSize(width: sheet.cellWidth * petScale,
                           height: sheet.cellHeight * petScale)
@@ -1574,6 +1701,7 @@ private final class OverlayController {
         petMoveStartFrame = nil
         petMoving = false
         createPetWindow(frame: startFrame, primaryHeight: primaryHeight, sheet: sheet)
+        createNameplateWindow(for: startFrame, primaryHeight: primaryHeight)
         startPetTimer()
     }
 
@@ -1603,6 +1731,7 @@ private final class OverlayController {
                               sheet: sheet)
         content.row = petRow
         content.frameIndex = petFrameIndex
+        content.spriteOpacity = petOpacity
         content.autoresizingMask = [.width, .height]
         window.contentView = content
 
@@ -1618,6 +1747,162 @@ private final class OverlayController {
         }
         petWindow = nil
         petView = nil
+        closeNameplate()
+    }
+
+    private func closeNameplate() {
+        if let window = nameplateWindow {
+            window.orderOut(nil)
+            window.close()
+        }
+        nameplateWindow = nil
+        nameplateView = nil
+    }
+
+    // MARK: Pet nameplate / launcher
+
+    private func nameplateFont() -> NSFont {
+        return NSFont.monospacedSystemFont(ofSize: 9.5, weight: .medium)
+    }
+
+    private func nameplateHeight() -> CGFloat {
+        let textHeight = ("butler" as NSString).size(
+            withAttributes: [.font: nameplateFont()]).height
+        return ceil(textHeight) + 8.0 // 4pt padding above and below
+    }
+
+    private func nameplateFrame(for petFrame: CGRect,
+                                primaryHeight: CGFloat) -> CGRect {
+        let height = nameplateHeight()
+        var frame = CGRect(x: petFrame.minX,
+                           y: petFrame.minY - height - 2.0,
+                           width: petFrame.width,
+                           height: height)
+        if let screen = screenContaining(petFrame, primaryHeight: primaryHeight) {
+            let visible = quartzRect(fromAppKit: screen.visibleFrame,
+                                     primaryHeight: primaryHeight)
+            if frame.minY < visible.minY + 2.0 {
+                frame.origin.y = visible.minY + 2.0
+            }
+        }
+        return frame
+    }
+
+    private func createNameplateWindow(for petFrame: CGRect,
+                                       primaryHeight: CGFloat) {
+        closeNameplate()
+
+        let quartzFrame = nameplateFrame(for: petFrame, primaryHeight: primaryHeight)
+        let appKitFrame = appKitRect(fromQuartz: quartzFrame,
+                                     primaryHeight: primaryHeight)
+        let window = NSWindow(contentRect: appKitFrame,
+                              styleMask: [.borderless],
+                              backing: .buffered,
+                              defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.level = .statusBar
+        window.collectionBehavior = [.canJoinAllSpaces,
+                                     .stationary,
+                                     .fullScreenAuxiliary,
+                                     .ignoresCycle]
+        // Only this tiny chip window is ever clickable; the sprite window
+        // remains ignoresMouseEvents = true.
+        window.ignoresMouseEvents = !launcherActive
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
+        window.isReleasedWhenClosed = false
+        window.acceptsMouseMovedEvents = false
+
+        let content = NameplateView(frame: NSRect(origin: .zero,
+                                                  size: appKitFrame.size),
+                                    text: "butler",
+                                    font: nameplateFont())
+        content.onClick = { [weak self] in
+            self?.writeLauncherClick()
+        }
+        content.autoresizingMask = [.width, .height]
+        window.contentView = content
+
+        nameplateWindow = window
+        nameplateView = content
+        window.orderFrontRegardless()
+    }
+
+    private func updateNameplateFrame(for petFrame: CGRect,
+                                      primaryHeight: CGFloat) {
+        guard let window = nameplateWindow else {
+            return
+        }
+        let quartzFrame = nameplateFrame(for: petFrame, primaryHeight: primaryHeight)
+        window.setFrame(appKitRect(fromQuartz: quartzFrame,
+                                   primaryHeight: primaryHeight),
+                        display: true)
+    }
+
+    private func showLauncher() {
+        launcherActive = true
+        if let window = nameplateWindow {
+            window.ignoresMouseEvents = false
+            window.orderFrontRegardless()
+        }
+    }
+
+    private func writeLauncherClick() {
+        guard launcherActive else {
+            return
+        }
+        let payload = "{\"op\":\"launcher_click\"}\n"
+        FileHandle.standardOutput.write(Data(payload.utf8))
+    }
+
+    // MARK: Pet farewell
+
+    private func petDone() {
+        guard !isShuttingDown, petWindow != nil, petSheet != nil else {
+            return
+        }
+        petMoving = false
+        petFarewell = true
+        petFading = false
+
+        let now = ProcessInfo.processInfo.systemUptime
+        if let sheet = petSheet,
+           let wave = sheet.rowIndex("waving") ?? sheet.rowIndex("jumping") {
+            petRow = wave
+            petFrameIndex = 0
+            petLastFrameAdvance = now
+            petView?.row = wave
+            petView?.frameIndex = 0
+            petView?.needsDisplay = true
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + petWaveDuration) { [weak self] in
+            self?.startPetFadeOut()
+        }
+    }
+
+    private func startPetFadeOut() {
+        guard !isShuttingDown, petWindow != nil, !petFading else {
+            return
+        }
+        petFading = true
+        petFadeStartTime = ProcessInfo.processInfo.systemUptime
+        petFadeFromAlpha = petWindow?.alphaValue ?? 1.0
+    }
+
+    private func finishPetFarewell() {
+        petFarewell = false
+        petFading = false
+        petTimer?.invalidate()
+        petTimer = nil
+        petCurrentFrame = nil
+        petTargetFrame = nil
+        petMoveStartFrame = nil
+        petMoving = false
+        closePetWindow()
+        petSheet = nil
     }
 
     private func startPetTimer() {
@@ -1655,17 +1940,29 @@ private final class OverlayController {
         if sameSpot {
             petMoving = false
             petCurrentFrame = target
+            setPetOpacityTarget(petParkedOpacity)
+            updateNameplateFrame(for: target, primaryHeight: primaryHeight)
             return
         }
 
         petMoveStartFrame = current
         petMoveStartTime = ProcessInfo.processInfo.systemUptime
         petMoving = true
+        setPetOpacityTarget(petMovingOpacity)
 
         let dx = target.midX - current.midX
         if abs(dx) > 0.5 {
             petMovingRight = dx > 0.0
         }
+    }
+
+    private func setPetOpacityTarget(_ target: CGFloat) {
+        if abs(petOpacityTarget - target) < 0.001 {
+            return
+        }
+        petOpacityStart = petOpacity
+        petOpacityTarget = target
+        petOpacityStartTime = ProcessInfo.processInfo.systemUptime
     }
 
     private func tickPet() {
@@ -1678,6 +1975,20 @@ private final class OverlayController {
         }
 
         let now = ProcessInfo.processInfo.systemUptime
+
+        if petFading {
+            let progress = min(1.0, max(0.0,
+                (now - petFadeStartTime) / petFadeDuration))
+            // Smoothstep the fade as well: no visible snap at either end.
+            let eased = progress * progress * (3.0 - 2.0 * progress)
+            let alpha = petFadeFromAlpha * (1.0 - eased)
+            window.alphaValue = alpha
+            nameplateWindow?.alphaValue = alpha
+            if progress >= 1.0 {
+                finishPetFarewell()
+                return
+            }
+        }
 
         if petMoving,
            let start = petMoveStartFrame,
@@ -1693,26 +2004,62 @@ private final class OverlayController {
             petCurrentFrame = frame
             window.setFrame(appKitRect(fromQuartz: frame, primaryHeight: primaryHeight),
                             display: true)
+            updateNameplateFrame(for: frame, primaryHeight: primaryHeight)
             if progress >= 1.0 {
                 petMoving = false
                 petCurrentFrame = target
+                setPetOpacityTarget(petParkedOpacity)
+                updateNameplateFrame(for: target, primaryHeight: primaryHeight)
             }
         }
 
-        let animation = petAnimation(for: sheet,
-                                     moving: petMoving,
-                                     movingRight: petMovingRight)
-        if animation.row != petRow {
-            petRow = animation.row
-            petFrameIndex = 0
-            petLastFrameAdvance = now
-            view.row = petRow
-            view.frameIndex = 0
+        // Ease the sprite alpha (0.55 moving / 0.75 parked) over the same
+        // 1.2s smoothstep window as the walk.
+        if abs(petOpacity - petOpacityTarget) > 0.001 {
+            let progress = min(1.0, max(0.0,
+                (now - petOpacityStartTime) / petOpacityDuration))
+            let eased = progress * progress * (3.0 - 2.0 * progress)
+            petOpacity = petOpacityStart
+                + (petOpacityTarget - petOpacityStart) * eased
+            if progress >= 1.0 {
+                petOpacity = petOpacityTarget
+            }
+            view.spriteOpacity = petOpacity
             view.needsDisplay = true
         }
-        if view.mirrored != animation.mirrored {
-            view.mirrored = animation.mirrored
-            view.needsDisplay = true
+
+        if petFarewell {
+            // Hold the wave row through the farewell; no parked-row switch.
+            if let wave = sheet.rowIndex("waving") ?? sheet.rowIndex("jumping") {
+                if petRow != wave {
+                    petRow = wave
+                    petFrameIndex = 0
+                    petLastFrameAdvance = now
+                    view.row = wave
+                    view.frameIndex = 0
+                    view.needsDisplay = true
+                }
+            }
+            if view.mirrored {
+                view.mirrored = false
+                view.needsDisplay = true
+            }
+        } else {
+            let animation = petAnimation(for: sheet,
+                                         moving: petMoving,
+                                         movingRight: petMovingRight)
+            if animation.row != petRow {
+                petRow = animation.row
+                petFrameIndex = 0
+                petLastFrameAdvance = now
+                view.row = petRow
+                view.frameIndex = 0
+                view.needsDisplay = true
+            }
+            if view.mirrored != animation.mirrored {
+                view.mirrored = animation.mirrored
+                view.needsDisplay = true
+            }
         }
 
         // Roughly 8 fps, matching the desktop sprite's relaxed cadence.

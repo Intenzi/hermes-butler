@@ -16,6 +16,14 @@ from . import ocr as bp_ocr
 PANEL_ACCESSIBILITY = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 PANEL_SCREENCAPTURE = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
 
+GRANT_SUBJECT = "Butler companion - the butler plugin's bundled helper"
+GRANT_WHY = ("Because the butler reads the screen through its own small helper, "
+             "macOS asks once and remembers across updates.")
+GRANT_FIX = (
+    "Grant Accessibility to \"%s\" in System Settings -> Privacy & Security -> "
+    "Accessibility, then try the guide again. %s" % (GRANT_SUBJECT, GRANT_WHY)
+)
+
 
 def _open_panel(pane_url):
     try:
@@ -34,7 +42,7 @@ def report(ask=False):
         # One grant subject: axtrusted is answered by the bundled companion
         # binary, never by the varying Python host.
         "accessibility_granted": accessibility_granted,
-        "accessibility_grant_subject": bp_capture.GRANT_SUBJECT,
+        "accessibility_grant_subject": GRANT_SUBJECT,
         "screen_recording_granted": screen_recording_granted,
         "capture": "missing grant" if not accessibility_granted else "ok",
         "ocr": "missing grant" if not screen_recording_granted else "ok",
@@ -54,7 +62,7 @@ def report(ask=False):
                 "accessibility": _open_panel(PANEL_ACCESSIBILITY),
             }
     if not accessibility_granted:
-        out["fix"] = bp_capture.GRANT_FIX
+        out["fix"] = GRANT_FIX
     elif not screen_recording_granted:
         out["fix"] = ("Run `hermes butler doctor --ask` to raise the Screen Recording dialog; grant to the "
                       "Hermes host, then restart Hermes (the OCR fallback waits on this grant).")

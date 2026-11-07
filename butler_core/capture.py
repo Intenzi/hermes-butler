@@ -19,11 +19,12 @@ except ImportError:  # pragma: no cover - direct module import
 DEFAULT_MAX = 150
 DEFAULT_DEPTH = 10
 REQUEST_TIMEOUT = 5.0
-GRANT_SUBJECT = "Butler companion (the butler plugin's bundled helper)"
+GRANT_SUBJECT = "Butler companion - the butler plugin's bundled helper"
 GRANT_FIX = (
     "Grant Accessibility to \"%s\" in System Settings -> Privacy & Security -> "
-    "Accessibility, then try the guide again. The companion binary keeps the "
-    "same path across Hermes updates, so the grant survives updates." % GRANT_SUBJECT
+    "Accessibility, then try the guide again. Because the butler reads the "
+    "screen through its own small helper, macOS asks once and remembers "
+    "across updates." % GRANT_SUBJECT
 )
 
 # The helper is the only thing that needs Accessibility; the Python host is not

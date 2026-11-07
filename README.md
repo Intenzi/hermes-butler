@@ -23,9 +23,11 @@ Install through the normal `hermes plugins` flow. Then run:
 That raises the real macOS permission dialogs — accessibility is prompted by
 the plugin itself via `AXIsProcessTrustedWithOptions`, screen recording via
 `CGRequestScreenCaptureAccess` — and deep-links the two System Settings panes
-so the grant is one toggle away. The final checkbox and one app restart stay
-manual, because macOS TCC requires it; the doctor tells you when it is your
-turn and tells you when you are clear.
+so the grant is one toggle away. The Accessibility grant is **Butler companion
+- the butler plugin's bundled helper**. Because the butler reads the screen
+through its own small helper, macOS asks once and remembers across updates.
+The final checkbox and one app restart stay manual, because macOS TCC requires
+it; the doctor tells you when it is your turn and tells you when you are clear.
 
 ## Usage
 

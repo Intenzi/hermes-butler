@@ -1,0 +1,80 @@
+TASK: Butler plugin final UX changeset (frontend + Swift + Python).
+
+WORK IN THIS CURRENT DIRECTORY (dedicated git worktree, branch feat/ux-marquee).
+Do NOT touch files outside the repo. No gateway or Hermes restarts. Commit on
+the branch at the end: "ux marquee: double styling, launcher, history endpoint".
+
+Repo notes: dashboard/plugin_api.py is the FastAPI backend the desktop page
+fetches ~/.hermes/plugins/butler through; desktop/plugin.js is the desktop
+UI half; butler_core/overlay_swift/ButlerOverlay.swift is the companion
+renderer (ring windows, chip, bubble, pet double with alpha-scan slicing,
+easing); butler_core/overlay.py spawns + feeds it over stdin ops
+(ring/chip/idle/quit/pet); butler_core/engine.py sends ring ops and
+transitions to status 'done' at the last verification.
+
+Deliverable 1 - Pet double styling and lifecycle (ButlerOverlay.swift):
+- Pet double opacity states: about 0.55 while moving toward a ring target,
+  about 0.75 parked beside it (animate opacity, 1.2 s smoothstep).
+- Draw a small nameplate above the double: dark rounded chip, text "butler",
+  font size 9-10 monospaced, padding 4, width matching the double.
+- New op {"op":"done"}: farewell - play the wave row for about 0.8 s, fade
+  the double out over about 1.5 s, close its window. Python sends `done`
+  when the guide reaches status done (engine sends `idle` today at that
+  point; overlay.py is the file to change - see below).
+Deliverable 2 - Session launcher:
+A) desktop/plugin.js:
+  - Register one status bar chip in the 'statusBar.right' area: a small
+    "Butler" button. Click: create-or-focus a chat session titled "Butler"
+    (create if none exists with that exact title; otherwise focus it).
+    Use the same session create/focus RPC surface other bundled plugins use;
+    if creation is unsupported, fall back to focusing the oldest matching
+    session. Also render the same button in the Butler page header.
+  - Do not draw anything over the Hermes pet canvas (SDK rule).
+B) ButlerOverlay.swift: new op {"op":"launcher"}: draws the nameplate chip
+  above the pet double; when launcher is active the chip is clickable:
+  set ignoresMouseEvents false for ONLY that small chip rect (sprite stays
+  ignoresMouseEvents true), and on click write one JSON line to stdout:
+  {"op":"launcher_click"}. No clickable-over-pet attempts.
+C) butler_core/overlay.py:
+  - pet op gains "pet_enabled": true/false read from display.pet.enabled in
+    ~/.hermes/config.yaml (tolerate missing config).
+  - engine already transitions to 'done' without sending `idle`? It sends
+    idle via _OVERLAY.idle() at the done transition - either way, make
+    overlay.py send {"op":"done"} when the guide status it knows turns
+    done/stopped (poll-free approach: extend the Overlay class with a
+    done() method; engine.py gains ONE line calling _OVERLAY.done() where
+    it currently calls _OVERLAY.idle() at that final transition - this is
+    the single permitted engine.py change in scope, add it exactly there).
+Deliverable 3 - Says split (desktop/plugin.js):
+  - The pet heartbeat must no longer speak per-step instruction lines;
+    it speaks only non-instruction status lines: done, stalled, capture
+    failed, and stop summaries. Status running with fresh capture -> pet
+    silent (the overlay bubble shows the instruction).
+Deliverable 4 - History:
+  - dashboard/plugin_api.py: add GET /history: list the guides storage
+    (same candidates dir logic as /state, then the guides subfolder),
+    each entry {"id","title","status","steps","verifications","started_at"},
+    newest started_at first, cap 50.
+  - desktop/plugin.js final layout:
+    * LIVE guide: vertical task checklist; each row "[checked/empty box]
+      Step N: <say>"; current step highlighted; instruction line and stall
+      note below; keep the smoke counter; remove the old Pane() entirely.
+    * DONE/STOPPED: collapsed dropdown per guide (details/summary), newest
+      first, up to 8 visible + "show N more" footer, expanding shows the
+      completed checklist; headline above: "No butler task running".
+Deliverable 5 - Grant words (butler_core/doctor.py + README.md):
+  - doctor fix strings name the grant as "Butler companion - the butler
+    plugin's bundled helper" with NO file paths, plus one why-sentence:
+    "Because the butler reads the screen through its own small helper,
+    macOS asks once and remembers across updates."
+  - README install section gets the same wording.
+Tests: add for pet_enabled flag, /history shape-sorting-cap, and a static
+assert that plugin.js registers a status bar entry in 'statusBar.right'.
+Build + smoke: swiftc -O -o butler_core/services/ButlerOverlay
+butler_core/overlay_swift/ButlerOverlay.swift; spawn companion; send pet op
++ launcher + ring; hold 2 s; quit; stderr must be clean.
+COMMIT: git add -A && git commit -m "ux marquee: double styling, launcher,
+history endpoint".
+
+REPORT under 40 lines: files changed; the one engine.py line added; smoke
+result; test counts; unknowns.

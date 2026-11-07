@@ -72,3 +72,55 @@ def test_state_ignores_unreadable_state_file(client: TestClient, tmp_path: Path)
 
     assert response.status_code == 200
     assert response.json() == {}
+
+
+def test_history_shape_sorting_and_cap(client: TestClient, tmp_path: Path) -> None:
+    guides = tmp_path / "plugin-data" / "butler" / "guides"
+    guides.mkdir(parents=True)
+    for i in range(55):
+        guide = {
+            "id": f"g{i:02d}",
+            "title": f"Guide {i}",
+            "state": {"status": "done" if i % 2 == 0 else "stopped"},
+            "steps": [{"say": f"Step {i}.1"}, {"say": f"Step {i}.2"}],
+            "verifications": [{"step": 0, "reason": "test"}],
+            "started_at": 1000.0 + i,
+        }
+        (guides / f"g{i:02d}.json").write_text(json.dumps(guide), encoding="utf-8")
+    # A malformed file must be skipped, not break the endpoint.
+    (guides / "broken.json").write_text("{not json", encoding="utf-8")
+
+    response = client.get("/history")
+
+    assert response.status_code == 200
+    rows = response.json()
+    assert isinstance(rows, list)
+    assert len(rows) == 50
+    assert [row["id"] for row in rows[:3]] == ["g54", "g53", "g52"]
+    assert rows[0]["started_at"] == 1054.0
+    assert rows[0]["title"] == "Guide 54"
+    assert rows[0]["status"] == "done"
+    assert rows[0]["steps"] == [{"say": "Step 54.1"}, {"say": "Step 54.2"}]
+    assert rows[0]["verifications"] == [{"step": 0, "reason": "test"}]
+    assert set(rows[0]) == {
+        "id", "title", "status", "steps", "verifications", "started_at"
+    }
+
+
+def test_history_reads_plugins_data_candidate(client: TestClient, tmp_path: Path) -> None:
+    guides = tmp_path / "plugins" / "butler" / "data" / "guides"
+    guides.mkdir(parents=True)
+    guide = {
+        "id": "fallback",
+        "title": "Fallback guide",
+        "state": {"status": "done"},
+        "steps": [],
+        "verifications": [],
+        "started_at": 12.0,
+    }
+    (guides / "fallback.json").write_text(json.dumps(guide), encoding="utf-8")
+
+    response = client.get("/history")
+
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()] == ["fallback"]

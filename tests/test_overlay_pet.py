@@ -39,7 +39,31 @@ def test_frames_dir_uses_configured_slug(tmp_path: Path, monkeypatch) -> None:
 
     assert overlay.resolve_frames_dir() == str(wanted)
     op = overlay.resolve_pet_op()
-    assert op == {"op": "pet", "frames_dir": str(wanted), "scale": 0.42}
+    assert op == {"op": "pet", "frames_dir": str(wanted), "scale": 0.42,
+                  "pet_enabled": True}
+
+
+def test_pet_op_marks_disabled_pet(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    wanted = _make_pet(tmp_path, "robotocat")
+    _write_config(
+        tmp_path,
+        "display:\n  pet:\n    enabled: false\n    slug: robotocat\n    scale: 0.5\n",
+    )
+
+    op = overlay.resolve_pet_op()
+
+    assert op["frames_dir"] == str(wanted)
+    assert op["pet_enabled"] is False
+
+
+def test_pet_op_defaults_enabled_when_config_is_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _make_pet(tmp_path, "robotocat")
+
+    op = overlay.resolve_pet_op()
+
+    assert op["pet_enabled"] is True
 
 
 def test_frames_dir_falls_back_to_first_valid_without_config(tmp_path: Path, monkeypatch) -> None:
@@ -145,7 +169,19 @@ def test_start_sends_one_pet_op_with_resolved_payload(tmp_path: Path, monkeypatc
         "op": "pet",
         "frames_dir": str(wanted),
         "scale": 0.5,
+        "pet_enabled": True,
     }
+
+
+def test_done_sends_the_farewell_op() -> None:
+    proc = _FakeProc()
+    controller = overlay.Overlay()
+    controller.proc = proc
+
+    controller.done()
+
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    assert [json.loads(line) for line in lines] == [{"op": "done"}]
 
 
 def test_start_sends_no_pet_op_when_no_pets(tmp_path: Path, monkeypatch) -> None:

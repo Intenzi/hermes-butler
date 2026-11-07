@@ -8,7 +8,9 @@ the guide falls back to in-app speech bubbles only - never hard-fails.
 Protocol: one JSON line per op on stdin -
   {"op":"ring","box":[x,y,w,h],"label":"...","say":"...","step":3,"total":7}
   {"op":"chip","step":3}
-  {"op":"pet","frames_dir":"...","scale":0.33}
+  {"op":"pet","frames_dir":"...","scale":0.33,"pet_enabled":true}
+  {"op":"launcher"}
+  {"op":"done"}
   {"op":"idle"}
   {"op":"quit"}
 """
@@ -91,7 +93,7 @@ def _unquote(value):
 
 
 def read_display_pet(path=None):
-    """Read display.pet.{slug,scale} from config.yaml without a YAML dependency.
+    """Read display.pet.{enabled,slug,scale} without a YAML dependency.
 
     Missing files, malformed lines, and unsupported values all degrade to an
     empty/partial dict; callers apply the defaults.
@@ -136,10 +138,20 @@ def read_display_pet(path=None):
             continue
         key, _, value = content.partition(":")
         key = key.strip()
-        if key in ("slug", "scale"):
+        if key in ("enabled", "slug", "scale"):
             values[key] = _unquote(value)
 
     return values
+
+
+def _resolved_enabled(values):
+    """display.pet.enabled, defaulting to enabled when the config is absent."""
+    raw = values.get("enabled")
+    if raw is None or raw == "" or raw.lower() in ("null", "~"):
+        return True
+    if raw.lower() in ("false", "no", "off", "0"):
+        return False
+    return True
 
 
 def _resolved_scale(values):
@@ -186,10 +198,12 @@ def resolve_pet_op():
     frames_dir = resolve_frames_dir()
     if not frames_dir:
         return None
+    values = read_display_pet()
     return {
         "op": "pet",
         "frames_dir": frames_dir,
-        "scale": _resolved_scale(read_display_pet()),
+        "scale": _resolved_scale(values),
+        "pet_enabled": _resolved_enabled(values),
     }
 
 
@@ -361,6 +375,10 @@ class Overlay:
 
     def idle(self):
         self._send({"op": "idle"})
+
+    def done(self):
+        """Tell the companion the guide finished so its double can wave off."""
+        self._send({"op": "done"})
 
     def quit(self):
         with self._io_lock:

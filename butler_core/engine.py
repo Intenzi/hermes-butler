@@ -225,6 +225,7 @@ def _poll_once(s):
             s["current_box"] = None
             s["current_label"] = None
             _OVERLAY.idle()
+            _OVERLAY.done()
         else:
             nxt = s["steps"][idx]
             s["state"]["say"] = nxt["say"]

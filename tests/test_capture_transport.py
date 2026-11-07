@@ -267,6 +267,11 @@ def test_doctor_reports_the_companion_grant_subject(monkeypatch) -> None:
 
     assert out["accessibility_granted"] is False
     assert out["accessibility_grant_subject"] == capture.GRANT_SUBJECT
+    assert out["accessibility_grant_subject"] == (
+        "Butler companion - the butler plugin's bundled helper")
     assert "Butler companion" in out["fix"]
     assert "Privacy & Security -> Accessibility" in out["fix"]
+    assert ("Because the butler reads the screen through its own small helper, "
+            "macOS asks once and remembers across updates.") in out["fix"]
+    assert "butler_core" not in out["fix"]
     assert "osascript" not in out["fix"]
