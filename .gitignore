@@ -2,4 +2,6 @@ __pycache__/
 *.pyc
 .venv/
 spike/out.json
+data/state.json
+data/guides/
 .DS_Store
