@@ -20,7 +20,7 @@ import {
   useQuery
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 
 const ID = 'butler'
 const ROUTE = '/butler'
@@ -30,6 +30,10 @@ const VERIFIED_CHIP_LIMIT = 6
 let rest = null
 let petCtx = null
 let lastSaid = null
+// smoke-test counters so the page can PROVE the plugin side spoke (or not):
+// petSayTicks increments on every say attempt, petLastTick stores wall-clock.
+let petSayTicks = 0
+let petLastTick = null
 
 function h(type, props, ...children) {
   let key = undefined
@@ -100,6 +104,78 @@ function Pane({ verified = [], sayLine = null, stallNote = null, progressLine = 
   )
 }
 
+/** One checklist row: box (checked / current / pending) + step say-line. */
+function TaskRow({ text, boxState, done }) {
+  const boxColor = done ? 'var(--ui-green, #6fd39a)'
+    : boxState === 'current' ? 'var(--ui-accent-local, #9aa3ea)' : 'rgba(138,143,152,.65)'
+  const textColor = done ? 'rgba(138,143,152,.95)' : '#eceef1'
+  return h('div', {
+    style: {
+      display: 'flex', alignItems: 'center', gap: 9,
+      padding: '7px 10px', borderRadius: 9,
+      background: boxState === 'current' ? 'rgba(122,134,255,.08)' : 'rgba(255,255,255,.03)',
+      border: boxState === 'current' ? '1px solid rgba(122,134,255,.35)' : '1px solid rgba(255,255,255,.06)'
+    }
+  },
+    h('span', {
+      style: {
+        flex: 'none', width: 18, height: 18, borderRadius: 5,
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: 12, fontWeight: 700, color: boxColor,
+        border: `1.5px solid ${boxColor}`
+      }
+    }, done ? '✓' : boxState === 'current' ? '•' : ''),
+    h('span', { style: { fontSize: 12.5, color: textColor, lineHeight: 1.35 } }, asText(text) || '')
+  )
+}
+
+/** Task checklist for a guide: boxes per step, current step highlighted. */
+function StepsChecklist({ steps = [], verified = [], currentIdx = 0, live = false }) {
+  const doneSet = new Set(asArray(verified).map(v => Number(v && typeof v === 'object' ? v.step : v)))
+  return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 } },
+    asArray(steps).map((s, i) => h(TaskRow, {
+      key: i,
+      text: asText(s && s.say),
+      done: doneSet.has(i),
+      boxState: doneSet.has(i) ? 'done' : (live && i === currentIdx ? 'current' : 'pending')
+    }))
+  )
+}
+
+/** Collapsed summary of a finished guide — a closed dropdown by default. */
+function CompletedGuide({ guide, verified }) {
+  const rows = asArray(verified)
+  const title = asText(guide && guide.title) || 'Guide'
+  const state = guide && guide.state || {}
+  const status = asText(state.status) || 'done'
+  const steps = asArray(guide && guide.steps)
+  return h('details', {
+    style: {
+      marginTop: 8, borderRadius: 10, border: '1px solid rgba(255,255,255,.08)',
+      background: 'rgba(255,255,255,.03)', overflow: 'hidden'
+    }
+  },
+    h('summary', {
+      style: {
+        cursor: 'pointer', listStyle: 'none', outline: 'none',
+        padding: '8px 12px', fontSize: 12.5, color: '#8a8f98',
+        display: 'flex', alignItems: 'center', gap: 8
+      }
+    },
+      h('span', { style: { fontSize: 9, color: '#6f7784' } }, '▸'),
+      h('span', { style: { color: '#c7cbd2', fontWeight: 500, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+        `Last guide · ${title}`),
+      h('span', {
+        style: { fontSize: 10.5, padding: '1px 8px', borderRadius: 99, border: '1px solid rgba(111,211,154,.4)', color: '#6fd39a' }
+      }, `${rows.length}/${steps.length} verified`),
+      h('span', { style: { fontSize: 10, color: '#6f7784' } }, status)
+    ),
+    h('div', { style: { padding: '0 12px 10px' } },
+      h(StepsChecklist, { steps, verified: rows, currentIdx: Infinity, live: false })
+    )
+  )
+}
+
 function ButlerApp() {
   const query = useQuery({
     queryKey: ['butler', 'state'],
@@ -126,18 +202,57 @@ function ButlerApp() {
 
   const sayLine = asText(step && step.say) || asText(state.say)
 
-  // Pet speech bubble: speak each step's say-line exactly once via ctx.pet.say.
-  // The Hermes pet canvas is app-owned; plugins only get the bubble API.
+  // Pet speech bubble driven by a SELF-RE-EVALUATING 2 s heartbeat instead of
+  // React re-renders. When the REST feed goes stale (gateway restart, plugin
+  // off/on), React Query stops producing new renders — an effect keyed on
+  // data would never re-run and the last say would repeat forever. The
+  // heartbeat re-checks on its own clock:
+  //   running + fresh capture (<5 s)  → say (or re-say at the 6 s mark)
+  //   running + stale/missing capture → clear (dead feed = silence)
+  //   done/stopped                    → announce the exit line once
+  //   nothing to say                  → clear
+  const stateRef = useRef({ sayLine: null, status: null, capturedAt: null })
+  stateRef.current = {
+    sayLine,
+    status: asText(state && state.status),
+    capturedAt: guide && guide.last_captured_at ? Number(guide.last_captured_at) : null
+  }
+  const sayHeartbeatRef = useRef({ lastAt: 0 })
   useEffect(() => {
-    const text = sayLine
-    if (!text || text === lastSaid) return
-    lastSaid = text
-    try {
-      if (petCtx && typeof petCtx.say === 'function') {
-        petCtx.say(text, { tone: 'info' })
+    const beat = () => {
+      const cur = stateRef.current
+      if (!cur.sayLine) {
+        try { petCtx && petCtx.clear && petCtx.clear('butler-say') } catch (err) { }
+        lastSaid = null
+        return
       }
-    } catch (err) { /* pet not visible or bubble api unavailable */ }
-  }, [sayLine])
+      if (cur.status === 'done' || cur.status === 'stopped') {
+        if (lastSaid === cur.sayLine) return
+        try { petCtx && typeof petCtx.say === 'function' && petCtx.say(cur.sayLine, { tone: 'info', ttlMs: 9000, id: 'butler-say' }) } catch (err) { }
+        petSayTicks += 1
+        petLastTick = new Date().toLocaleTimeString()
+        lastSaid = cur.sayLine
+        return
+      }
+      const fresh = cur.status !== 'running' || (
+        Number.isFinite(cur.capturedAt) && (Date.now() / 1000) - cur.capturedAt < 5)
+      if (!fresh) {
+        try { petCtx && petCtx.clear && petCtx.clear('butler-say') } catch (err) { }
+        lastSaid = null
+        return
+      }
+      const now = Date.now()
+      if (lastSaid === cur.sayLine && now - sayHeartbeatRef.current.lastAt < 6000) return
+      try { petCtx && typeof petCtx.say === 'function' && petCtx.say(cur.sayLine, { tone: 'info', ttlMs: 9000, id: 'butler-say' }) } catch (err) { }
+      petSayTicks += 1
+      petLastTick = new Date().toLocaleTimeString()
+      lastSaid = cur.sayLine
+      sayHeartbeatRef.current.lastAt = now
+    }
+    beat()
+    const id = window.setInterval(beat, 2000)
+    return () => window.clearInterval(id)
+  }, [])
   const stallNote = asText(state.note) || (stalled
     ? `Step ${currentStep + 1} is still unverified. The butler is waiting on the OS layer; ask the agent to revise or skip this step.`
     : overlay && overlay.startsWith('unavailable')
@@ -148,6 +263,7 @@ function ButlerApp() {
     : `Step ${currentStep + 1} of ${steps.length} · ${verifications.length > 0
       ? `${verifications.length} verified`
       : 'unverified'}`
+  const petSmokeLine = `pet.say smoke: ${petSayTicks} says fired (last ${petLastTick || 'never'})${petCtx ? '' : ' — ctx.pet MISSING from this app build'}`
 
   return h('div', {
     className: 'hermes-p-4',
@@ -177,11 +293,11 @@ function ButlerApp() {
     }, 'Butler backend not reachable: install and enable the butler plugin, then reload desktop plugins (⌘K → Reload desktop plugins).'),
 
     !error && !guide && h(EmptyState, {
-      title: 'No guide is running',
+      title: 'No butler task running',
       description: 'Ask in chat to fix something on your Mac, or run `hermes butler doctor`. The butler appears when a plan needs your hands on the screen.'
     }),
 
-    guide && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+    guide && (status === 'running' || status === 'stalled' || status === 'capture_failed') && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
       h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
         h('span', { style: { fontSize: 13.5, fontWeight: 600, color: '#eceef1' } },
           asText(guide.title) || 'Butler guide'),
@@ -204,15 +320,36 @@ function ButlerApp() {
         title: 'This guide has no steps yet',
         description: 'The guide exists but has no steps to show. Ask the agent to restart or revise the plan.'
       }),
-      h(Pane, {
+      steps.length > 0 && h(StepsChecklist, {
+        steps,
         verified: verifications,
-        sayLine,
-        stallNote,
-        progressLine
+        currentIdx: currentStep,
+        live: true
       }),
+      (sayLine || stallNote) && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 } },
+        progressLine && h('div', { style: { fontSize: 11.5, color: '#8a8f98' } }, progressLine),
+        sayLine && h('div', {
+          style: {
+            fontSize: 13, color: '#eceef1', background: 'rgba(255,255,255,.05)',
+            border: '1px solid rgba(255,255,255,.07)', borderRadius: 10, padding: '10px 14px'
+          }
+        }, asText(sayLine)),
+        stallNote && h('div', {
+          style: {
+            fontSize: 12, color: '#f5c26b',
+            border: '1px solid rgba(245,194,107,.35)', borderRadius: 10, padding: '8px 12px'
+          }
+        }, asText(stallNote))
+      ),
       currentLabel && h('div', {
         style: { fontSize: 11.5, color: '#8a8f98' }
-      }, 'ring parked on: ', h('b', { style: { color: '#d0d6e0', fontWeight: 500 } }, currentLabel.slice(0, 60)))
+      }, 'ring parked on: ', h('b', { style: { color: '#d0d6e0', fontWeight: 500 } }, currentLabel.slice(0, 60))),
+      h('div', { style: { fontSize: 11, color: '#6f7784', marginTop: 4 } }, petSmokeLine)
+    ),
+
+    guide && (status === 'done' || status === 'stopped') && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+      CompletedGuide({ guide, verified: verifications }),
+      h('div', { style: { fontSize: 11, color: '#6f7784', marginTop: 4 } }, petSmokeLine)
     )
   )
 }

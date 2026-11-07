@@ -1,0 +1,36 @@
+{
+ "id": "e369b1febe",
+ "title": "Demo: walk to Network pane",
+ "steps": [
+  {
+   "say": "Open System Settings",
+   "expect": {
+    "app": "System Settings"
+   }
+  },
+  {
+   "say": "Click Network in the sidebar",
+   "find": {
+    "label": "Network"
+   },
+   "expect": {
+    "visible": "Network"
+   }
+  }
+ ],
+ "state": {
+  "idx": 0,
+  "status": "stalled",
+  "say": "Open System Settings",
+  "step_opened_at": 1793973159.185142,
+  "note": "step 1 unverified for 120s; expect=expectation_unmet"
+ },
+ "verifications": [],
+ "overlay": "waiting",
+ "started_at": 1793973159.185143,
+ "last_capture_app": "Hermes",
+ "last_captured_at": 1793973280.3303628,
+ "current_box": null,
+ "current_label": null,
+ "poll_errors": 0
+}

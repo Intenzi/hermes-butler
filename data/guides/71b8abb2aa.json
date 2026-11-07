@@ -19,10 +19,12 @@
  ],
  "state": {
   "idx": 0,
-  "status": "running",
-  "say": "Open System Settings"
+  "status": "stopped",
+  "say": "Open System Settings",
+  "note": "orphaned guide with malformed find.label schema; verify-key never fired"
  },
  "verifications": [],
  "overlay": "ringing",
- "started_at": 1793971223.4670238
+ "started_at": 1793971223.4670238,
+ "current_box": null
 }

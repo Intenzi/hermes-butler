@@ -6,6 +6,7 @@ description: >
   progress), verifying each step from the macOS Accessibility layer. macOS in
   v1; capture and overlay are swappable modules for later platforms.
 requires_hermes: ">=0.22.5"
+api: plugin_api.py
 provides_tools:
   - butler_guide_start
   - butler_guide_status

@@ -48,10 +48,27 @@ def _window_count(app):
 
 
 def find_running_app(target=None):
-    """Frontmost app if target is None; else best name match with open windows."""
+    """Frontmost app if target is None; else best name match with open windows.
+
+    "Frontmost" is read from the CGWindowList z-order (topmost layer-0 window
+    on screen), NOT from NSWorkspace.frontmostApplication(): in a long-lived
+    tool host that never pumps an NSApplication runloop, NSWorkspace's
+    frontmost cache never refreshes and stays welded to the app that held
+    focus at AppKit init - the butler then walks a screen that stopped moving.
+    """
     if not HAS_MAC:
         return None, None
-    ws = NSWorkspace.sharedWorkspace()
+    wins = _topmost_layer0_windows()
+    if target is None:
+        if wins:
+            w = wins[0]
+            return w["pid"], w["name"]
+    else:
+        needle = target.lower()
+        for w in wins:
+            if w["name"] and needle in w["name"].lower():
+                return w["pid"], w["name"]
+    ws = NSWorkspace.sharedWorkspace()  # cached fallback; usually stale host-side
     if target is None:
         app = ws.frontmostApplication()
         if app is None:
@@ -70,6 +87,28 @@ def find_running_app(target=None):
         return None, None
     cands.sort(key=_window_count, reverse=True)
     return int(cands[0].processIdentifier()), cands[0].localizedName()
+
+
+def _topmost_layer0_windows():
+    """On-screen normal-level windows in z-order (topmost first). Never raises."""
+    try:
+        import Quartz as QZ
+        opts = getattr(QZ, "kCGWindowListOptionOnScreenOnly") | getattr(
+            QZ, "kCGWindowListExcludeDesktopElements")
+        info = getattr(QZ, "CGWindowListCopyWindowInfo")(
+            opts, getattr(QZ, "kCGNullWindowID"))
+        out = []
+        for w in (info or []):
+            try:
+                if w.get("kCGWindowLayer") == 0 and int(w.get("kCGWindowOwnerPID") or 0) > 0:
+                    out.append({"pid": int(w["kCGWindowOwnerPID"]),
+                                "name": w.get("kCGWindowOwnerName") or "",
+                                "title": w.get("kCGWindowName")})
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
 
 
 def copy_attr(el, name):
@@ -165,6 +204,17 @@ def capture(target=None, max_elements=DEFAULT_MAX, depth=DEFAULT_DEPTH):
         return result
     root = AS.AXUIElementCreateApplication(pid)
     result["app"] = name
+    # What actually holds keyboard focus right now (click feedback): the
+    # expect-engine uses this for the "focus" verdict so a step is completed
+    # by acting on the control, not by it merely appearing on screen.
+    try:
+        focused_el = copy_attr(root, "AXFocusedUIElement")
+        if focused_el is not None:
+            _role, flabel, _box = read_fields(focused_el)
+            if isinstance(flabel, str) and flabel.strip():
+                result["focused"] = flabel.strip()[:120]
+    except Exception:
+        pass
     elements = []
     for win in _windows_of(root):
         title = copy_attr(win, "AXTitle") or copy_attr(win, "AXDescription")
@@ -184,7 +234,14 @@ def capture(target=None, max_elements=DEFAULT_MAX, depth=DEFAULT_DEPTH):
 
 
 def best_match(elements, label_needle, role_needle=None):
-    """Score best element for a step find. Returns element dict or None."""
+    """Score best element for a step find. Returns element dict or None.
+
+    Window roots are ranked below ordinary controls on purpose: native app
+    windows carry the pane name as their title (System Settings' window is
+    literally "Network" when that pane opens), so a plain label match would
+    ring the entire window instead of the sidebar/control the user should
+    touch. A window only rings when no other element matches.
+    """
     if not label_needle:
         return None
     needle = label_needle.lower()
@@ -198,6 +255,9 @@ def best_match(elements, label_needle, role_needle=None):
             s = 3 if needle == label else (2 if label.startswith(needle) else 1)
             if role_needle and role_needle.lower() in role:
                 s += 2
+            # keep window roots from winning ties over real controls
+            if role and "axwindow" in role:
+                s -= 4
             if e.get("box") and e["box"][0] is not None:
                 s += 1
             scores.append((s, e))
@@ -214,12 +274,23 @@ def expect_pending(expect, snapshot, best):
     app = expect.get("app")
     if app and snapshot.get("app") and app.lower() in snapshot["app"].lower():
         return {"verified": True, "reason": "app_focused"}
+    window = expect.get("window")
+    if window and snapshot.get("window") and window.lower() in snapshot["window"].lower():
+        # the pane the user landed on (its root window title carries the pane
+        # name in apps like System Settings) — a click-observable: it only
+        # becomes true after the user navigates, unlike "visible".
+        return {"verified": True, "reason": "pane_reached"}
     visible = expect.get("visible")
     if visible:
         for e in snapshot.get("elements", []):
             if e.get("label") and visible.lower() in e["label"].lower():
                 return {"verified": True, "reason": "element_visible"}
     focus = expect.get("focus")
-    if focus and best is not None and best.get("label"):
-        return {"verified": True, "reason": "target_present"}
+    if focus:
+        # "focus" means the user acted on the control: verify against the
+        # snapshot's focused element label, not mere presence (which is
+        # already true the moment the control exists).
+        focused = snapshot.get("focused")
+        if isinstance(focused, str) and focus.lower() in focused.lower():
+            return {"verified": True, "reason": "element_focused"}
     return {"verified": False, "reason": "expectation_unmet"}

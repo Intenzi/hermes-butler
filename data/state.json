@@ -1,1 +1,1 @@
-{"guide": {"id": "71b8abb2aa", "title": "Guide", "steps": [{"expect": {"app": "System Settings"}, "find.label": "System Settings", "say": "Open System Settings"}, {"expect": {"visible": "Network"}, "find.label": "Network", "say": "Click Network in the sidebar"}], "state": {"idx": 0, "status": "running", "say": "Open System Settings"}, "verifications": [], "overlay": "ringing", "started_at": 1793971223.4670238}, "overlay": "ringing", "generated_at": 1793971661.773199}
+{}
