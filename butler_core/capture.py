@@ -1,236 +1,122 @@
 """macOS Accessibility capture for the butler.
 
-Python 3.9-safe. Import-guarded so non-macOS installs load cleanly.
-"""
-import json
-import re
+The Accessibility walk lives in the bundled Swift companion
+(``overlay_swift/ButlerOverlay.swift``) so the plugin has exactly one stable
+TCC grant subject: the compiled helper binary. This module is the thin Python
+transport over that already-running companion's stdin/stdout.
 
-try:
-    import ApplicationServices as AS
-    from AppKit import NSWorkspace
-    HAS_MAC = True
-except Exception:  # pragma: no cover - non-macOS
-    AS = None
-    NSWorkspace = None
-    HAS_MAC = False
+Python 3.9-safe. The pure matching helpers at the bottom (best_match /
+expect_pending) still run in-process; engine.py keeps the same public API and
+snapshot shape.
+"""
+import sys
+
+try:  # package import
+    from . import overlay as bp_overlay
+except ImportError:  # pragma: no cover - direct module import
+    import overlay as bp_overlay
 
 DEFAULT_MAX = 150
 DEFAULT_DEPTH = 10
-_ACCESS_ERR = 252
+REQUEST_TIMEOUT = 5.0
+GRANT_SUBJECT = "Butler companion (the butler plugin's bundled helper)"
+GRANT_FIX = (
+    "Grant Accessibility to \"%s\" in System Settings -> Privacy & Security -> "
+    "Accessibility, then try the guide again. The companion binary keeps the "
+    "same path across Hermes updates, so the grant survives updates." % GRANT_SUBJECT
+)
+
+# The helper is the only thing that needs Accessibility; the Python host is not
+# a grant subject anymore.
+HAS_MAC = sys.platform == "darwin"
 
 
 def mac_supported():
     return HAS_MAC
 
 
+def _helper():
+    """Return the shared companion handle (the same process the overlay uses)."""
+    return bp_overlay.shared_overlay()
+
+
+def _request(op, timeout=None):
+    """Send one op to the companion and return its parsed JSON line, or None."""
+    if timeout is None:
+        timeout = REQUEST_TIMEOUT
+    try:
+        helper = _helper()
+        response = helper.request(op, timeout=timeout)
+        return response if isinstance(response, dict) else None
+    except Exception:  # noqa: BLE001 - transport must never raise
+        return None
+
+
+def _failed_snapshot(note, fix=GRANT_FIX, prompted=False):
+    return {
+        "trusted": False,
+        "app": None,
+        "window": None,
+        "count": 0,
+        "with_box": 0,
+        "elements": [],
+        "prompted": prompted,
+        "note": note,
+        "fix": fix,
+    }
+
+
 def trusted():
+    """Silent Accessibility trust check via the companion (no dialog)."""
     if not HAS_MAC:
         return False
-    return bool(AS.AXIsProcessTrusted())
+    reply = _request({"op": "axtrusted"})
+    if not isinstance(reply, dict):
+        return False
+    return bool(reply.get("trusted"))
 
 
 def _ask_accessibility():
-    """Pop macOS' own Accessibility grant dialog for this process. Best-effort."""
+    """Raise macOS' own Accessibility grant dialog for the companion. Best-effort."""
     if not HAS_MAC:
         return False
-    try:
-        opts = {AS.kAXTrustedCheckOptionPrompt: True}
-        return bool(AS.AXIsProcessTrustedWithOptions(opts))
-    except Exception:
+    reply = _request({"op": "axtrusted", "prompt": True})
+    if not isinstance(reply, dict):
         return False
+    return bool(reply.get("prompted"))
 
 
-def _window_count(app):
+def _capture_op(target, max_elements, depth):
     try:
-        return len(app.windows())
-    except Exception:
-        return 0
-
-
-def find_running_app(target=None):
-    """Frontmost app if target is None; else best name match with open windows.
-
-    "Frontmost" is read from the CGWindowList z-order (topmost layer-0 window
-    on screen), NOT from NSWorkspace.frontmostApplication(): in a long-lived
-    tool host that never pumps an NSApplication runloop, NSWorkspace's
-    frontmost cache never refreshes and stays welded to the app that held
-    focus at AppKit init - the butler then walks a screen that stopped moving.
-    """
-    if not HAS_MAC:
-        return None, None
-    wins = _topmost_layer0_windows()
-    if target is None:
-        if wins:
-            w = wins[0]
-            return w["pid"], w["name"]
-    else:
-        needle = target.lower()
-        for w in wins:
-            if w["name"] and needle in w["name"].lower():
-                return w["pid"], w["name"]
-    ws = NSWorkspace.sharedWorkspace()  # cached fallback; usually stale host-side
-    if target is None:
-        app = ws.frontmostApplication()
-        if app is None:
-            return None, None
-        return int(app.processIdentifier()), app.localizedName()
-    cands = []
-    for a in ws.runningApplications():
-        name = a.localizedName()
-        try:
-            alive = not a.isTerminated()
-        except Exception:
-            alive = True
-        if name and target.lower() in name.lower() and alive:
-            cands.append(a)
-    if not cands:
-        return None, None
-    cands.sort(key=_window_count, reverse=True)
-    return int(cands[0].processIdentifier()), cands[0].localizedName()
-
-
-def _topmost_layer0_windows():
-    """On-screen normal-level windows in z-order (topmost first). Never raises."""
+        limit = int(max_elements)
+    except (TypeError, ValueError):
+        limit = DEFAULT_MAX
     try:
-        import Quartz as QZ
-        opts = getattr(QZ, "kCGWindowListOptionOnScreenOnly") | getattr(
-            QZ, "kCGWindowListExcludeDesktopElements")
-        info = getattr(QZ, "CGWindowListCopyWindowInfo")(
-            opts, getattr(QZ, "kCGNullWindowID"))
-        out = []
-        for w in (info or []):
-            try:
-                if w.get("kCGWindowLayer") == 0 and int(w.get("kCGWindowOwnerPID") or 0) > 0:
-                    out.append({"pid": int(w["kCGWindowOwnerPID"]),
-                                "name": w.get("kCGWindowOwnerName") or "",
-                                "title": w.get("kCGWindowName")})
-            except Exception:
-                continue
-        return out
-    except Exception:
-        return []
-
-
-def copy_attr(el, name):
-    err, value = AS.AXUIElementCopyAttributeValue(el, name, None)
-    if err != 0 or value is None:
-        return None
-    return value
-
-
-def _ax_point_size(v, kind):
-    try:
-        t = AS.AXValueGetType(v)
-        if t == AS.kAXValueCGPointType and kind == "point":
-            ok, pt = AS.AXValueGetValue(v, AS.kAXValueCGPointType, None)
-            if ok and hasattr(pt, "x"):
-                return [int(pt.x), int(pt.y)]
-        if t == AS.kAXValueCGSizeType and kind == "size":
-            ok, sz = AS.AXValueGetValue(v, AS.kAXValueCGSizeType, None)
-            if ok and hasattr(sz, "width"):
-                return [int(sz.width), int(sz.height)]
-    except Exception:
-        pass
-    return None
-
-
-def read_fields(el):
-    role = copy_attr(el, "AXRole")
-    title = copy_attr(el, "AXTitle")
-    desc = copy_attr(el, "AXDescription")
-    val = copy_attr(el, "AXValue")
-    pos = copy_attr(el, "AXPosition")
-    size = copy_attr(el, "AXSize")
-    label = None
-    for cand in (title, desc):
-        if isinstance(cand, str) and cand.strip():
-            label = cand.strip()
-            break
-    if label is None and isinstance(val, str) and val.strip():
-        label = val.strip()[:80]
-    box = [None, None, None, None]
-    p = _ax_point_size(pos, "point")
-    s = _ax_point_size(size, "size")
-    if isinstance(p, list) and isinstance(s, list):
-        box = [p[0], p[1], s[0], s[1]]
-    role_s = str(role) if role is not None else "unknown"
-    return role_s, label, box
-
-
-def _walk(el, depth, out, budget):
-    if el is None or depth < 0 or len(out) >= budget:
-        return
-    role, label, box = read_fields(el)
-    if label is not None or box is not None:
-        out.append({"role": role, "label": label, "box": box})
-    kids = copy_attr(el, "AXChildren")
-    if kids is not None and hasattr(kids, "__iter__"):
-        for kid in kids:
-            if len(out) >= budget:
-                return
-            _walk(kid, depth - 1, out, budget)
-
-
-def _windows_of(root):
-    win = copy_attr(root, "AXFocusedWindow")
-    if win is not None:
-        return [win]
-    wins = copy_attr(root, "AXWindows")
-    if wins is not None and hasattr(wins, "__iter__"):
-        return list(wins)
-    return [root]
+        level = int(depth)
+    except (TypeError, ValueError):
+        level = DEFAULT_DEPTH
+    return {
+        "op": "axcapture",
+        "target": target if isinstance(target, str) else None,
+        "max_elements": limit,
+        "depth": level,
+    }
 
 
 def capture(target=None, max_elements=DEFAULT_MAX, depth=DEFAULT_DEPTH):
-    """Element list of the target/frontmost app. Never raises for OS errors."""
+    """Element list of the target/frontmost app. Never raises for OS errors.
+
+    The returned dict is the companion's snapshot, unchanged; on silence or a
+    dead helper it degrades to the untrusted/failed snapshot shape.
+    """
     if not HAS_MAC:
-        return {"platform": "macos_only", "error": "pyobjc not available on this platform"}
-    result = {"trusted": trusted(), "app": None, "window": None,
-              "count": 0, "with_box": 0, "elements": []}
-    if not result["trusted"]:
-        prompted = _ask_accessibility()
-        if prompted:
-            # a dialog requires a user click; this call stays empty this round
-            result["trusted"] = trusted()
-        result["prompted"] = prompted
-    if not result["trusted"]:
-        result["note"] = "Accessibility not granted to this process"
-        result["fix"] = ("A system dialog was raised (or use `hermes butler doctor --ask`). "
-                         "After granting, restart the Hermes host process.")
-        return result
-    pid, name = find_running_app(target)
-    if pid is None:
-        result["error"] = "no running app matches target" if target else "no frontmost app"
-        return result
-    root = AS.AXUIElementCreateApplication(pid)
-    result["app"] = name
-    # What actually holds keyboard focus right now (click feedback): the
-    # expect-engine uses this for the "focus" verdict so a step is completed
-    # by acting on the control, not by it merely appearing on screen.
-    try:
-        focused_el = copy_attr(root, "AXFocusedUIElement")
-        if focused_el is not None:
-            _role, flabel, _box = read_fields(focused_el)
-            if isinstance(flabel, str) and flabel.strip():
-                result["focused"] = flabel.strip()[:120]
-    except Exception:
-        pass
-    elements = []
-    for win in _windows_of(root):
-        title = copy_attr(win, "AXTitle") or copy_attr(win, "AXDescription")
-        if result["window"] is None and isinstance(title, str):
-            result["window"] = title
-        before = len(elements)
-        _walk(win, depth, elements, max_elements)
-        if len(elements) >= max_elements:
-            break
-    for i, e in enumerate(elements):
-        e["id"] = i
-        if e["box"][0] is not None:
-            result["with_box"] += 1
-    result["elements"] = elements[:max_elements]
-    result["count"] = len(result["elements"])
-    return result
+        return {"platform": "macos_only", "error": "Butler companion capture is macOS-only"}
+    op = _capture_op(target, max_elements, depth)
+    reply = _request(op)
+    if isinstance(reply, dict):
+        return reply
+    return _failed_snapshot(
+        "Butler companion did not return a capture within %gs" % REQUEST_TIMEOUT)
 
 
 def best_match(elements, label_needle, role_needle=None):

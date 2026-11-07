@@ -13,6 +13,8 @@
 //    {"op":"ring","box":[x,y,w,h],"label":"...","say":"...","step":n,"total":m}
 //    {"op":"chip","step":n}
 //    {"op":"pet","frames_dir":"...","scale":0.33}
+//    {"op":"axtrusted","prompt":true}
+//    {"op":"axcapture","target":null,"max_elements":150,"depth":10}
 //    {"op":"idle"}
 //    {"op":"quit"}
 //
@@ -23,6 +25,7 @@
 //
 
 import AppKit
+import ApplicationServices
 import CoreGraphics
 
 // MARK: - Logging
@@ -257,6 +260,337 @@ private func makeParagraphStyle(lineBreakMode: NSLineBreakMode) -> NSParagraphSt
     return style
 }
 
+// MARK: - Accessibility capture
+
+// This is a 1:1 port of the Python AX walk that used to live in capture.py.
+// The companion binary is the single TCC grant subject, so AX calls happen
+// here, on the same process that already draws rings/chips/pets.
+
+private let axDefaultMaxElements = 150
+private let axDefaultDepth = 10
+
+private struct AXCaptureSpec {
+    let target: String?
+    let maxElements: Int
+    let depth: Int
+}
+
+private func copyAXAttribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    var value: CFTypeRef?
+    let error = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+    // AXError.apiDisabled (252) and every other OS error degrade to "missing".
+    // The capture path never raises.
+    guard error == .success, let value = value else {
+        return nil
+    }
+    return value
+}
+
+private func axElement(from raw: Any?) -> AXUIElement? {
+    guard let raw = raw else {
+        return nil
+    }
+    // unsafeBitCast needs the 8-byte object reference; casting the 16-byte
+    // Any existential directly would trap.
+    let object = raw as AnyObject
+    guard CFGetTypeID(object) == AXUIElementGetTypeID() else {
+        return nil
+    }
+    return unsafeBitCast(object, to: AXUIElement.self)
+}
+
+private func axString(_ element: AXUIElement, _ name: String) -> String? {
+    return copyAXAttribute(element, name) as? String
+}
+
+private func axInt(_ value: CGFloat) -> Int? {
+    // Accessibility coordinates are small; reject non-finite/absurd values
+    // instead of trapping in Int(CGFloat).
+    let safeLimit = 9_007_199_254_740_992.0 // 2^53
+    guard value.isFinite, value > -safeLimit, value < safeLimit else {
+        return nil
+    }
+    return Int(value) // truncates toward zero, like Python int()
+}
+
+private func axPointOrSize(_ raw: Any?, kind: String) -> [Int]? {
+    guard let raw = raw else {
+        return nil
+    }
+    let object = raw as AnyObject
+    guard CFGetTypeID(object) == AXValueGetTypeID() else {
+        return nil
+    }
+    let value: AXValue = unsafeBitCast(object, to: AXValue.self)
+    let type = AXValueGetType(value)
+    if type == .cgPoint && kind == "point" {
+        var point = CGPoint.zero
+        guard AXValueGetValue(value, .cgPoint, &point),
+              let x = axInt(point.x), let y = axInt(point.y) else {
+            return nil
+        }
+        return [x, y]
+    }
+    if type == .cgSize && kind == "size" {
+        var size = CGSize.zero
+        guard AXValueGetValue(value, .cgSize, &size),
+              let width = axInt(size.width), let height = axInt(size.height) else {
+            return nil
+        }
+        return [width, height]
+    }
+    return nil
+}
+
+private struct AXFields {
+    let role: String
+    let label: String?
+    let box: [Any]
+}
+
+private func readAXFields(_ element: AXUIElement) -> AXFields {
+    let roleRaw = copyAXAttribute(element, "AXRole")
+    let title = axString(element, "AXTitle")
+    let description = axString(element, "AXDescription")
+    let rawValue = copyAXAttribute(element, "AXValue")
+    let position = copyAXAttribute(element, "AXPosition")
+    let size = copyAXAttribute(element, "AXSize")
+
+    var label: String?
+    for candidate in [title, description] {
+        guard let candidate = candidate else { continue }
+        let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            label = trimmed
+            break
+        }
+    }
+    if label == nil, let valueText = rawValue as? String {
+        let trimmed = valueText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            label = String(trimmed.prefix(80))
+        }
+    }
+
+    var box: [Any] = [NSNull(), NSNull(), NSNull(), NSNull()]
+    if let point = axPointOrSize(position, kind: "point"),
+       let dimensions = axPointOrSize(size, kind: "size"),
+       point.count == 2, dimensions.count == 2 {
+        box = [point[0], point[1], dimensions[0], dimensions[1]]
+    }
+
+    let role: String
+    if let roleRaw = roleRaw {
+        role = (roleRaw as? String) ?? String(describing: roleRaw)
+    } else {
+        role = "unknown"
+    }
+    return AXFields(role: role, label: label, box: box)
+}
+
+private func walkAX(_ element: AXUIElement,
+                    depth: Int,
+                    out: inout [[String: Any]],
+                    budget: Int) {
+    if depth < 0 || out.count >= budget {
+        return
+    }
+    let fields = readAXFields(element)
+    // read_fields always returns a box (possibly all-null), so every visited
+    // element is recorded - matching the Python walk exactly.
+    out.append(["role": fields.role,
+                "label": fields.label ?? NSNull(),
+                "box": fields.box])
+
+    guard let rawKids = copyAXAttribute(element, "AXChildren"),
+          let kids = rawKids as? [Any] else {
+        return
+    }
+    for kid in kids {
+        if out.count >= budget {
+            return
+        }
+        if let kidElement = axElement(from: kid) {
+            walkAX(kidElement, depth: depth - 1, out: &out, budget: budget)
+        }
+    }
+}
+
+private func axWindows(of root: AXUIElement) -> [AXUIElement] {
+    if let focusedWindow = axElement(from: copyAXAttribute(root, "AXFocusedWindow")) {
+        return [focusedWindow]
+    }
+    if let rawWindows = copyAXAttribute(root, "AXWindows"),
+       let windows = rawWindows as? [Any] {
+        return windows.compactMap { axElement(from: $0) }
+    }
+    return [root]
+}
+
+private func axWindowTitle(_ window: AXUIElement) -> String? {
+    // Python: copy_attr(AXTitle) or copy_attr(AXDescription)
+    if let title = axString(window, "AXTitle"), !title.isEmpty {
+        return title
+    }
+    return axString(window, "AXDescription")
+}
+
+private struct AXRunningWindow {
+    let pid: pid_t
+    let name: String
+    let title: String?
+}
+
+private func axTopmostLayer0Windows() -> [AXRunningWindow] {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+    var out: [AXRunningWindow] = []
+    for window in info {
+        guard let layer = intValue(window[kCGWindowLayer as String]), layer == 0,
+              let rawPid = intValue(window[kCGWindowOwnerPID as String]), rawPid > 0 else {
+            continue
+        }
+        out.append(AXRunningWindow(
+            pid: pid_t(rawPid),
+            name: (window[kCGWindowOwnerName as String] as? String) ?? "",
+            title: window[kCGWindowName as String] as? String))
+    }
+    return out
+}
+
+private func findRunningApp(_ target: String?) -> (pid: pid_t?, name: String?) {
+    let windows = axTopmostLayer0Windows()
+    if target == nil {
+        if let first = windows.first {
+            return (first.pid, first.name)
+        }
+    } else if let target = target {
+        let needle = target.lowercased()
+        for window in windows {
+            if !window.name.isEmpty && window.name.lowercased().contains(needle) {
+                return (window.pid, window.name)
+            }
+        }
+    }
+
+    let workspace = NSWorkspace.shared
+    if target == nil {
+        guard let app = workspace.frontmostApplication else {
+            return (nil, nil)
+        }
+        return (app.processIdentifier, app.localizedName)
+    }
+
+    let needle = (target ?? "").lowercased()
+    var candidates: [NSRunningApplication] = []
+    for app in workspace.runningApplications {
+        guard let name = app.localizedName, !name.isEmpty,
+              name.lowercased().contains(needle), !app.isTerminated else {
+            continue
+        }
+        candidates.append(app)
+    }
+    // Python sorts matches by app.windows() count, but NSRunningApplication
+    // exposes no window list so that count is always 0; stable first-match is
+    // the same observable behavior.
+    guard let first = candidates.first else {
+        return (nil, nil)
+    }
+    return (first.processIdentifier, first.localizedName)
+}
+
+private func axCaptureSnapshot(target: String?,
+                               maxElements: Int,
+                               depth: Int) -> [String: Any] {
+    var result: [String: Any] = [
+        "trusted": AXIsProcessTrusted(),
+        "app": NSNull(),
+        "window": NSNull(),
+        "count": 0,
+        "with_box": 0,
+        "elements": [Any](),
+    ]
+
+    guard (result["trusted"] as? Bool) == true else {
+        result["prompted"] = false
+        result["note"] = "Accessibility not granted to this process"
+        result["fix"] = "Grant Accessibility to \"Butler companion (the butler plugin's bundled helper)\" in System Settings -> Privacy & Security -> Accessibility, then try the guide again."
+        return result
+    }
+
+    let found = findRunningApp(target)
+    guard let pid = found.pid else {
+        result["error"] = target == nil ? "no frontmost app" : "no running app matches target"
+        return result
+    }
+
+    let root = AXUIElementCreateApplication(pid)
+    result["app"] = found.name ?? NSNull()
+
+    // Keyboard focus snapshot: the expect-engine's "focus" verdict.
+    if let focusedElement = axElement(from: copyAXAttribute(root, "AXFocusedUIElement")) {
+        let fields = readAXFields(focusedElement)
+        if let label = fields.label {
+            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                result["focused"] = String(trimmed.prefix(120))
+            }
+        }
+    }
+
+    var elements: [[String: Any]] = []
+    for window in axWindows(of: root) {
+        if let title = axWindowTitle(window), result["window"] is NSNull {
+            result["window"] = title
+        }
+        walkAX(window, depth: depth, out: &elements, budget: maxElements)
+        if elements.count >= maxElements {
+            break
+        }
+    }
+
+    var withBox = 0
+    for index in elements.indices {
+        elements[index]["id"] = index
+        if let box = elements[index]["box"] as? [Any], box.count == 4,
+           !(box[0] is NSNull) {
+            withBox += 1
+        }
+    }
+    let limited = Array(elements.prefix(max(0, maxElements)))
+    result["elements"] = limited
+    result["count"] = limited.count
+    result["with_box"] = withBox
+    return result
+}
+
+private func axTrustedResponse(prompt: Bool) -> [String: Any] {
+    var trusted = AXIsProcessTrusted()
+    var prompted = false
+    if !trusted && prompt {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        prompted = AXIsProcessTrustedWithOptions(options)
+        if prompted {
+            trusted = AXIsProcessTrusted()
+        }
+    }
+    return ["trusted": trusted, "prompted": prompted]
+}
+
+private func writeAXResponse(_ response: [String: Any]) {
+    let data: Data
+    do {
+        data = try JSONSerialization.data(withJSONObject: response, options: [])
+    } catch {
+        logStderr("butler-overlay: AX response encode failed: \(error.localizedDescription)")
+        data = Data("{\"trusted\":false,\"note\":\"Butler companion capture failed\",\"fix\":\"Retry the guide.\"}".utf8)
+    }
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data([0x0a]))
+}
+
 // MARK: - Parsed commands
 
 private struct RingSpec {
@@ -276,6 +610,8 @@ private enum OverlayCommand {
     case ring(RingSpec)
     case chip(Int)
     case pet(PetSpec)
+    case axtrusted(prompt: Bool)
+    case axcapture(AXCaptureSpec)
     case idle
     case quit
 }
@@ -383,6 +719,58 @@ private func parseCommand(line: String) -> OverlayCommand? {
             scale = CGFloat(min(4.0, max(0.1, rawScale)))
         }
         return .pet(PetSpec(framesDir: framesDir, scale: scale))
+
+    case "axtrusted":
+        var prompt = false
+        if let rawPrompt = object["prompt"], !(rawPrompt is NSNull) {
+            guard let parsedPrompt = rawPrompt as? Bool else {
+                logMalformedOnce(line: line, reason: "axtrusted has an invalid prompt")
+                return nil
+            }
+            prompt = parsedPrompt
+        }
+        return .axtrusted(prompt: prompt)
+
+    case "axcapture":
+        let target: String?
+        if object.keys.contains("target") {
+            if object["target"] is NSNull {
+                target = nil
+            } else if let text = stringValue(object["target"]) {
+                target = text
+            } else {
+                logMalformedOnce(line: line, reason: "axcapture has an invalid target")
+                return nil
+            }
+        } else {
+            target = nil
+        }
+
+        let maxElements: Int
+        if object.keys.contains("max_elements") {
+            guard let parsed = intValue(object["max_elements"]) else {
+                logMalformedOnce(line: line, reason: "axcapture has an invalid max_elements")
+                return nil
+            }
+            maxElements = parsed
+        } else {
+            maxElements = axDefaultMaxElements
+        }
+
+        let depth: Int
+        if object.keys.contains("depth") {
+            guard let parsed = intValue(object["depth"]) else {
+                logMalformedOnce(line: line, reason: "axcapture has an invalid depth")
+                return nil
+            }
+            depth = parsed
+        } else {
+            depth = axDefaultDepth
+        }
+
+        return .axcapture(AXCaptureSpec(target: target,
+                                        maxElements: maxElements,
+                                        depth: depth))
 
     case "idle":
         return .idle
@@ -917,6 +1305,12 @@ private final class OverlayController {
             showChip(step: step)
         case .pet(let spec):
             showPet(spec)
+        case .axtrusted(let prompt):
+            writeAXResponse(axTrustedResponse(prompt: prompt))
+        case .axcapture(let spec):
+            writeAXResponse(axCaptureSnapshot(target: spec.target,
+                                              maxElements: spec.maxElements,
+                                              depth: spec.depth))
         case .idle:
             activeRing = nil
             hideRings(close: true)

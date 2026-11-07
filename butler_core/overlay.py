@@ -14,8 +14,11 @@ Protocol: one JSON line per op on stdin -
 """
 import json
 import os
+import select
 import shutil
 import subprocess
+import threading
+import time
 
 DEFAULT_PET_SCALE = 0.33
 MIN_PET_SCALE = 0.2
@@ -190,39 +193,161 @@ def resolve_pet_op():
     }
 
 
+_SHARED_OVERLAY = None
+
+
 class Overlay:
-    """Best-effort controller. publish() and close() never raise."""
+    """Best-effort controller. publish() and close() never raise.
+
+    The controller is also the shared transport handle for Accessibility
+    captures: one companion process serves both drawing and AX queries, so the
+    plugin only needs a single TCC grant.
+    """
 
     def __init__(self):
+        global _SHARED_OVERLAY
         self.proc = None
         self.starting = True
+        self._io_lock = threading.RLock()
+        self._stdout_buf = b""
+        _SHARED_OVERLAY = self
+
+    def _is_running(self):
+        proc = self.proc
+        if proc is None:
+            return False
+        try:
+            return proc.poll() is None
+        except AttributeError:
+            # Test doubles do not all implement poll().
+            return True
+        except Exception:
+            return False
 
     def start(self):
-        try:
-            ok, detail = build_if_needed()
-            if not ok:
-                self.starting = False
-                return False, detail
-            self.proc = subprocess.Popen(
-                [binary_path()],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self.starting = False
-            # Send the pet once, before any ring can arrive, so the double is
-            # already loaded when the first step is highlighted.
-            try:
-                pet_op = resolve_pet_op()
-                if pet_op is not None:
-                    self._send(pet_op)
-            except Exception:  # noqa: BLE001
-                pass
-            return True, "spawned pid %d" % self.proc.pid
-        except Exception as exc:  # noqa: BLE001
+        with self._io_lock:
+            if self._is_running():
+                return True, "already running pid %d" % self.proc.pid
             self.proc = None
-            self.starting = False
-            return False, str(exc)
+            self._stdout_buf = b""
+            try:
+                ok, detail = build_if_needed()
+                if not ok:
+                    self.starting = False
+                    return False, detail
+                self.proc = subprocess.Popen(
+                    [binary_path()],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+                self.starting = False
+                # Send the pet once, before any ring can arrive, so the double is
+                # already loaded when the first step is highlighted.
+                try:
+                    pet_op = resolve_pet_op()
+                    if pet_op is not None:
+                        self._send(pet_op)
+                except Exception:  # noqa: BLE001
+                    pass
+                return True, "spawned pid %d" % self.proc.pid
+            except Exception as exc:  # noqa: BLE001
+                self.proc = None
+                self.starting = False
+                return False, str(exc)
+
+    def request(self, op, timeout=5.0):
+        """Send one op and return its single JSON response line, or None.
+
+        This is the transport used by capture.py. It never raises and enforces
+        a hard read deadline so a stalled companion cannot hang the guide poll.
+        """
+        with self._io_lock:
+            try:
+                budget = max(0.0, float(timeout))
+            except (TypeError, ValueError):
+                budget = 5.0
+            deadline = time.monotonic() + budget
+            try:
+                if not self._is_running():
+                    ok, _detail = self.start()
+                    if not ok:
+                        return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                self._send(op)
+                if not self._is_running():
+                    return None
+                return self._read_response(remaining)
+            except Exception:  # noqa: BLE001
+                return None
+
+    def _read_response(self, timeout):
+        stdout = getattr(self.proc, "stdout", None)
+        if stdout is None:
+            return None
+        try:
+            fd = stdout.fileno()
+        except Exception:  # noqa: BLE001
+            fd = None
+        if fd is None:
+            # Test doubles are often in-memory streams without a selectable
+            # fd; production pipes always take the deadline path below.
+            try:
+                raw = stdout.readline()
+            except Exception:  # noqa: BLE001
+                return None
+            if not raw:
+                return None
+            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            text = text.strip()
+            if not text:
+                return None
+            try:
+                return json.loads(text)
+            except Exception:  # noqa: BLE001
+                return None
+        try:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+        except (TypeError, ValueError):
+            deadline = time.monotonic() + 5.0
+
+        while True:
+            newline = self._stdout_buf.find(b"\n")
+            if newline >= 0:
+                raw = self._stdout_buf[:newline]
+                self._stdout_buf = self._stdout_buf[newline + 1:]
+                text = raw.decode("utf-8", "replace").strip()
+                if not text:
+                    continue
+                try:
+                    return json.loads(text)
+                except Exception:  # noqa: BLE001
+                    return None
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            try:
+                ready, _, _ = select.select([fd], [], [], remaining)
+            except Exception:  # noqa: BLE001
+                return None
+            if not ready:
+                return None
+            try:
+                chunk = os.read(fd, 65536)
+            except Exception:  # noqa: BLE001
+                return None
+            if not chunk:
+                # EOF: the companion exited (or was rebuilt away).
+                self.proc = None
+                return None
+            self._stdout_buf += chunk
+            if len(self._stdout_buf) > 8 * 1024 * 1024:
+                self._stdout_buf = b""
+                return None
 
     def publish(self, state):
         if not self.proc or not self.proc.stdin:
@@ -238,19 +363,30 @@ class Overlay:
         self._send({"op": "idle"})
 
     def quit(self):
-        self._send({"op": "quit"})
-        if self.proc:
-            try:
-                self.proc.stdin.close()
-            except Exception:
-                pass
-        self.proc = None
+        with self._io_lock:
+            self._send({"op": "quit"})
+            if self.proc:
+                try:
+                    self.proc.stdin.close()
+                except Exception:
+                    pass
+            self.proc = None
+            self._stdout_buf = b""
 
     def _send(self, op):
-        if not self.proc or not self.proc.stdin:
-            return
-        try:
-            self.proc.stdin.write((json.dumps(op) + "\n").encode("utf-8"))
-            self.proc.stdin.flush()
-        except Exception:
-            self.proc = None
+        with self._io_lock:
+            if not self.proc or not self.proc.stdin:
+                return
+            try:
+                self.proc.stdin.write((json.dumps(op) + "\n").encode("utf-8"))
+                self.proc.stdin.flush()
+            except Exception:
+                self.proc = None
+
+
+def shared_overlay():
+    """Return the process-wide companion handle, creating it on first use."""
+    global _SHARED_OVERLAY
+    if _SHARED_OVERLAY is None:
+        _SHARED_OVERLAY = Overlay()
+    return _SHARED_OVERLAY

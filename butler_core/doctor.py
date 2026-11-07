@@ -27,12 +27,17 @@ def _open_panel(pane_url):
 
 
 def report(ask=False):
+    accessibility_granted = bool(bp_capture.trusted())
+    screen_recording_granted = bool(bp_ocr.preflight_screen_record())
     out = {
         "platform_ok": bp_capture.mac_supported(),
-        "accessibility_granted": bp_capture.trusted(),
-        "screen_recording_granted": bp_ocr.preflight_screen_record(),
-        "capture": "missing grant" if not bp_capture.trusted() else "ok",
-        "ocr": "missing grant" if not bp_ocr.preflight_screen_record() else "ok",
+        # One grant subject: axtrusted is answered by the bundled companion
+        # binary, never by the varying Python host.
+        "accessibility_granted": accessibility_granted,
+        "accessibility_grant_subject": bp_capture.GRANT_SUBJECT,
+        "screen_recording_granted": screen_recording_granted,
+        "capture": "missing grant" if not accessibility_granted else "ok",
+        "ocr": "missing grant" if not screen_recording_granted else "ok",
     }
     ok, detail = bp_overlay.build_if_needed()
     out["overlay"] = detail
@@ -40,18 +45,17 @@ def report(ask=False):
     out["overlay_binary"] = exe if os.path.exists(exe) else None
     out["prompted"] = {}
     if ask:
-        if not bp_capture.trusted():
+        if not accessibility_granted:
             out["prompted"]["accessibility"] = bp_capture._ask_accessibility()
-        if not bp_ocr.preflight_screen_record():
+        if not screen_recording_granted:
             out["prompted"]["screen_recording"] = bp_ocr.request_screen_record()
             out["prompted"]["opened_panels"] = {
                 "screen_capture": _open_panel(PANEL_SCREENCAPTURE),
                 "accessibility": _open_panel(PANEL_ACCESSIBILITY),
             }
-    if not out["accessibility_granted"]:
-        out["fix"] = ("Run `hermes butler doctor --ask` to raise the grant dialogs; grant to the "
-                      "Hermes host listed there, then restart Hermes. The pane deep-links to the toggle.")
-    elif not out["screen_recording_granted"]:
+    if not accessibility_granted:
+        out["fix"] = bp_capture.GRANT_FIX
+    elif not screen_recording_granted:
         out["fix"] = ("Run `hermes butler doctor --ask` to raise the Screen Recording dialog; grant to the "
-                      "same host, then restart Hermes (OCR fallback waits on this grant).")
+                      "Hermes host, then restart Hermes (the OCR fallback waits on this grant).")
     return out
