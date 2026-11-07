@@ -239,14 +239,18 @@ class Overlay:
             return False
 
     def start(self, show_pet=True):
-        """Spawn the companion.
+        """Spawn the companion, or re-assert the pet double on a live one.
 
         ``show_pet=False`` is the capture-only path: a companion spawned just to
         read the screen must not park a pet double on the user's desktop, and
         without a pet window the idle watchdog can retire that process too.
+        A guide start passes True even when a petless companion is already up
+        (a capture spawned it moments ago), so the double always appears.
         """
         with self._io_lock:
             if self._is_running():
+                if show_pet:
+                    self._send_pet_op()
                 return True, "already running pid %d" % self.proc.pid
             self.proc = None
             self._stdout_buf = b""
@@ -266,17 +270,20 @@ class Overlay:
                 # Send the pet once, before any ring can arrive, so the double is
                 # already loaded when the first step is highlighted.
                 if show_pet:
-                    try:
-                        pet_op = resolve_pet_op()
-                        if pet_op is not None:
-                            self._send(pet_op)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    self._send_pet_op()
                 return True, "spawned pid %d" % self.proc.pid
             except Exception as exc:  # noqa: BLE001
                 self.proc = None
                 self.starting = False
                 return False, str(exc)
+
+    def _send_pet_op(self):
+        try:
+            pet_op = resolve_pet_op()
+            if pet_op is not None:
+                self._send(pet_op)
+        except Exception:  # noqa: BLE001
+            pass
 
     def request(self, op, timeout=5.0):
         """Send one op and return its single JSON response line, or None.

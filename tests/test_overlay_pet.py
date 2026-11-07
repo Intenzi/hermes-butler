@@ -212,3 +212,26 @@ def test_capture_request_spawns_without_a_pet_double(tmp_path: Path, monkeypatch
     ops = [json.loads(line)["op"] for line in lines]
     assert "pet" not in ops
     assert ops == ["axcapture"]
+
+
+def test_guide_start_reasserts_the_pet_on_a_capture_spawned_companion(tmp_path: Path, monkeypatch) -> None:
+    """A petless companion left by a capture must still show the double for a guide."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    wanted = _make_pet(tmp_path, "robotocat")
+    _write_config(tmp_path, "display:\n  pet:\n    slug: robotocat\n    scale: 0.5\n")
+
+    proc = _FakeProc()
+    controller = overlay.Overlay()
+    controller.proc = proc
+
+    ok, detail = controller.start()
+
+    assert ok is True
+    assert detail == "already running pid 4242"
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    assert [json.loads(line) for line in lines] == [{
+        "op": "pet",
+        "frames_dir": str(wanted),
+        "scale": 0.5,
+        "pet_enabled": True,
+    }]
