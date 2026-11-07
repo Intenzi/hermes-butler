@@ -1032,11 +1032,16 @@ private struct PetSheet {
     let columns: Int
     let rows: Int
     let frameCounts: [Int]
+    let loopMs: Double
     private let rowIndexes: [String: Int]
 
     static let defaultFrameWidth = 192.0
     static let defaultFrameHeight = 208.0
     static let defaultFrameCount = 6
+    // Mirrors LOOP_MS in the desktop app: one full loop for a single state.
+    static let defaultLoopMs = 1100.0
+    static let minLoopMs = 200.0
+    static let maxLoopMs = 5000.0
 
     // Mirrors DEFAULT_STATE_ROWS from the desktop pet-sprite component.
     static let currentStateRows = [
@@ -1066,10 +1071,19 @@ private struct PetSheet {
         let manager = FileManager.default
         let manifestPath = (framesDir as NSString).appendingPathComponent("pet.json")
 
-        var sheetPath = (framesDir as NSString).appendingPathComponent("spritesheet.webp")
+        var manifest: [String: Any]?
         if let data = manager.contents(atPath: manifestPath),
-           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-           let relative = object["spritesheetPath"] as? String,
+           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            manifest = object
+        }
+
+        var loopMs = defaultLoopMs
+        if let rawLoopMs = manifest?["loopMs"], let parsedLoopMs = numberValue(rawLoopMs) {
+            loopMs = min(maxLoopMs, max(minLoopMs, parsedLoopMs))
+        }
+
+        var sheetPath = (framesDir as NSString).appendingPathComponent("spritesheet.webp")
+        if let relative = manifest?["spritesheetPath"] as? String,
            !relative.isEmpty {
             let candidate = relative.hasPrefix("/")
                 ? relative
@@ -1181,6 +1195,7 @@ private struct PetSheet {
                         columns: columns,
                         rows: rows,
                         frameCounts: frameCounts,
+                        loopMs: loopMs,
                         rowIndexes: rowIndexes)
     }
 
@@ -1343,6 +1358,9 @@ private final class OverlayController {
     private var petRow = 0
     private var petFrameIndex = 0
     private var petLastFrameAdvance: TimeInterval = 0.0
+    // Cached per-row frame step, recomputed only when the played row changes.
+    private var petStepSeconds: TimeInterval = 0.0
+    private var petStepRow = -1
     private var lastRingBox: CGRect?
 
     // Moving and parked are distinct alpha states, eased over the same 1.2s as
@@ -1361,6 +1379,16 @@ private final class OverlayController {
     private var nameplateView: NameplateView?
     private var launcherActive = false
 
+    // A finished guide must not leave this process alive just because the host
+    // keeps stdin open: exit shortly after the farewell once nothing is shown,
+    // and keep a watchdog for any other path that ends with no UI.
+    private let postFarewellExitGrace: TimeInterval = 0.75
+    private let watchdogInterval: TimeInterval = 60.0
+    private let watchdogIdleLimit: TimeInterval = 600.0
+    private var pendingExitGeneration = 0
+    private var watchdogTimer: Timer?
+    private var lastOpUptime: TimeInterval = 0.0
+
     // "done" is a farewell: wave for ~0.8s, then fade the double (and its
     // nameplate) out over ~1.5s before closing the window.
     private let petWaveDuration: TimeInterval = 0.8
@@ -1374,7 +1402,9 @@ private final class OverlayController {
         guard stdinThread == nil else {
             return
         }
+        lastOpUptime = ProcessInfo.processInfo.systemUptime
         observeEnvironment()
+        startWatchdog()
         let thread = Thread { [weak self] in
             self?.readStdin()
         }
@@ -1405,17 +1435,22 @@ private final class OverlayController {
     }
 
     private func handle(_ command: OverlayCommand) {
+        lastOpUptime = ProcessInfo.processInfo.systemUptime
         if isShuttingDown {
             return
         }
         switch command {
         case .ring(let spec):
+            cancelPendingExit()
             showRing(spec)
         case .chip(let step):
+            cancelPendingExit()
             showChip(step: step)
         case .pet(let spec):
+            cancelPendingExit()
             showPet(spec)
         case .launcher:
+            cancelPendingExit()
             showLauncher()
         case .done:
             petDone()
@@ -1675,6 +1710,7 @@ private final class OverlayController {
         petSheet = sheet
         petScale = spec.scale
         petRow = parkedPetRow(for: sheet)
+        petStepRow = -1
         petFrameIndex = 0
         petLastFrameAdvance = ProcessInfo.processInfo.systemUptime
         petFarewell = false
@@ -1903,6 +1939,7 @@ private final class OverlayController {
         petMoving = false
         closePetWindow()
         petSheet = nil
+        scheduleExitAfterFarewell()
     }
 
     private func startPetTimer() {
@@ -2062,8 +2099,15 @@ private final class OverlayController {
             }
         }
 
-        // Roughly 8 fps, matching the desktop sprite's relaxed cadence.
-        if now - petLastFrameAdvance >= 0.125 {
+        // One full loop per state, like the desktop app: loopMs / frameCount.
+        // The divisor is cached per row so a 60 Hz tick does no division.
+        if petStepRow != petRow {
+            petStepRow = petRow
+            petStepSeconds = sheet.loopMs
+                / 1000.0
+                / Double(max(1, sheet.frameCount(for: petRow)))
+        }
+        if now - petLastFrameAdvance >= petStepSeconds {
             petLastFrameAdvance = now
             let count = sheet.frameCount(for: petRow)
             petFrameIndex = (petFrameIndex + 1) % count
@@ -2173,6 +2217,59 @@ private final class OverlayController {
         return CGRect(origin: origin, size: size)
     }
 
+    // MARK: Lifecycle watchdog
+
+    private func startWatchdog() {
+        guard watchdogTimer == nil else {
+            return
+        }
+        let timer = Timer(timeInterval: watchdogInterval, repeats: true) { [weak self] _ in
+            self?.watchdogFired()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdogTimer = timer
+    }
+
+    private func watchdogFired() {
+        guard !isShuttingDown else {
+            return
+        }
+        let idleFor = ProcessInfo.processInfo.systemUptime - lastOpUptime
+        guard idleFor >= watchdogIdleLimit,
+              activeRing == nil,
+              petWindow == nil else {
+            return
+        }
+        shutdown()
+        NSApplication.shared.terminate(nil)
+    }
+
+    /// Invalidate any scheduled post-farewell exit. Bumping the generation is
+    /// enough to make the deferred block a no-op; it also means a newer exit
+    /// can be scheduled without racing the previous one.
+    private func cancelPendingExit() {
+        pendingExitGeneration += 1
+    }
+
+    private func scheduleExitAfterFarewell() {
+        guard !isShuttingDown, activeRing == nil, chipWindow == nil else {
+            return
+        }
+        cancelPendingExit()
+        let generation = pendingExitGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + postFarewellExitGrace) { [weak self] in
+            guard let self = self,
+                  !self.isShuttingDown,
+                  self.pendingExitGeneration == generation,
+                  self.activeRing == nil,
+                  self.chipWindow == nil else {
+                return
+            }
+            self.shutdown()
+            NSApplication.shared.terminate(nil)
+        }
+    }
+
     // MARK: Teardown
 
     /// Idempotent cleanup used by quit, EOF, and application termination.
@@ -2181,6 +2278,9 @@ private final class OverlayController {
             return
         }
         isShuttingDown = true
+        cancelPendingExit()
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
         activeRing = nil
         hideRings(close: true)
         hideChip()
