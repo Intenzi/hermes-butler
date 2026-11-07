@@ -1,6 +1,6 @@
 ---
 name: conventions
-description: "Butler plugin dev conventions: flat step keys, restart batching, verify-dsh-rule, checklist shape, TCC scope, card etiquette. Load for any butler board or code work."
+description: "Butler plugin dev conventions: flat step keys, restart batching, verify-worker-rule, checklist shape, TCC scope, board etiquette. Load for any butler board or code work."
 ---
 
 # Butler implementation conventions
@@ -59,21 +59,22 @@ it carries.
   was supposed to load the fix can blow the 10 s plugin load budget
   (`plugins.load_timeout_seconds`, raised to 30 in config).
 
-## 3. Verify-dsh-rule (never trust self-report)
+## 3. Verify-worker-rule (never trust self-report)
 
-dsh (DeepSeek Harness) completion summaries are CLAIMS, not results. Every
-dsh outcome gets verified directly with tools before anything is reported or
+A worker's completion summary is a CLAIM, not a result. Every delegated
+outcome gets verified directly with tools before anything is reported or
 built on:
 
 - Check the worktree/repo themselves: `git status`, `git diff` against the
-  branch you asked for, file existence and `mtime`. Known failure: dsh's
-  sandbox could NOT commit inside a git worktree — the commit must be made
-  from an outside shell and tests re-verified in the MAIN tree.
+  branch you asked for, file existence and `mtime`. Known failure: the
+  worker's sandbox could NOT commit inside a git worktree — the commit must
+  be made from an outside shell and tests re-verified in the MAIN tree.
 - Run the tests yourself. "27 tests pass" in a report counts zero until the
   suite passes in your shell.
 - A run that merely echoes the brief back = a no-op. Symptom and cause we
   hit: dispatching with an inline heredoc quoted into the command; the fix
-  is to write the brief to a FILE and have dsh read it, then re-dispatch.
+  is to write the brief to a FILE and have the worker read it, then
+  re-dispatch.
 - Verify assertions specific to the deliverable (a binary compiled, an
   endpoint added, a smoke run's stderr clean), not just a green summary.
 
@@ -128,14 +129,15 @@ Rules:
   survive `plugin install → grant → walkthrough` on a machine that has
   never seen the repo.
 
-## 6. Card etiquette (butler kanban board)
+## 6. Card etiquette (board notes feed the executor)
 
 Writing and maintaining kanban cards on the `butler` board:
 
 Body
-- A card body is a standalone spec the next worker executes with zero
-  sibling context: file paths, acceptance criteria, and every decision it
-  depends on written INTO the body. If two cards would each decide the same
+- Board notes feed the executor: a card body is a standalone spec the next
+  worker executes with zero sibling context — file paths, acceptance
+  criteria, and every decision it depends on written INTO the body. If two
+  cards would each decide the same
   question, decide it once and write the answer into BOTH bodies.
 - One card = one deliverable with checkable acceptance criteria. Never a
   "tracking" card that grows new scope mid-run; spawn children instead.
