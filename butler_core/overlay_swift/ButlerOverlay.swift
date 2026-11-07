@@ -12,6 +12,7 @@
 //  Protocol (one JSON object per line, EOF-terminated):
 //    {"op":"ring","box":[x,y,w,h],"label":"...","say":"...","step":n,"total":m}
 //    {"op":"chip","step":n}
+//    {"op":"pet","frames_dir":"...","scale":0.33}
 //    {"op":"idle"}
 //    {"op":"quit"}
 //
@@ -62,6 +63,22 @@ private func logMalformedOnce(line: String, reason: String) {
         snippet = line
     }
     logStderr("butler-overlay: malformed op dropped (\(reason)): \(snippet)")
+}
+
+// A bad pet directory is a configuration problem rather than a malformed op, so
+// report it once per directory and then keep the rest of the overlay alive.
+private let petLogLock = NSLock()
+private var petLogKeys = Set<String>()
+
+private func logPetFailureOnce(framesDir: String, reason: String) {
+    petLogLock.lock()
+    let shouldLog = petLogKeys.insert(framesDir).inserted
+    petLogLock.unlock()
+
+    guard shouldLog else {
+        return
+    }
+    logStderr("butler-overlay: pet unavailable (\(reason)): \(framesDir)")
 }
 
 // MARK: - JSON value helpers
@@ -250,9 +267,15 @@ private struct RingSpec {
     let total: Int
 }
 
+private struct PetSpec {
+    let framesDir: String
+    let scale: CGFloat
+}
+
 private enum OverlayCommand {
     case ring(RingSpec)
     case chip(Int)
+    case pet(PetSpec)
     case idle
     case quit
 }
@@ -344,6 +367,22 @@ private func parseCommand(line: String) -> OverlayCommand? {
             return nil
         }
         return .chip(step)
+
+    case "pet":
+        guard let framesDir = stringValue(object["frames_dir"]), !framesDir.isEmpty else {
+            logMalformedOnce(line: line, reason: "pet has an invalid frames_dir")
+            return nil
+        }
+        var scale: CGFloat = 0.33
+        if object.keys.contains("scale") {
+            guard let rawScale = numberValue(object["scale"]), rawScale > 0.0 else {
+                logMalformedOnce(line: line, reason: "pet has an invalid scale")
+                return nil
+            }
+            // Keep a hostile payload from allocating an absurd window.
+            scale = CGFloat(min(4.0, max(0.1, rawScale)))
+        }
+        return .pet(PetSpec(framesDir: framesDir, scale: scale))
 
     case "idle":
         return .idle
@@ -572,6 +611,239 @@ private final class ChipView: NSView {
     }
 }
 
+// MARK: - Pet sprite sheet
+
+/// Decoded spritesheet plus the slicing metadata the real pet manifests do not
+/// carry. Sheets follow the desktop app convention: 192pt-wide cells, 208pt
+/// rows, and rows in DEFAULT_STATE_ROWS order. Some generated sheets append
+/// extra gaze rows; those are sliced but never played by this overlay.
+private struct PetSheet {
+    let image: NSImage
+    let cellWidth: CGFloat
+    let cellHeight: CGFloat
+    let columns: Int
+    let rows: Int
+    let frameCounts: [Int]
+    private let rowIndexes: [String: Int]
+
+    static let defaultFrameWidth = 192.0
+    static let defaultFrameHeight = 208.0
+    static let defaultFrameCount = 6
+
+    // Mirrors DEFAULT_STATE_ROWS from the desktop pet-sprite component.
+    static let currentStateRows = [
+        "idle",
+        "running-right",
+        "running-left",
+        "waving",
+        "jumping",
+        "failed",
+        "waiting",
+        "running",
+        "review"
+    ]
+
+    // Older seven-row sheets predate the directional running rows.
+    static let legacyStateRows = [
+        "idle",
+        "waving",
+        "jumping",
+        "failed",
+        "waiting",
+        "running",
+        "review"
+    ]
+
+    static func load(framesDir: String) -> PetSheet? {
+        let manager = FileManager.default
+        let manifestPath = (framesDir as NSString).appendingPathComponent("pet.json")
+
+        var sheetPath = (framesDir as NSString).appendingPathComponent("spritesheet.webp")
+        if let data = manager.contents(atPath: manifestPath),
+           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let relative = object["spritesheetPath"] as? String,
+           !relative.isEmpty {
+            let candidate = relative.hasPrefix("/")
+                ? relative
+                : (framesDir as NSString).appendingPathComponent(relative)
+            if manager.fileExists(atPath: candidate) {
+                sheetPath = candidate
+            }
+        }
+
+        guard manager.fileExists(atPath: sheetPath),
+              let source = NSImage(contentsOfFile: sheetPath),
+              let cgImage = source.cgImage(forProposedRect: nil,
+                                           context: nil,
+                                           hints: nil),
+              cgImage.width > 0, cgImage.height > 0 else {
+            return nil
+        }
+
+        let pixelWidth = cgImage.width
+        let pixelHeight = cgImage.height
+
+        let columns = max(1, Int((Double(pixelWidth) / defaultFrameWidth).rounded()))
+        let rowGuess = max(1, Int((Double(pixelHeight) / defaultFrameHeight).rounded()))
+        let cellHeightPx = max(1, pixelHeight / rowGuess)
+        let cellWidthPx = max(1, pixelWidth / columns)
+        let rows = max(1, pixelHeight / cellHeightPx)
+
+        let names: [String]
+        if rows == legacyStateRows.count {
+            names = legacyStateRows
+        } else if rows >= currentStateRows.count {
+            names = currentStateRows + (currentStateRows.count..<rows).map { "extra-\($0)" }
+        } else if rows < legacyStateRows.count {
+            names = Array(legacyStateRows.prefix(rows))
+        } else {
+            names = Array(currentStateRows.prefix(rows))
+        }
+
+        // pet.json in the wild has no framesByRow metadata. Detect the real
+        // frame count per row from the sheet's alpha instead of drawing the
+        // blank padding cells every uneven row has after its last frame.
+        let bytesPerRow = pixelWidth * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * pixelHeight)
+        var decoded = false
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        pixels.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress,
+                  let context = CGContext(data: base,
+                                          width: pixelWidth,
+                                          height: pixelHeight,
+                                          bitsPerComponent: 8,
+                                          bytesPerRow: bytesPerRow,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: bitmapInfo.rawValue) else {
+                return
+            }
+            context.draw(cgImage,
+                         in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+            decoded = true
+        }
+        guard decoded else {
+            return nil
+        }
+
+        var frameCounts = [Int](repeating: 0, count: rows)
+        for row in 0..<rows {
+            var lastOccupied = -1
+            let yStart = row * cellHeightPx
+            let yEnd = min(pixelHeight, yStart + cellHeightPx)
+            for column in 0..<columns {
+                let xStart = column * cellWidthPx
+                let xEnd = min(pixelWidth, xStart + cellWidthPx)
+                var occupied = false
+                scan: for y in yStart..<yEnd {
+                    let rowBase = y * bytesPerRow
+                    for x in xStart..<xEnd where pixels[rowBase + x * 4 + 3] > 8 {
+                        occupied = true
+                        break scan
+                    }
+                }
+                if occupied {
+                    lastOccupied = column
+                }
+            }
+            frameCounts[row] = lastOccupied >= 0 ? lastOccupied + 1 : 0
+        }
+
+        let idleRow = names.firstIndex(of: "idle") ?? 0
+        let fallbackCount = frameCounts[idleRow] > 0
+            ? frameCounts[idleRow]
+            : max(1, min(columns, defaultFrameCount))
+        for row in 0..<frameCounts.count where frameCounts[row] <= 0 {
+            frameCounts[row] = fallbackCount
+        }
+
+        var rowIndexes: [String: Int] = [:]
+        for (index, name) in names.enumerated() {
+            rowIndexes[name] = index
+        }
+
+        // Normalize the image to pixel-sized points so the source rect used by
+        // NSImage.draw is expressed in the same space as the slicing math.
+        let normalized = NSImage(cgImage: cgImage,
+                                 size: NSSize(width: pixelWidth, height: pixelHeight))
+
+        return PetSheet(image: normalized,
+                        cellWidth: CGFloat(cellWidthPx),
+                        cellHeight: CGFloat(cellHeightPx),
+                        columns: columns,
+                        rows: rows,
+                        frameCounts: frameCounts,
+                        rowIndexes: rowIndexes)
+    }
+
+    func rowIndex(_ name: String) -> Int? {
+        return rowIndexes[name]
+    }
+
+    func frameCount(for row: Int) -> Int {
+        guard row >= 0, row < frameCounts.count else {
+            return 1
+        }
+        return max(1, frameCounts[row])
+    }
+}
+
+// MARK: - Pet view
+
+private final class PetView: NSView {
+    private let sheet: PetSheet
+    var row: Int = 0
+    var frameIndex: Int = 0
+    var mirrored: Bool = false
+
+    init(frame: NSRect, sheet: PetSheet) {
+        self.sheet = sheet
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override var isFlipped: Bool {
+        return true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        guard bounds.width > 0.0, bounds.height > 0.0 else {
+            return
+        }
+        let source = NSRect(x: CGFloat(frameIndex) * sheet.cellWidth,
+                            y: CGFloat(sheet.rows - 1 - row) * sheet.cellHeight,
+                            width: sheet.cellWidth,
+                            height: sheet.cellHeight)
+
+        if mirrored {
+            NSGraphicsContext.saveGraphicsState()
+            let transform = NSAffineTransform()
+            transform.translateX(by: bounds.width, yBy: 0.0)
+            transform.scaleX(by: -1.0, yBy: 1.0)
+            transform.concat()
+        }
+
+        sheet.image.draw(in: bounds,
+                         from: source,
+                         operation: .sourceOver,
+                         fraction: 1.0,
+                         respectFlipped: true,
+                         hints: [.interpolation: NSImageInterpolation.high.rawValue])
+
+        if mirrored {
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+}
+
 // MARK: - Overlay controller
 
 private final class OverlayController {
@@ -581,6 +853,24 @@ private final class OverlayController {
     private var activeRing: RingSpec?
     private var observerTokens: [(NotificationCenter, NSObjectProtocol)] = []
     private var isShuttingDown = false
+
+    // The pet double is independent of the ring windows: it survives `idle`
+    // and only goes away on `quit`/EOF or when a pet directory cannot load.
+    private var petWindow: NSWindow?
+    private var petView: PetView?
+    private var petSheet: PetSheet?
+    private var petScale: CGFloat = 0.33
+    private var petTimer: Timer?
+    private var petCurrentFrame: CGRect?
+    private var petTargetFrame: CGRect?
+    private var petMoveStartFrame: CGRect?
+    private var petMoveStartTime: TimeInterval = 0.0
+    private var petMoving = false
+    private var petMovingRight = false
+    private var petRow = 0
+    private var petFrameIndex = 0
+    private var petLastFrameAdvance: TimeInterval = 0.0
+    private var lastRingBox: CGRect?
 
     func start() {
         guard stdinThread == nil else {
@@ -625,6 +915,8 @@ private final class OverlayController {
             showRing(spec)
         case .chip(let step):
             showChip(step: step)
+        case .pet(let spec):
+            showPet(spec)
         case .idle:
             activeRing = nil
             hideRings(close: true)
@@ -726,6 +1018,7 @@ private final class OverlayController {
 
         hideRings(close: true)
         activeRing = spec
+        lastRingBox = spec.box
 
         for slice in slices {
             let window = NSWindow(contentRect: slice.frame,
@@ -758,6 +1051,8 @@ private final class OverlayController {
             window.orderFrontRegardless()
             ringWindows.append(window)
         }
+
+        retargetPet(to: spec.box)
     }
 
     private func hideRings(close: Bool) {
@@ -842,6 +1137,301 @@ private final class OverlayController {
         chipWindow = nil
     }
 
+    // MARK: Pet double
+
+    private func showPet(_ spec: PetSpec) {
+        guard !isShuttingDown else {
+            return
+        }
+        guard let primaryHeight = primaryScreenHeight(), !NSScreen.screens.isEmpty else {
+            logPetFailureOnce(framesDir: spec.framesDir, reason: "no attached screens")
+            return
+        }
+        guard let sheet = PetSheet.load(framesDir: spec.framesDir) else {
+            // A broken pet must never take the ring/chip overlay down with it.
+            closePetWindow()
+            petSheet = nil
+            logPetFailureOnce(framesDir: spec.framesDir,
+                              reason: "spritesheet missing or unreadable")
+            return
+        }
+
+        closePetWindow()
+        petSheet = sheet
+        petScale = spec.scale
+        petRow = parkedPetRow(for: sheet)
+        petFrameIndex = 0
+        petLastFrameAdvance = ProcessInfo.processInfo.systemUptime
+
+        let size = CGSize(width: sheet.cellWidth * petScale,
+                          height: sheet.cellHeight * petScale)
+        let startFrame: CGRect
+        if let box = lastRingBox,
+           let target = targetPetFrame(for: box,
+                                       size: size,
+                                       primaryHeight: primaryHeight) {
+            startFrame = target
+        } else {
+            startFrame = defaultPetFrame(size: size, primaryHeight: primaryHeight)
+        }
+
+        petCurrentFrame = startFrame
+        petTargetFrame = startFrame
+        petMoveStartFrame = nil
+        petMoving = false
+        createPetWindow(frame: startFrame, primaryHeight: primaryHeight, sheet: sheet)
+        startPetTimer()
+    }
+
+    private func createPetWindow(frame: CGRect,
+                                 primaryHeight: CGFloat,
+                                 sheet: PetSheet) {
+        let appKitFrame = appKitRect(fromQuartz: frame, primaryHeight: primaryHeight)
+        let window = NSWindow(contentRect: appKitFrame,
+                              styleMask: [.borderless],
+                              backing: .buffered,
+                              defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.level = .statusBar
+        window.collectionBehavior = [.canJoinAllSpaces,
+                                     .stationary,
+                                     .fullScreenAuxiliary,
+                                     .ignoresCycle]
+        window.ignoresMouseEvents = true
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
+        window.isReleasedWhenClosed = false
+        window.acceptsMouseMovedEvents = false
+
+        let content = PetView(frame: NSRect(origin: .zero, size: appKitFrame.size),
+                              sheet: sheet)
+        content.row = petRow
+        content.frameIndex = petFrameIndex
+        content.autoresizingMask = [.width, .height]
+        window.contentView = content
+
+        petWindow = window
+        petView = content
+        window.orderFrontRegardless()
+    }
+
+    private func closePetWindow() {
+        if let window = petWindow {
+            window.orderOut(nil)
+            window.close()
+        }
+        petWindow = nil
+        petView = nil
+    }
+
+    private func startPetTimer() {
+        guard petTimer == nil else {
+            return
+        }
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.tickPet()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        petTimer = timer
+    }
+
+    /// Ease the double toward the ring's trailing (right) edge over ~1.2s.
+    private func retargetPet(to box: CGRect) {
+        guard !isShuttingDown,
+              let sheet = petSheet,
+              petWindow != nil,
+              let primaryHeight = primaryScreenHeight(),
+              let current = petCurrentFrame else {
+            return
+        }
+
+        let size = CGSize(width: sheet.cellWidth * petScale,
+                          height: sheet.cellHeight * petScale)
+        guard let target = targetPetFrame(for: box,
+                                          size: size,
+                                          primaryHeight: primaryHeight) else {
+            return
+        }
+
+        petTargetFrame = target
+        let sameSpot = abs(current.minX - target.minX) < 0.5
+            && abs(current.minY - target.minY) < 0.5
+        if sameSpot {
+            petMoving = false
+            petCurrentFrame = target
+            return
+        }
+
+        petMoveStartFrame = current
+        petMoveStartTime = ProcessInfo.processInfo.systemUptime
+        petMoving = true
+
+        let dx = target.midX - current.midX
+        if abs(dx) > 0.5 {
+            petMovingRight = dx > 0.0
+        }
+    }
+
+    private func tickPet() {
+        guard !isShuttingDown,
+              let sheet = petSheet,
+              let window = petWindow,
+              let view = petView,
+              let primaryHeight = primaryScreenHeight() else {
+            return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+
+        if petMoving,
+           let start = petMoveStartFrame,
+           let target = petTargetFrame {
+            let duration = 1.2
+            let progress = min(1.0, max(0.0, (now - petMoveStartTime) / duration))
+            // Smoothstep: zero velocity at both ends, so it never teleports.
+            let eased = progress * progress * (3.0 - 2.0 * progress)
+            let frame = CGRect(x: start.minX + (target.minX - start.minX) * eased,
+                               y: start.minY + (target.minY - start.minY) * eased,
+                               width: target.width,
+                               height: target.height)
+            petCurrentFrame = frame
+            window.setFrame(appKitRect(fromQuartz: frame, primaryHeight: primaryHeight),
+                            display: true)
+            if progress >= 1.0 {
+                petMoving = false
+                petCurrentFrame = target
+            }
+        }
+
+        let animation = petAnimation(for: sheet,
+                                     moving: petMoving,
+                                     movingRight: petMovingRight)
+        if animation.row != petRow {
+            petRow = animation.row
+            petFrameIndex = 0
+            petLastFrameAdvance = now
+            view.row = petRow
+            view.frameIndex = 0
+            view.needsDisplay = true
+        }
+        if view.mirrored != animation.mirrored {
+            view.mirrored = animation.mirrored
+            view.needsDisplay = true
+        }
+
+        // Roughly 8 fps, matching the desktop sprite's relaxed cadence.
+        if now - petLastFrameAdvance >= 0.125 {
+            petLastFrameAdvance = now
+            let count = sheet.frameCount(for: petRow)
+            petFrameIndex = (petFrameIndex + 1) % count
+            view.frameIndex = petFrameIndex
+            view.needsDisplay = true
+        }
+    }
+
+    private func petAnimation(for sheet: PetSheet,
+                              moving: Bool,
+                              movingRight: Bool) -> (row: Int, mirrored: Bool) {
+        if moving {
+            let left = sheet.rowIndex("running-left")
+            let right = sheet.rowIndex("running-right")
+            if movingRight {
+                if let row = right {
+                    return (row, false)
+                }
+                if let row = left {
+                    return (row, true)
+                }
+            } else {
+                if let row = left {
+                    return (row, false)
+                }
+                if let row = right {
+                    return (row, true)
+                }
+            }
+            // The undirected running row faces left by convention, so rightward
+            // travel is mirrored (same rule as the desktop pet renderer).
+            if let row = sheet.rowIndex("running") {
+                return (row, movingRight)
+            }
+            if let row = sheet.rowIndex("run") {
+                return (row, movingRight)
+            }
+        }
+
+        return (parkedPetRow(for: sheet), false)
+    }
+
+    private func parkedPetRow(for sheet: PetSheet) -> Int {
+        if let row = sheet.rowIndex("waiting") {
+            return row
+        }
+        return sheet.rowIndex("idle") ?? 0
+    }
+
+    private func screenContaining(_ box: CGRect,
+                                  primaryHeight: CGFloat) -> NSScreen? {
+        var bestScreen: NSScreen?
+        var bestArea: CGFloat = 0.0
+        for screen in NSScreen.screens {
+            let visible = quartzRect(fromAppKit: screen.visibleFrame,
+                                     primaryHeight: primaryHeight)
+            let clipped = box.intersection(visible)
+            guard !clipped.isNull, clipped.width > 0.0, clipped.height > 0.0 else {
+                continue
+            }
+            let area = clipped.width * clipped.height
+            if area > bestArea {
+                bestArea = area
+                bestScreen = screen
+            }
+        }
+        return bestScreen ?? primaryScreen()
+    }
+
+    private func targetPetFrame(for box: CGRect,
+                                size: CGSize,
+                                primaryHeight: CGFloat) -> CGRect? {
+        guard size.width > 0.0, size.height > 0.0,
+              let screen = screenContaining(box, primaryHeight: primaryHeight) else {
+            return nil
+        }
+        let visible = quartzRect(fromAppKit: screen.visibleFrame,
+                                 primaryHeight: primaryHeight)
+
+        // Just outside the trailing edge, vertically centered on the control,
+        // but always fully on screen.
+        var origin = CGPoint(x: box.maxX + 8.0,
+                             y: box.midY - size.height / 2.0)
+        if visible.width > size.width {
+            origin.x = min(max(origin.x, visible.minX + 4.0),
+                           visible.maxX - size.width - 4.0)
+        } else {
+            origin.x = visible.midX - size.width / 2.0
+        }
+        if visible.height > size.height {
+            origin.y = min(max(origin.y, visible.minY + 4.0),
+                           visible.maxY - size.height - 4.0)
+        } else {
+            origin.y = visible.midY - size.height / 2.0
+        }
+        return CGRect(origin: origin, size: size)
+    }
+
+    private func defaultPetFrame(size: CGSize, primaryHeight: CGFloat) -> CGRect {
+        guard let screen = primaryScreen() else {
+            return CGRect(origin: .zero, size: size)
+        }
+        let visible = quartzRect(fromAppKit: screen.visibleFrame,
+                                 primaryHeight: primaryHeight)
+        let origin = CGPoint(x: visible.maxX - size.width - 24.0,
+                             y: visible.maxY - size.height - 24.0)
+        return CGRect(origin: origin, size: size)
+    }
+
     // MARK: Teardown
 
     /// Idempotent cleanup used by quit, EOF, and application termination.
@@ -853,6 +1443,10 @@ private final class OverlayController {
         activeRing = nil
         hideRings(close: true)
         hideChip()
+        petTimer?.invalidate()
+        petTimer = nil
+        closePetWindow()
+        petSheet = nil
 
         for (center, token) in observerTokens {
             center.removeObserver(token)
