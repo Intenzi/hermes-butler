@@ -32,11 +32,15 @@ _stop_flag = False
 
 def init(data_dir):
     global DATA_DIR
+    if not data_dir:
+        raise ValueError("butler engine: init() requires a data_dir")
     DATA_DIR = data_dir
     os.makedirs(os.path.join(str(data_dir), "guides"), exist_ok=True)
 
 
 def _guides_dir():
+    if not DATA_DIR:
+        raise RuntimeError("butler engine: init() not called")
     return os.path.join(str(DATA_DIR), "guides")
 
 
