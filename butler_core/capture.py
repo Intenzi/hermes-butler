@@ -161,6 +161,11 @@ def expect_pending(expect, snapshot, best):
     app = expect.get("app")
     if app and snapshot.get("app") and app.lower() in snapshot["app"].lower():
         return {"verified": True, "reason": "app_focused"}
+    app_frontmost = expect.get("app_frontmost")
+    if app_frontmost and snapshot.get("app") and app_frontmost.lower() in snapshot["app"].lower():
+        # frontmost-only: identical to "app" EXCEPT the engine's targeted
+        # open-counts fallback never applies, so it waits for real focus.
+        return {"verified": True, "reason": "app_focused_frontmost"}
     window = expect.get("window")
     if window and snapshot.get("window") and window.lower() in snapshot["window"].lower():
         # the pane the user landed on (its root window title carries the pane

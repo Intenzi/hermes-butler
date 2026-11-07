@@ -186,9 +186,11 @@ def _poll_once(s):
     s["last_captured_at"] = time.time()
     if not verdict["verified"]:
         # "Open the app" counts when the app is OPEN, not only frontmost:
-        # users follow the pet side-by-side without chasing focus.
+        # users follow the pet side-by-side without chasing focus. The
+        # targeted fallback applies ONLY to the `app` key — `app_frontmost`
+        # steps deliberately wait for real focus ("Focus System Settings").
         want_app = (step.get("expect") or {}).get("app")
-        if want_app:
+        if want_app and not (step.get("expect") or {}).get("app_frontmost"):
             app_snap = bp_capture.capture(target=want_app, max_elements=40, depth=8)
             if app_snap.get("app") and (app_snap.get("window")
                                         or int(app_snap.get("count") or 0) > 0):

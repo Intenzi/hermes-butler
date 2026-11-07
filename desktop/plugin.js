@@ -350,10 +350,12 @@ function LauncherButton({ compact = false }) {
 // ---------------------------------------------------------------- pet speech
 
 /**
- * The pet heartbeat never repeats a step instruction. It speaks only status
- * lines: done, stalled, capture failed, and stop summaries. A running guide
- * with a fresh capture stays silent; its instruction lives in the overlay
- * bubble and on the page checklist.
+ * The pet heartbeat speaks STATUS lines (done / stalled / capture failed)
+ * AND, when the user asked us to step says back on, the CURRENT instruction
+ * line — "my pet never said anything" was a regression from the says split,
+ * so instructions are spoken again. The overlay bubble still shows the same
+ * step; that tutorial-ish duplication is accepted (their words: it's a
+ * tutorial, saying only once in one place is harder to notice).
  */
 function petStatusLine(cur) {
   const status = asText(cur && cur.status)
@@ -375,7 +377,8 @@ function petStatusLine(cur) {
       ? `Capture failed: ${note}`
       : 'Capture failed — butler could not read the screen'
   }
-  return null
+  // Live step: speak the current instruction (restored by user request).
+  return instruction
 }
 
 function ButlerApp() {
