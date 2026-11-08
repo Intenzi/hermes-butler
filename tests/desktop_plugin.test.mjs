@@ -16,13 +16,12 @@ import { fileURLToPath } from 'node:url'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PLUGIN_JS = path.join(HERE, '..', 'desktop', 'plugin.js')
 const INTERNALS = [
-  'summonButler', 'sendSummonText', 'summonFromBar', 'summonFailureMessage',
-  'writePetClickClaim', 'setPetClickClaim',
+  'summonButler', 'sendSummonText', 'sendSummonInjection', 'summonFromBar',
+  'summonFailureMessage', 'writePetClickClaim', 'setPetClickClaim',
   'startPetClickWatcher', 'stopPetClickWatcher', 'openSummonBar',
   'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar', 'petCanvasNode',
   'readSummonDestination', 'setSummonDestination', 'getSummonDestination', 'butlerCommandText',
-  'PET_HINT_TEXT', 'armPetVisibilityHint', 'petVisibilityHint',
-  'subscribePetVisibilityHint', 'notePetCanvasFound', 'stopPetVisibilityHint'
+  'openFreshButlerSession', 'openButlerSession'
 ]
 
 function makeDocument({ canvas = null } = {}) {
@@ -235,9 +234,10 @@ test('pane header toggle writes the hot-reload config knob', async () => {
   env.api.setPetClickClaim(false)
 })
 
-test('summon reuses an existing Butler session and sends after the mount grace', async () => {
+test('summon injects into the oldest existing Butler chat without using the composer', async () => {
   const opened = []
   const submitted = []
+  const injected = []
   const host = defaultHost({
     request: async (method, params) => {
       if (method === 'session.list') return [{ id: 's1', title: 'Butler', created_at: 1 }]
@@ -249,17 +249,31 @@ test('summon reuses an existing Butler session and sends after the mount grace',
       submit: (id, text) => { submitted.push({ id, text }); return id === 's1' }
     }
   })
-  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+  const env = await loadPlugin({
+    host,
+    rest: async (requestPath, opts) => {
+      if (requestPath === '/summon/send') {
+        injected.push({ text: opts.body.text, session_id: opts.body.session_id })
+        return { ok: true, session: opts.body.session_id }
+      }
+      return {}
+    },
+    document: makeDocument()
+  })
 
   const result = await env.api.summonButler('fix my wifi')
 
   assert.equal(result.ok, true)
+  assert.equal(result.send, 'inject')
   assert.deepEqual(opened, ['s1'])
-  assert.deepEqual(submitted, [{ id: 's1', text: '/butler fix my wifi' }])
+  assert.deepEqual(injected, [{ text: 'fix my wifi', session_id: 's1' }])
+  assert.deepEqual(submitted, [], 'the injection path must not submit /butler')
 })
 
-test('summon creates the Butler chat when none exists', async () => {
+test('summon creates the Butler chat when none exists, then injects into that id', async () => {
   const requested = []
+  const opened = []
+  const injected = []
   const submitted = []
   const host = defaultHost({
     request: async (method, params) => {
@@ -269,18 +283,31 @@ test('summon creates the Butler chat when none exists', async () => {
       if (method === 'session.title') return {}
       throw new Error(`unexpected request ${method}`)
     },
-    openSession: async () => true,
+    openSession: async id => { opened.push(id); return true },
     composer: {
       submit: (id, text) => { submitted.push({ id, text }); return id === 's2' }
     }
   })
-  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+  const env = await loadPlugin({
+    host,
+    rest: async (requestPath, opts) => {
+      if (requestPath === '/summon/send') {
+        injected.push({ text: opts.body.text, session_id: opts.body.session_id })
+        return { ok: true, session: opts.body.session_id }
+      }
+      return {}
+    },
+    document: makeDocument()
+  })
 
   const result = await env.api.summonButler('open system settings')
 
   assert.equal(result.ok, true)
+  assert.equal(result.send, 'inject')
   assert.ok(requested.includes('session.create'))
-  assert.deepEqual(submitted, [{ id: 's2', text: '/butler open system settings' }])
+  assert.deepEqual(opened, ['s2'])
+  assert.deepEqual(injected, [{ text: 'open system settings', session_id: 's2' }])
+  assert.deepEqual(submitted, [])
 })
 
 test('petless summon still sends and skips the companion double', async () => {
@@ -295,6 +322,7 @@ test('petless summon still sends and skips the companion double', async () => {
   const env = await loadPlugin({
     host,
     rest: async (requestPath, opts) => {
+      if (requestPath === '/summon/send') return { ok: true, session: opts.body.session_id }
       if (requestPath === '/summon/pet') {
         posts.push(requestPath)
         return { ok: true, pet: false }
@@ -497,17 +525,24 @@ test('bar failure reports a seated draft without claiming the send succeeded', a
   assert.doesNotMatch(toast.message, /Draft seat: not seated\./)
 })
 
-test('bar success clears and dismisses with a Summoned toast', async () => {
+test('denied injection falls back to /butler and toasts honestly', async () => {
   const clock = makeClock()
   const notifications = []
+  const submitted = []
   const host = defaultHost({
     request: async method => method === 'session.list'
       ? [{ id: 's1', title: 'Butler', created_at: 1 }]
       : [],
     notify(notification) { notifications.push(notification) },
-    composer: { submit: () => true, setDraft: async () => false }
+    composer: { submit: (id, text) => { submitted.push({ id, text }); return true } }
   })
-  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+  const env = await loadPlugin({
+    host,
+    rest: async requestPath => requestPath === '/summon/send'
+      ? { ok: false, reason: 'injection_denied' }
+      : {},
+    document: makeDocument()
+  })
 
   const outcome = await env.api.summonFromBar('make a guide', {
     now: clock.now,
@@ -515,10 +550,15 @@ test('bar success clears and dismisses with a Summoned toast', async () => {
   })
 
   assert.equal(outcome.result.ok, true)
+  assert.equal(outcome.result.fallback, true)
+  assert.equal(outcome.result.injection_reason, 'injection_denied')
   assert.equal(outcome.clearText, true)
   assert.equal(outcome.dismiss, true)
-  assert.ok(notifications.some(notification => notification.kind === 'success'
-    && notification.message === 'Summoned → Butler chat (existing)'))
+  assert.deepEqual(submitted, [{ id: 's1', text: '/butler make a guide' }])
+  const toast = notifications.find(notification => notification.kind === 'warning')
+  assert.ok(toast, 'the fallback is reported as a warning, not a full success')
+  assert.match(toast.message, /^Summoned → Butler chat \(existing\)/)
+  assert.match(toast.message, /could not host the full conversation/)
 })
 
 test('reach-in listener degrades silently when no pet canvas exists', async () => {
@@ -575,8 +615,9 @@ test('capture-phase pet click summons only when the toggle is on', async () => {
   env.dispose()
 })
 
-test('summon bar sends the /butler slash form and names the existing destination', async () => {
+test('summon bar injects into the existing destination and shows the success toast', async () => {
   const notifications = []
+  const injected = []
   const submitted = []
   const host = defaultHost({
     request: async method => method === 'session.list'
@@ -585,20 +626,33 @@ test('summon bar sends the /butler slash form and names the existing destination
     notify(notification) { notifications.push(notification) },
     composer: { submit: (id, text) => { submitted.push({ id, text }); return true } }
   })
-  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+  const env = await loadPlugin({
+    host,
+    rest: async (requestPath, opts) => {
+      if (requestPath === '/summon/send') {
+        injected.push({ text: opts.body.text, session_id: opts.body.session_id })
+        return { ok: true, session: opts.body.session_id }
+      }
+      return {}
+    },
+    document: makeDocument()
+  })
 
   const outcome = await env.api.summonFromBar('make a guide')
 
   assert.equal(outcome.result.ok, true)
-  assert.deepEqual(submitted, [{ id: 's1', text: '/butler make a guide' }])
+  assert.equal(outcome.result.send, 'inject')
+  assert.deepEqual(injected, [{ text: 'make a guide', session_id: 's1' }])
+  assert.deepEqual(submitted, [], 'the chip path is only the fallback')
   assert.ok(notifications.some(notification => notification.kind === 'success'
     && notification.message === 'Summoned → Butler chat (existing)'))
 })
 
-test('new destination always creates a fresh Butler session, never the oldest', async () => {
+test('new destination creates a fresh id, waits for focus, then injects into it only', async () => {
   const clock = makeClock()
   const requested = []
   const opened = []
+  const injected = []
   const submitted = []
   const notifications = []
   const host = defaultHost({
@@ -616,7 +670,17 @@ test('new destination always creates a fresh Butler session, never the oldest', 
       setDraft: async () => false
     }
   })
-  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+  const env = await loadPlugin({
+    host,
+    rest: async (requestPath, opts) => {
+      if (requestPath === '/summon/send') {
+        injected.push({ text: opts.body.text, session_id: opts.body.session_id })
+        return { ok: true, session: opts.body.session_id }
+      }
+      return {}
+    },
+    document: makeDocument()
+  })
 
   const outcome = await env.api.summonFromBar('fresh start', {
     destination: 'new',
@@ -626,12 +690,110 @@ test('new destination always creates a fresh Butler session, never the oldest', 
 
   assert.equal(outcome.result.ok, true)
   assert.equal(outcome.result.destination, 'new')
+  assert.equal(outcome.result.send, 'inject')
   assert.ok(requested.includes('session.create'))
   assert.ok(!requested.includes('session.activate'), 'never falls back to focusing the oldest')
   assert.deepEqual(opened, ['stored-new'])
-  assert.deepEqual(submitted, [{ id: 'stored-new', text: '/butler fresh start' }])
+  assert.deepEqual(injected, [{ text: 'fresh start', session_id: 'stored-new' }])
+  assert.ok(!injected.some(body => body.session_id === 'oldest'))
+  assert.deepEqual(submitted, [])
   assert.ok(notifications.some(notification => notification.kind === 'success'
     && notification.message === 'Summoned → fresh Butler session'))
+})
+
+test('fresh creation failure surfaces the true reason and never reuses the oldest', async () => {
+  const clock = makeClock()
+  const requested = []
+  const opened = []
+  const injected = []
+  const submitted = []
+  const notifications = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      requested.push(method)
+      if (method === 'session.list') return [{ id: 'oldest', title: 'Butler', created_at: 1 }]
+      if (method === 'session.create') throw new Error('session cap reached')
+      throw new Error(`unexpected request ${method}: ${JSON.stringify(params)}`)
+    },
+    openSession: async id => { opened.push(id); return true },
+    notify(notification) { notifications.push(notification) },
+    composer: { submit: (id, text) => { submitted.push({ id, text }); return true } }
+  })
+  const env = await loadPlugin({
+    host,
+    rest: async (requestPath, opts) => {
+      if (requestPath === '/summon/send') {
+        injected.push({ text: opts.body.text, session_id: opts.body.session_id })
+        return { ok: true, session: opts.body.session_id }
+      }
+      return {}
+    },
+    document: makeDocument()
+  })
+
+  const outcome = await env.api.summonFromBar('fresh start', {
+    destination: 'new',
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(outcome.result.ok, false)
+  assert.equal(outcome.result.destination, 'new')
+  assert.equal(outcome.result.reason, 'session_create_failed')
+  assert.match(outcome.result.error.message, /session cap reached/)
+  assert.ok(!requested.includes('session.activate'), 'never focuses the oldest on a failed create')
+  assert.deepEqual(opened, [])
+  assert.deepEqual(injected, [], 'nothing is injected into the oldest')
+  assert.deepEqual(submitted, [], 'no composer fallback can silently reach the oldest')
+  const toast = notifications.find(notification => notification.kind === 'error')
+  assert.ok(toast)
+  assert.match(toast.message, /could not create a fresh Butler session/)
+  assert.match(toast.message, /session cap reached/)
+})
+
+test('fresh-denied fallback stays on the new id and never re-reads the oldest', async () => {
+  const clock = makeClock()
+  const listCalls = []
+  const opened = []
+  const submitted = []
+  const notifications = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      if (method === 'session.list') {
+        listCalls.push(params)
+        return [{ id: 'oldest', title: 'Butler', created_at: 1 }]
+      }
+      if (method === 'session.create') return { session_id: 'runtime-new', stored_session_id: 'stored-new' }
+      if (method === 'session.title') return {}
+      throw new Error(`unexpected request ${method}: ${JSON.stringify(params)}`)
+    },
+    openSession: async id => { opened.push(id); return true },
+    notify(notification) { notifications.push(notification) },
+    composer: { submit: (id, text) => { submitted.push({ id, text }); return id === 'stored-new' } }
+  })
+  const env = await loadPlugin({
+    host,
+    rest: async requestPath => requestPath === '/summon/send'
+      ? { ok: false, reason: 'injection_denied' }
+      : {},
+    document: makeDocument()
+  })
+
+  const outcome = await env.api.summonFromBar('fresh fallback', {
+    destination: 'new',
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(outcome.result.ok, true)
+  assert.equal(outcome.result.fallback, true)
+  assert.equal(outcome.result.session, 'stored-new')
+  assert.deepEqual(submitted, [{ id: 'stored-new', text: '/butler fresh fallback' }])
+  assert.deepEqual(listCalls, [], 'a fresh fallback must not re-derive the oldest chat')
+  assert.deepEqual(opened, ['stored-new'])
+  const toast = notifications.find(notification => notification.kind === 'warning')
+  assert.ok(toast)
+  assert.match(toast.message, /could not host the full conversation/)
 })
 
 test('destination choice persists across plugin loads in localStorage', async () => {
@@ -655,48 +817,4 @@ test('destination choice persists across plugin loads in localStorage', async ()
   second.api.setSummonDestination('existing')
   assert.equal(storage.values.get('butler.summon.destination'), 'existing')
   second.dispose()
-})
-
-test('pet visibility hint surfaces once per enable and clears when a canvas appears', async () => {
-  let canvas = null
-  const document = makeDocument({ canvas: () => canvas })
-  const env = await loadPlugin({
-    host: defaultHost(),
-    rest: async () => ({ summon: { pet_click_claim: true } }),
-    document
-  })
-  const seen = []
-  const unsubscribe = env.api.subscribePetVisibilityHint(value => seen.push(value))
-
-  // A zero-timeout scan makes the 10 s rule observable without a slow test.
-  // Toggle off first so the config sync's normal 10 s scan cannot win the arm.
-  env.api.setPetClickClaim(false)
-  env.api.setPetClickClaim(true, { timeoutMs: 0 })
-  await new Promise(resolve => setTimeout(resolve, 20))
-
-  assert.equal(env.api.petVisibilityHint(), env.api.PET_HINT_TEXT)
-  assert.match(env.api.PET_HINT_TEXT, /No in-window pet found/)
-  assert.match(env.api.PET_HINT_TEXT, /Cmd\+Shift\+A/)
-  assert.equal(seen.filter(value => value === env.api.PET_HINT_TEXT).length, 1)
-
-  // Once per enable: another scan while the hint stands does not republish it.
-  env.api.armPetVisibilityHint({ timeoutMs: 0 })
-  await new Promise(resolve => setTimeout(resolve, 20))
-  assert.equal(seen.filter(value => value === env.api.PET_HINT_TEXT).length, 1)
-
-  // The first in-window canvas clears the hint immediately.
-  canvas = { getBoundingClientRect: () => ({ left: 1, top: 1, width: 10, height: 10, right: 11, bottom: 11 }) }
-  env.api.notePetCanvasFound()
-  assert.equal(env.api.petVisibilityHint(), null)
-  assert.equal(seen.at(-1), null)
-
-  // ...and a later scan in the same enable must not bring it back.
-  env.api.armPetVisibilityHint({ timeoutMs: 0 })
-  await new Promise(resolve => setTimeout(resolve, 20))
-  assert.equal(env.api.petVisibilityHint(), null)
-
-  env.api.setPetClickClaim(false)
-  assert.equal(env.api.petVisibilityHint(), null)
-  unsubscribe()
-  env.dispose()
 })

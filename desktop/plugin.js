@@ -47,9 +47,6 @@ const CONFIG_REFRESH_MS = 5000
 // Documented legacy locator for the petdex pet (the core pet canvas). Read-only:
 // we never paint into it and never edit Hermes core to add a hook.
 const PET_CANVAS_SELECTOR = 'canvas[aria-label$=" pet"]'
-const PET_SCAN_TIMEOUT_MS = 10000
-const PET_HINT_TEXT = 'No in-window pet found — click the pet inside the Hermes window, '
-  + 'or use Cmd+Shift+A (a popped-out pet cannot be reached).'
 const SUMMON_DESTINATION_KEY = 'butler.summon.destination'
 const SUMMON_EXISTING = 'existing'
 const SUMMON_NEW = 'new'
@@ -78,13 +75,6 @@ let petClickWatcher = null
 let petClickConfigWrites = 0
 // Destination picker state; localStorage is the cross-opening source of truth.
 let summonDestination = null
-// One honest pet-visibility hint per enable. It lives on the Butler pane, not
-// the summon bar, and clears as soon as the watcher sees a canvas.
-const petHintListeners = new Set()
-let petHintTimer = null
-let petHintArmed = false
-let petHintAnnounced = false
-let petHintText = null
 
 function h(type, props, ...children) {
   let key = undefined
@@ -335,39 +325,65 @@ function addTargetIds(list, values) {
   }
 }
 
+function launcherState(ok, reason = null, error = null) {
+  return {
+    ok,
+    target: asText(launcherTargetId),
+    ids: uniqueIds(launcherTargetAliases),
+    reason,
+    error
+  }
+}
+
+function setLauncherTarget(target, ids = []) {
+  launcherTargetId = asText(target)
+  launcherTargetAliases = uniqueIds(ids, launcherTargetId)
+}
+
 async function focusSession(row) {
-  if (!row) return false
+  if (!row) return launcherState(false, 'no_session')
   const storedId = sessionTargetId(row)
-  if (!storedId) return false
+  if (!storedId) return launcherState(false, 'no_session')
+  let lastError = null
   if (host && typeof host.openSession === 'function') {
     try {
       const opened = await host.openSession(storedId, { intent: 'in-place' })
-      launcherTargetId = storedId
-      launcherTargetAliases = uniqueIds(launcherTargetAliases, rowTargetIds(row), openResultIds(opened))
-      return true
+      setLauncherTarget(storedId, uniqueIds(rowTargetIds(row), openResultIds(opened)))
+      return launcherState(true)
     } catch (err) {
-      // Older desktop builds may only expose the gateway RPC.
+      lastError = err
     }
   }
-  if (!host || typeof host.request !== 'function') return false
+  if (!host || typeof host.request !== 'function') {
+    return launcherState(false, 'session_focus_failed', lastError)
+  }
   try {
     const activated = await host.request('session.activate', {
       session_id: asText(row.session_id) || asText(row.id) || storedId
     })
-    launcherTargetId = storedId
-    launcherTargetAliases = uniqueIds(launcherTargetAliases, rowTargetIds(row), openResultIds(activated))
-    return true
+    setLauncherTarget(storedId, uniqueIds(rowTargetIds(row), openResultIds(activated)))
+    return launcherState(true)
   } catch (err) {
-    return false
+    return launcherState(false, 'session_focus_failed', err)
   }
 }
 
 async function createButlerSession() {
-  if (!host || typeof host.request !== 'function') return false
-  const created = await host.request('session.create', { title: BUTLER_TITLE })
+  if (!host || typeof host.request !== 'function') {
+    return launcherState(false, 'session_create_unavailable')
+  }
+  let created = null
+  try {
+    created = await host.request('session.create', { title: BUTLER_TITLE })
+  } catch (err) {
+    return launcherState(false, 'session_create_failed', err)
+  }
   const runtimeId = asText(created && created.session_id)
   const storedId = asText(created && created.stored_session_id) || runtimeId
-  if (!runtimeId && !storedId) return false
+  if (!runtimeId && !storedId) {
+    return launcherState(false, 'session_create_failed',
+      new Error('session.create returned no session id'))
+  }
   if (runtimeId) {
     try {
       await host.request('session.title', { session_id: runtimeId, title: BUTLER_TITLE })
@@ -376,41 +392,28 @@ async function createButlerSession() {
     }
   }
   const target = storedId || runtimeId
-  if (target && host && typeof host.openSession === 'function') {
+  let lastError = null
+  if (host && typeof host.openSession === 'function') {
     try {
       const opened = await host.openSession(target, { intent: 'in-place' })
-      launcherTargetId = target
-      launcherTargetAliases = uniqueIds(
-        launcherTargetAliases,
-        target,
-        runtimeId,
-        openResultIds(created),
-        openResultIds(opened)
-      )
-      return true
+      setLauncherTarget(target, uniqueIds(
+        target, runtimeId, openResultIds(created), openResultIds(opened)))
+      return launcherState(true)
     } catch (err) {
-      // Fall through to activating the runtime session.
+      lastError = err
     }
   }
-  if (runtimeId) {
+  if (runtimeId && host && typeof host.request === 'function') {
     try {
       const activated = await host.request('session.activate', { session_id: runtimeId })
-      launcherTargetId = target
-      launcherTargetAliases = uniqueIds(
-        launcherTargetAliases,
-        target,
-        runtimeId,
-        openResultIds(created),
-        openResultIds(activated)
-      )
-      return true
+      setLauncherTarget(target, uniqueIds(
+        target, runtimeId, openResultIds(created), openResultIds(activated)))
+      return launcherState(true)
     } catch (err) {
-      return false
+      return launcherState(false, 'session_focus_failed', err)
     }
   }
-  launcherTargetId = target
-  launcherTargetAliases = uniqueIds(launcherTargetAliases, target, runtimeId)
-  return Boolean(target)
+  return launcherState(false, 'session_focus_failed', lastError)
 }
 
 function notifyLauncherFailure() {
@@ -437,14 +440,21 @@ function notifySummonFailure(message) {
   }
 }
 
-function notifySummonSuccess(destination) {
+function notifySummonSuccess(result) {
+  const destination = result && result.destination
   const fresh = destination === SUMMON_NEW
+  let message = fresh ? 'Summoned → fresh Butler session' : 'Summoned → Butler chat (existing)'
+  let kind = 'success'
+  if (result && result.fallback) {
+    // Injection was denied/unavailable, so the chip path carried the request.
+    // Say so: the user must not read this as the full agent conversation.
+    kind = 'warning'
+    const reason = asText(result.injection_reason) || 'injection_unavailable'
+    message += ` — gateway injection was ${reason === 'injection_denied' ? 'denied' : 'unavailable'}`
+      + ' (' + reason + '); sent /butler instead, so this chat could not host the full conversation.'
+  }
   try {
-    host && host.notify && host.notify({
-      kind: 'success',
-      title: 'Butler',
-      message: fresh ? 'Summoned → fresh Butler session' : 'Summoned → Butler chat (existing)'
-    })
+    host && host.notify && host.notify({ kind, title: 'Butler', message })
   } catch (err) {
     // A missing toast surface must not break the send.
   }
@@ -452,27 +462,29 @@ function notifySummonSuccess(destination) {
 
 /** Create the one "Butler" chat, or focus the oldest matching one. */
 async function openButlerSession() {
-  if (launcherBusy) return false
+  if (launcherBusy) return launcherState(false, 'busy')
   launcherBusy = true
   launcherTargetId = null
   launcherTargetAliases = []
   try {
     const existing = oldestSession(await listButlerSessions())
-    if (existing && await focusSession(existing)) return true
+    if (existing) {
+      // The default destination is the oldest exact Butler chat: focus THAT
+      // chat. If focusing fails, surface the reason instead of quietly minting
+      // a different session behind the user's back.
+      const focused = await focusSession(existing)
+      if (!focused.ok) notifyLauncherFailure()
+      return focused
+    }
 
-    let created = false
+    let created
     try {
       created = await createButlerSession()
     } catch (err) {
-      created = false
+      created = launcherState(false, 'session_create_failed', err)
     }
-    if (created) return true
-
-    // Creation unsupported (or failed): fall back to the oldest match.
-    const fallback = oldestSession(await listButlerSessions())
-    if (fallback && await focusSession(fallback)) return true
-    notifyLauncherFailure()
-    return false
+    if (!created || !created.ok) notifyLauncherFailure()
+    return created || launcherState(false, 'session_create_failed')
   } finally {
     launcherBusy = false
   }
@@ -524,87 +536,6 @@ function setSummonDestination(value) {
 function butlerCommandText(value) {
   const text = asText(value) || ''
   return /^\s*\//.test(text) ? text : `/butler ${text}`
-}
-
-// ------------------------------------------------------- pet visibility hint
-
-function petHintListenersPublish() {
-  for (const listener of [...petHintListeners]) {
-    try {
-      listener(petHintText)
-    } catch (err) {
-      // A broken pane listener must not break the watcher.
-    }
-  }
-}
-
-function subscribePetVisibilityHint(listener) {
-  petHintListeners.add(listener)
-  try {
-    listener(petHintText)
-  } catch (err) {
-    // A broken listener must not break the subscription.
-  }
-  return () => { petHintListeners.delete(listener) }
-}
-
-function petVisibilityHint() {
-  return petHintText
-}
-
-function clearPetHintTimer() {
-  if (petHintTimer !== null) {
-    try { window.clearTimeout(petHintTimer) } catch (err) { }
-  }
-  petHintTimer = null
-}
-
-function publishPetHint(text) {
-  const next = asText(text)
-  if (next === petHintText) return
-  petHintText = next
-  petHintListenersPublish()
-}
-
-/** Clear the hint (and any pending scan) the moment a canvas is found. */
-function notePetCanvasFound() {
-  clearPetHintTimer()
-  petHintArmed = false
-  if (petHintText !== null) publishPetHint(null)
-}
-
-/**
- * Start one 10 s visibility scan for the current enable. Re-arming is a no-op
- * while a scan or the surfaced hint is live, so the pane sees it once.
- */
-function armPetVisibilityHint(options = {}) {
-  if (!petClickClaim || petHintAnnounced) return false
-  if (petHintTimer !== null || petHintArmed) return false
-  if (petCanvasNode()) {
-    notePetCanvasFound()
-    return false
-  }
-  const timeoutMs = timingOption(options.timeoutMs, PET_SCAN_TIMEOUT_MS)
-  petHintArmed = true
-  clearPetHintTimer()
-  petHintTimer = window.setTimeout(() => {
-    petHintTimer = null
-    if (!petClickClaim || petHintAnnounced) return
-    if (petCanvasNode()) {
-      notePetCanvasFound()
-      return
-    }
-    petHintAnnounced = true
-    publishPetHint(PET_HINT_TEXT)
-  }, timeoutMs)
-  return true
-}
-
-function stopPetVisibilityHint() {
-  clearPetHintTimer()
-  petHintArmed = false
-  petHintAnnounced = false
-  if (petHintText !== null) publishPetHint(null)
 }
 
 function petCanvasNode() {
@@ -701,11 +632,6 @@ function startPetClickWatcher() {
   const follow = () => {
     if (disposed) return
     const canvas = petCanvasNode()
-    // Honest visibility: a canvas clears the hint immediately; no canvas for
-    // the scan window surfaces it once, in the pane, on the next tick. The
-    // watcher keeps looking so a later in-window pet is picked up.
-    if (canvas) notePetCanvasFound()
-    else armPetVisibilityHint()
     if (!canvas || !overlay) {
       if (overlay) overlay.style.opacity = '0'
       frame = window.requestAnimationFrame(follow)
@@ -779,21 +705,14 @@ function stopPetClickWatcher() {
   if (petClickWatcher) petClickWatcher.dispose()
 }
 
-function setPetClickClaim(enabled, options = {}) {
+function setPetClickClaim(enabled) {
   const next = Boolean(enabled)
   if (!next) {
     petClickClaim = false
     stopPetClickWatcher()
-    stopPetVisibilityHint()
     return
   }
-  if (!petClickClaim) {
-    // A fresh enable starts a fresh visibility scan; the previous enable's
-    // surfaced hint never carries over.
-    stopPetVisibilityHint()
-  }
   petClickClaim = true
-  armPetVisibilityHint(options)
   startPetClickWatcher()
 }
 
@@ -845,6 +764,7 @@ async function sendSummonText(target, text, options = {}) {
   const retryMs = timingOption(options.retryMs, SUMMON_SEND_RETRY_MS)
   const timeoutMs = timingOption(options.timeoutMs, SUMMON_SEND_TIMEOUT_MS)
   const refreshMs = timingOption(options.refreshMs, SUMMON_LIVE_REFRESH_MS)
+  const canRefresh = options.refresh !== false
   const canSubmit = typeof host.composer.submit === 'function'
   const canDraft = typeof host.composer.setDraft === 'function'
   const candidates = uniqueIds(
@@ -884,7 +804,7 @@ async function sendSummonText(target, text, options = {}) {
 
     // A stored id can be stale while the mounted surface answers for the
     // runtime id it resumed under. Re-read the live row between attempts.
-    if (now() >= nextRefreshAt) {
+    if (canRefresh && now() >= nextRefreshAt) {
       const live = await refreshSummonTarget(currentTarget)
       if (live) {
         addTargetIds(candidates, live.ids)
@@ -947,7 +867,12 @@ const SUMMON_REASON_LABELS = {
   no_composer: 'no composer',
   no_visible_composer: 'no visible composer',
   no_programmatic_send: 'no_programmatic_send',
-  draft_failed: 'draft_failed'
+  draft_failed: 'draft_failed',
+  injection_denied: 'gateway injection denied',
+  injection_unavailable: 'gateway injection unavailable',
+  session_create_failed: 'could not create a fresh Butler session',
+  session_create_unavailable: 'session creation unsupported',
+  session_focus_failed: 'could not focus the Butler session'
 }
 
 function summonErrorText(error) {
@@ -962,8 +887,12 @@ function summonFailureMessage(result) {
   const label = SUMMON_REASON_LABELS[reason] || reason
   let message = `Could not summon: ${label}`
   if (label !== reason) message += ` (${reason})`
-  const error = summonErrorText(result && result.error)
+  const error = summonErrorText(result && result.error) || summonErrorText(result && result.injection_error)
   if (error) message += ` — ${error}`
+  const injectionReason = asText(result && result.injection_reason)
+  if (injectionReason) {
+    message += `. Full-conversation injection was unavailable (${injectionReason}); /butler fallback also failed`
+  }
   if (result && result.seated) {
     message += '. Draft seat: seated. Press Enter in the Butler composer to send it.'
   } else {
@@ -972,20 +901,68 @@ function summonFailureMessage(result) {
   return message
 }
 
-async function openFreshButlerSession() {
-  if (launcherBusy) return false
+/**
+ * Primary send: ask the gateway to inject a real agent turn into the exact
+ * session the desktop resolved. Fail-closed contract is
+ * `{ok: false, reason: 'injection_denied'}`; any transport failure reads as
+ * `injection_unavailable` so the caller can fall back honestly.
+ */
+async function sendSummonInjection(target, text) {
+  const targetId = asText(target)
+  if (!targetId) {
+    return { ok: false, reason: 'no_session', error: null, session: null }
+  }
+  if (!rest || typeof rest !== 'function') {
+    return { ok: false, reason: 'injection_unavailable', error: null, session: targetId }
+  }
+  try {
+    const response = await rest('/summon/send', {
+      method: 'POST',
+      body: { text, session_id: targetId }
+    })
+    if (response && response.ok === true) {
+      return {
+        ok: true,
+        send: 'inject',
+        session: asText(response.session) || targetId,
+        attempts: 1
+      }
+    }
+    return {
+      ok: false,
+      reason: asText(response && response.reason) || 'injection_denied',
+      error: response && response.error,
+      session: targetId
+    }
+  } catch (err) {
+    return { ok: false, reason: 'injection_unavailable', error: err, session: targetId }
+  }
+}
+
+/**
+ * New destination: create the session first, let the focus settle (openSession
+ * in-place plus the same 300 ms mount grace the composer path used), then keep
+ * the fresh stored/runtime ids. Never falls back to the oldest Butler chat.
+ */
+async function openFreshButlerSession(options = {}) {
+  if (launcherBusy) return launcherState(false, 'busy')
   launcherBusy = true
   launcherTargetId = null
   launcherTargetAliases = []
   try {
-    // New means new: never fall back to the oldest matching session.
-    return await createButlerSession()
+    const created = await createButlerSession()
+    if (!created || !created.ok) return created || launcherState(false, 'session_create_failed')
+    const delay = typeof options.wait === 'function' ? options.wait : wait
+    await delay(timingOption(options.graceMs, SUMMON_SEND_GRACE_MS))
+    return created
+  } catch (err) {
+    return launcherState(false, 'session_create_failed', err)
   } finally {
     launcherBusy = false
   }
 }
 
-/** Resolve the chosen Butler chat, send the slash request, then own the visual. */
+/** Resolve the chosen Butler chat, inject a real agent turn, then own the visual. */
 async function summonButler(text, options = {}) {
   const message = asText(text)
   if (!message) return { ok: false, reason: 'empty', destination: SUMMON_EXISTING }
@@ -993,12 +970,39 @@ async function summonButler(text, options = {}) {
     || (options.destination === undefined && getSummonDestination() === SUMMON_NEW)
     ? SUMMON_NEW : SUMMON_EXISTING
   const opened = destination === SUMMON_NEW
-    ? await openFreshButlerSession()
+    ? await openFreshButlerSession(options)
     : await openButlerSession()
-  if (!opened) return { ok: false, reason: 'no_session', destination }
-  const target = launcherTargetId
-  const result = await sendSummonText(target, butlerCommandText(message), options)
-  return { ...result, session: result.session || target, destination }
+  if (!opened || !opened.ok) {
+    return {
+      ok: false,
+      reason: (opened && opened.reason) || 'no_session',
+      error: opened && opened.error,
+      destination,
+      phase: 'session'
+    }
+  }
+  const target = asText(opened.target) || asText(launcherTargetId)
+  if (!target) return { ok: false, reason: 'no_session', destination, phase: 'session' }
+
+  const injection = await sendSummonInjection(target, message)
+  if (injection.ok) return { ...injection, destination }
+
+  // The gateway could not host the turn. Preserve the grounded chip ladder:
+  // composer.submit('/butler <text>') reaches the slash handler, which reports
+  // honestly instead of opening a full conversation. A fresh send must never
+  // re-derive the oldest Butler chat during this fallback.
+  const fallback = await sendSummonText(target, butlerCommandText(message), {
+    ...options,
+    refresh: options.refresh !== undefined ? options.refresh : destination !== SUMMON_NEW
+  })
+  return {
+    ...fallback,
+    session: fallback.session || target,
+    destination,
+    fallback: true,
+    injection_reason: injection.reason,
+    injection_error: injection.error
+  }
 }
 
 /**
@@ -1013,7 +1017,7 @@ async function summonFromBar(value, options = {}) {
     result = { ok: false, reason: 'threw', error: err, seated: false, destination: getSummonDestination() }
   }
   if (result.ok) {
-    notifySummonSuccess(result.destination)
+    notifySummonSuccess(result)
     await spawnSummonDouble()
     return { result, clearText: true, dismiss: true }
   }
@@ -1352,10 +1356,6 @@ function ButlerApp() {
     refetchOnMount: 'always'
   }) || {}
 
-  // Pet-click honesty lives on the pane header, not the summon bar.
-  const [visibilityHint, setVisibilityHint] = useState(() => petVisibilityHint())
-  useEffect(() => subscribePetVisibilityHint(setVisibilityHint), [])
-
   const rawGuide = data && data.guide
   const guide = rawGuide && typeof rawGuide === 'object' && Object.keys(rawGuide).length > 0 ? rawGuide : null
   const state = guide && guide.state && typeof guide.state === 'object' ? guide.state : {}
@@ -1449,16 +1449,6 @@ function ButlerApp() {
           onClick: () => { if (typeof refetch === 'function') refetch() }
         }, 'Refresh'))
     ),
-
-    visibilityHint && h('div', {
-      role: 'status',
-      'aria-live': 'polite',
-      style: {
-        fontSize: 12, lineHeight: 1.4, color: '#f5c26b',
-        border: '1px solid rgba(245,194,107,.35)', borderRadius: 10, padding: '8px 12px',
-        background: 'rgba(245,194,107,.06)'
-      }
-    }, visibilityHint),
 
     h(ButlerPetClickToggle, {}),
 
@@ -1590,8 +1580,6 @@ export default {
       ctx.onDispose(() => {
         stopPetClickWatcher()
         petClickClaim = false
-        stopPetVisibilityHint()
-        petHintListeners.clear()
         summonOpen = false
         summonListeners.clear()
       })

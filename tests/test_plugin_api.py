@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dashboard.plugin_api import router  # noqa: E402  (import after sys.path setup)
+from dashboard import plugin_api  # noqa: E402  (import after sys.path setup)
+from butler_core.summon import frame_summon_text  # noqa: E402
+
+router = plugin_api.router
 
 
 @pytest.fixture
@@ -159,3 +162,80 @@ def test_summon_pet_is_a_noop_without_a_petdex_pet(
 
     assert response.status_code == 200
     assert response.json() == {"ok": True, "pet": False}
+
+
+class FakePluginCtx:
+    def __init__(self, accepted=True, raises=False):
+        self.accepted = accepted
+        self.raises = raises
+        self.injected = []
+
+    def inject_message(self, text, **kwargs):
+        self.injected.append({"text": text, **kwargs})
+        if self.raises:
+            raise RuntimeError("injection host is down")
+        return self.accepted
+
+
+def test_summon_send_injects_the_exact_frame_into_the_selected_session(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = FakePluginCtx()
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={
+        "text": "turn off wifi",
+        "session_id": "ses_123",
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "session": "ses_123"}
+    assert ctx.injected == [{
+        "text": frame_summon_text("turn off wifi"),
+        "role": "user",
+        "session_key": "ses_123",
+    }]
+    assert ctx.injected[0]["text"].startswith("[butler summon] turn off wifi\n\n")
+
+
+def test_summon_send_returns_the_denied_contract_when_injection_is_refused(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = FakePluginCtx(accepted=False)
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={
+        "text": "fix it",
+        "session_id": "ses_123",
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": False, "reason": "injection_denied"}
+    assert len(ctx.injected) == 1
+
+
+def test_summon_send_fails_closed_when_injection_raises(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = FakePluginCtx(raises=True)
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={
+        "text": "fix it",
+        "session_id": "ses_123",
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": False, "reason": "injection_denied"}
+
+
+def test_summon_send_fails_closed_without_a_live_plugin_context(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: None)
+
+    response = client.post("/summon/send", json={"text": "fix it", "session_id": "ses_123"})
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": False, "reason": "injection_denied"}
+
+
+def test_summon_send_requires_text_and_a_session_id(client: TestClient) -> None:
+    assert client.post("/summon/send", json={"text": "", "session_id": "ses_123"}).status_code == 400
+    assert client.post("/summon/send", json={"text": "fix it", "session_id": ""}).status_code == 400

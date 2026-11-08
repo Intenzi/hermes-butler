@@ -50,7 +50,7 @@ def test_plugin_uses_the_composer_submit_send_path_with_a_honest_draft_fallback(
     assert "no_programmatic_send" in source
 
 
-def test_plugin_has_a_persistent_destination_picker_and_sends_the_slash_form() -> None:
+def test_plugin_has_a_persistent_destination_picker_and_keeps_the_slash_fallback() -> None:
     source = PLUGIN_JS.read_text(encoding="utf-8")
 
     assert "Butler chat" in source
@@ -61,11 +61,21 @@ def test_plugin_has_a_persistent_destination_picker_and_sends_the_slash_form() -
     assert "Summoned → fresh Butler session" in source
 
 
-def test_plugin_has_the_one_shot_in_window_pet_hint() -> None:
+def test_plugin_has_no_pane_header_pet_visibility_hint() -> None:
     source = PLUGIN_JS.read_text(encoding="utf-8")
 
-    assert "No in-window pet found" in source
-    assert "Cmd+Shift+A" in source
-    assert "subscribePetVisibilityHint" in source
-    assert "petVisibilityHint" in source
-    assert "PET_SCAN_TIMEOUT_MS = 10000" in source
+    assert "No in-window pet found" not in source
+    assert "subscribePetVisibilityHint" not in source
+    assert "petVisibilityHint" not in source
+    assert "PET_SCAN_TIMEOUT_MS" not in source
+
+
+def test_plugin_posts_the_summon_send_route_with_a_session_id_and_keeps_the_fallback() -> None:
+    source = PLUGIN_JS.read_text(encoding="utf-8")
+
+    assert "/summon/send" in source
+    assert "session_id" in source
+    assert "injection_denied" in source
+    assert "injection_unavailable" in source
+    assert "sendSummonText" in source
+    assert "butlerCommandText" in source

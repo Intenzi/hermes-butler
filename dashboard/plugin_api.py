@@ -2,11 +2,13 @@
 
 ``GET /state`` — the live guide state the desktop pane renders.
 ``GET /history`` — finished guide rows, newest first (cap 50).
+``POST /summon/send`` — inject a framed butler turn into a selected session.
 ``GET /health`` — mount probe.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -17,6 +19,7 @@ from fastapi import APIRouter, HTTPException
 
 
 router = APIRouter()
+logger = logging.getLogger("hermes.plugins.butler.api")
 
 HISTORY_LIMIT = 50
 CONFIG_KEY = "summon.pet_click_claim"
@@ -96,6 +99,50 @@ def _write_config(pet_click_claim: bool) -> dict[str, Any] | None:
     except OSError:
         return None
     return cfg
+
+
+def _plugin_context():
+    """The register()-time PluginContext for this plugin, wherever it loaded.
+
+    In-process, the plugin module owns the context as a module global; under
+    ``plugins.isolation: host`` the same module runs in the plugin host child and
+    the route is forwarded there. Scan sys.modules by the module's real file so
+    neither host needs a package-name assumption.
+    """
+    root = Path(__file__).resolve().parents[1]
+    try:
+        init_path = (root / "__init__.py").resolve()
+    except OSError:
+        return None
+    for module in list(sys.modules.values()):
+        filename = getattr(module, "__file__", None)
+        if not filename:
+            continue
+        try:
+            if Path(filename).resolve() != init_path:
+                continue
+        except OSError:
+            continue
+        getter = getattr(module, "get_plugin_context", None)
+        if not callable(getter):
+            continue
+        try:
+            context = getter()
+        except Exception:
+            continue
+        if context is not None:
+            return context
+    return None
+
+
+def _summon_frame(text: str) -> str:
+    """The shared summon frame (imported from the plugin body, not copied)."""
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from butler_core.summon import frame_summon_text
+
+    return frame_summon_text(text)
 
 
 def _load_overlay_module():
@@ -230,6 +277,37 @@ def set_config(body: dict[str, Any]) -> dict[str, Any]:
 def summon_pet() -> dict[str, Any]:
     spawned = _summon_pet_double()
     return {"ok": True, "pet": bool(spawned)}
+
+
+@router.post("/summon/send")
+def summon_send(body: dict[str, Any]) -> dict[str, Any]:
+    """Inject a framed butler turn into the session the desktop selected.
+
+    The desktop resolves the destination (oldest Butler chat, or the fresh one it
+    just created) and sends its durable id. ``ctx.inject_message`` fails closed
+    when gateway injection is not allowed; the contract is a stable
+    ``{ok: false, reason: "injection_denied"}`` so the desktop can fall back to
+    the honest composer/slash path.
+    """
+    text = body.get("text") if isinstance(body, dict) else None
+    session_id = body.get("session_id") if isinstance(body, dict) else None
+    text = text.strip() if isinstance(text, str) else ""
+    session_id = session_id.strip() if isinstance(session_id, str) else ""
+    if not text or not session_id:
+        raise HTTPException(status_code=400, detail="text and session_id are required")
+
+    ctx = _plugin_context()
+    inject = getattr(ctx, "inject_message", None)
+    if not callable(inject):
+        return {"ok": False, "reason": "injection_denied"}
+    try:
+        accepted = bool(inject(_summon_frame(text), role="user", session_key=session_id))
+    except Exception:
+        logger.exception("butler summon injection failed")
+        accepted = False
+    if not accepted:
+        return {"ok": False, "reason": "injection_denied"}
+    return {"ok": True, "session": session_id}
 
 
 @router.get("/health")

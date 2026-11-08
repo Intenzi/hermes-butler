@@ -34,9 +34,11 @@ it; the doctor tells you when it is your turn and tells you when you are clear.
 ### Ask the butler
 
 Summon the dedicated **Butler** chat from anywhere in the desktop and hand it a
-text request. The bar sends the request as `/butler <request>` — the agent-side
-slash command that plans a short guide and starts it immediately. Typing a plain
-message in any chat without the slash is still ordinary conversation.
+text request. The bar posts the request to the plugin's gateway route, which
+injects a real agent turn into the chosen chat. The agent plans a short guide and
+starts it immediately; if the request is too vague, it asks exactly one
+clarifying question as a normal chat reply, and you answer it right there. Typing
+a plain message in any chat without the slash is still ordinary conversation.
 
 - **Keyboard shortcut** — "Ask the butler" (default ⌘⇧A, rebindable in
   Settings → Keybinds). Opens the floating bar; Enter sends, Escape or blur
@@ -50,21 +52,23 @@ message in any chat without the slash is still ordinary conversation.
   "Click the pet to ask the butler" switch on the `/butler` pane. The switch
   writes `summon.pet_click_claim` in the plugin's
   `plugin-data/butler/config.json`; the engine reads it fresh, so it hot-reloads
-  without a gateway restart. The receiver only sees an in-window pet canvas: if
-  none is found within ten seconds, the Butler pane header says so once (a
-  popped-out pet cannot be reached; use ⌘⇧A instead).
+  without a gateway restart. The receiver only acts on the in-window pet canvas;
+  a popped-out pet window cannot receive the click, so use ⌘⇧A there.
 - **Existing surfaces** — the status-bar chip, sidebar page, and palette are
   unchanged.
 
 On send the chat is focused (or created if it does not exist yet), and the
 butler's companion pet double appears by the bar before waving off. With no
-petdex pet installed the double is skipped; the bar and the send still work.
+petdex pet installed the double is skipped; the bar and the send still work. If
+the gateway cannot inject the turn (gateway injection is not allowed or
+unavailable), the bar falls back to posting `/butler <request>` and says plainly
+that the chat could not host the full conversation.
 
 Agent-side tools and commands:
 
-- `/butler <request>` — observe the current screen, plan a butler guide from the
-  request (≤6 flat steps), and start it with `butler_guide_start`; a vague
-  request gets one concrete question instead of guessed labels
+- `/butler <request>` — inject the request into the current chat as a real agent
+  turn and return a one-line acknowledgement; the agent's guide plan (or its one
+  clarifying question) then appears as a normal chat reply
 
 - `butler_guide_start` — start a guide from a JSON plan of steps
 - `butler_guide_status` — poll the live state of a running guide
@@ -151,10 +155,11 @@ platforms land. Requires Hermes >= 0.22.5.
    and app restart are manual.
 2. `hermes butler capture` — should print element text and boxes for the
    current foreground app.
-3. Type `/butler open System Settings` in any chat; a guide should start walking
-   your screen (rings, bubbles, progress) rather than print a plan.
-4. Open the Butler pane from the sidebar: check its status summary and, with the
-   pet-click switch on, the one-line in-window-pet hint.
+3. Type `/butler open System Settings` in any chat; the injector acknowledges in
+   chat, then the agent starts the guide (rings, bubbles, progress) rather than
+   printing a plan.
+4. Open the Butler pane from the sidebar: check its status summary, and turn on
+   the pet-click switch if you want clicking the pet to open the bar.
 
 Desktop-half tests run with `npm test` (Node's built-in test runner); the
 Python side runs with `python -m pytest`.

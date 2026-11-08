@@ -1,20 +1,31 @@
 """Butler — Hermes plugin.
 
 Tools: butler_guide_start, butler_guide_status, butler_capture, butler_stop.
-Slash command: /butler <request> — plan a guide and start it in one command.
+Slash command: /butler <request> — inject the request into this chat as a real
+agent turn that plans and starts a guide.
 CLI: hermes butler capture|status|doctor.
 Skills: butler:follow (guide authoring), butler:conventions (dev conventions).
 """
 import json
 import logging
 import os
-from pathlib import Path
 
 from .butler_core import capture as bp_capture
 from .butler_core import doctor as bp_doctor
 from .butler_core import engine as bp_engine
+from .butler_core import summon as bp_summon
 
 logger = logging.getLogger("hermes.plugins.butler")
+
+# The live PluginContext for this plugin, captured by register(). The gateway-side
+# dashboard route reads it through get_plugin_context() so POST /summon/send can
+# call the same ctx.inject_message the slash handler uses.
+_PLUGIN_CONTEXT = None
+
+
+def get_plugin_context():
+    """Return the register()-time context, or None before/without registration."""
+    return _PLUGIN_CONTEXT
 
 GUIDE_START_SCHEMA = {
     "type": "object",
@@ -74,81 +85,9 @@ STOP_SCHEMA = {
 BUTLER_SLASH_NAME = "butler"
 BUTLER_SLASH_ARGS_HINT = "<request>"
 BUTLER_SLASH_HELP = (
-    "Usage: /butler <what you want walked through on screen> — the butler plans a "
-    "short guide, observes the current screen, and starts it immediately."
+    "Usage: /butler <what you want walked through on screen> — injects the request "
+    "into this chat as an agent turn that plans and starts a short guide."
 )
-# The slash command is a handler call, not an agent turn (Hermes intercepts the
-# slash before the model). So the handler carries the same deterministic
-# instruction a turn would get: butler:follow's rules, an observation pass, a
-# single plan, then the real butler_guide_start tool. No plan is printed as a
-# substitute for a guide.
-BUTLER_SLASH_INSTRUCTIONS = """\
-You are planning a Butler Follow-mode guide. The user invoked /butler, so treat
-their text as a BUTLER GUIDANCE REQUEST, not as ordinary conversation.
-
-Follow the butler:follow skill below exactly. In particular:
-- OBSERVE-THEN-PLAN: the OBSERVATION block is a live Accessibility read of the
-  current screen. Use only control labels that appear there (or exact words the
-  user supplied) for find.label. Never invent labels from memory or a generic
-  layout.
-- If the request names a different app that is not frontmost, the first step may
-  be hands-off: no find.label, with an expect.app for the app that must open.
-- Six steps maximum. One flat dict per step: say plus find.label / find.role and
-  expect.app / expect.app_frontmost / expect.window / expect.visible / expect.focus.
-  Never nest find or expect and never add step ids or substeps.
-- If the request is too vague to ground a single first step, or the labels it
-  needs are not observable yet, return outcome "ask" with ONE concrete question
-  the user can answer. Do not guess labels.
-- If you can ground a useful first guide, return outcome "start" with a title and
-  steps. The handler starts that guide with butler_guide_start in this same
-  command execution.
-
-Return one JSON object only, matching the supplied schema.
-
-===== butler:follow skill =====
-"""
-
-_GUIDE_STEP_KEYS = (
-    "find.label",
-    "find.role",
-    "expect.app",
-    "expect.app_frontmost",
-    "expect.window",
-    "expect.visible",
-    "expect.focus",
-)
-
-_GUIDE_STEP_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "say": {"type": "string", "description": "One imperative line naming the control."},
-        "find.label": {"type": "string"},
-        "find.role": {"type": "string"},
-        "expect.app": {"type": "string"},
-        "expect.app_frontmost": {"type": "string"},
-        "expect.window": {"type": "string"},
-        "expect.visible": {"type": "string"},
-        "expect.focus": {"type": "string"},
-    },
-    "required": ["say"],
-}
-
-GUIDE_PLAN_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "outcome": {"type": "string", "enum": ["start", "ask"]},
-        "question": {"type": "string"},
-        "title": {"type": "string"},
-        "steps": {
-            "type": "array",
-            "maxItems": 6,
-            "items": _GUIDE_STEP_SCHEMA,
-        },
-    },
-    "required": ["outcome"],
-}
 
 
 def _out(payload):
@@ -194,191 +133,37 @@ def tool_stop(args, **kwargs):
         return _out({"error": str(exc)})
 
 
-def _follow_skill_text():
-    """The same butler:follow body a turn would load with skill_view()."""
-    path = Path(__file__).resolve().parent / "skills" / "butler-follow" / "SKILL.md"
+def _inject_summon(ctx, request, session_key=None):
+    """Inject one framed butler turn; False when the host refuses it."""
+    inject = getattr(ctx, "inject_message", None)
+    if not callable(inject):
+        return False
+    kwargs = {"role": "user"}
+    if session_key:
+        kwargs["session_key"] = session_key
     try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
-
-
-def _format_observation(snapshot):
-    """Compact, model-readable view of the live screen read."""
-    if not isinstance(snapshot, dict):
-        return "No screen observation was available."
-    lines = []
-    if snapshot.get("trusted") is False:
-        lines.append("ACCESSIBILITY GRANT MISSING: the screen read is untrusted.")
-    if snapshot.get("error"):
-        lines.append("Capture error: %s" % snapshot["error"])
-    if snapshot.get("app"):
-        lines.append("Frontmost app: %s" % snapshot["app"])
-    if snapshot.get("window"):
-        lines.append("Frontmost window: %s" % snapshot["window"])
-    if snapshot.get("focused"):
-        lines.append("Focused control: %s" % snapshot["focused"])
-    elements = snapshot.get("elements")
-    if isinstance(elements, list):
-        rows = []
-        for element in elements[:180]:
-            if not isinstance(element, dict):
-                continue
-            label = element.get("label")
-            if not isinstance(label, str) or not label.strip():
-                continue
-            role = element.get("role") or "control"
-            rows.append("- %s: %s" % (role, label.strip()))
-        if rows:
-            lines.append("Visible controls:")
-            lines.extend(rows)
-    if not lines:
-        lines.append("No readable controls were observed.")
-    return "\n".join(lines)
-
-
-def _one_concrete_question(text):
-    """Keep the model's clarification to a single, answerable question."""
-    cleaned = " ".join(str(text or "").split()).strip()
-    if not cleaned:
-        return ""
-    mark = cleaned.find("?")
-    if mark >= 0:
-        return cleaned[: mark + 1]
-    return cleaned[:400]
-
-
-def _plan_requests_clarification(parsed):
-    if not isinstance(parsed, dict):
-        return ""
-    if str(parsed.get("outcome") or "").strip().lower() != "ask":
-        return ""
-    return _one_concrete_question(parsed.get("question")) or (
-        "What is the first screen or app you want the butler to walk you through?"
-    )
-
-
-def _clean_guide_steps(parsed):
-    """Validate a structured plan into flat, engine-ready steps.
-
-    Returns (title, steps, question). A non-empty question means the request was
-    too vague (or the plan was ungrounded) and no guide may start.
-    """
-    if not isinstance(parsed, dict):
-        return "", [], "What is the first screen or app you want the butler to walk you through?"
-    question = _plan_requests_clarification(parsed)
-    if question:
-        return "", [], question
-    raw_steps = parsed.get("steps")
-    if not isinstance(raw_steps, list) or not raw_steps:
-        return "", [], "What is the first screen or app you want the butler to walk you through?"
-    if len(raw_steps) > 6:
-        return "", [], (
-            "That request needs more than six steps. What is the single first thing "
-            "you want the butler to walk you through?"
-        )
-    steps = []
-    for raw in raw_steps:
-        if not isinstance(raw, dict):
-            continue
-        say = raw.get("say")
-        if not isinstance(say, str) or not say.strip():
-            continue
-        step = {"say": say.strip()}
-        for key in _GUIDE_STEP_KEYS:
-            value = raw.get(key)
-            if isinstance(value, str) and value.strip():
-                step[key] = value.strip()
-        # A step with neither a target nor an expectation can never verify; the
-        # engine would reject it and leave the user with a dead guide.
-        if "find.label" not in step and not any(
-                key.startswith("expect.") for key in step):
-            continue
-        steps.append(step)
-    if not steps:
-        return "", [], (
-            "I could not ground a verifiable first step from that request. "
-            "Which exact control or app should the butler walk you to first?"
-        )
-    title = str(parsed.get("title") or "").strip()
-    if not title:
-        title = "Butler guide"
-    return title, steps, ""
+        return bool(inject(bp_summon.frame_summon_text(request), **kwargs))
+    except Exception:  # noqa: BLE001 - a handler must always answer
+        logger.exception("butler summon injection failed")
+        return False
 
 
 def _handle_butler_slash(ctx, raw_args):
-    """`/butler <request>`: observe, plan, then start the real guide.
+    """`/butler <request>`: inject the request into THIS chat as an agent turn.
 
-    Deterministic by construction: the same butler:follow instructions are used
-    every time, the live screen read is supplied as evidence, the plan is
-    schema-validated (flat keys, ≤6 steps), and butler_guide_start is dispatched
-    before this handler returns. A vague request gets one question, not a guess.
+    Hermes intercepts the slash before the model, so the handler does not try to
+    plan anything itself. It queues the same framed guidance the summon bar uses
+    and returns a short acknowledgement; the agent's plan (or its one clarifying
+    question) then appears as a normal chat reply.
     """
     request = (raw_args or "").strip()
     if not request:
         return BUTLER_SLASH_HELP
     if request.lower() in {"help", "-h", "--help", "?"}:
         return BUTLER_SLASH_HELP
-
-    llm = getattr(ctx, "llm", None)
-    complete_structured = getattr(llm, "complete_structured", None)
-    if not callable(complete_structured):
-        return "The /butler command needs this Hermes build's plugin LLM access (ctx.llm)."
-
-    try:
-        snapshot = bp_capture.capture(max_elements=150, depth=10)
-    except Exception as exc:  # capture must never prevent the handler from answering
-        logger.exception("butler /butler capture failed")
-        snapshot = {"error": str(exc)}
-    observation = _format_observation(snapshot)
-
-    try:
-        result = complete_structured(
-            instructions=BUTLER_SLASH_INSTRUCTIONS + _follow_skill_text(),
-            input=[{
-                "type": "text",
-                "text": "REQUEST:\n%s\n\nOBSERVATION:\n%s" % (request, observation),
-            }],
-            json_schema=GUIDE_PLAN_SCHEMA,
-            schema_name="butler.guide_plan",
-            purpose="butler.slash",
-            temperature=0.0,
-            max_tokens=1400,
-        )
-    except Exception:
-        logger.exception("butler /butler planning failed")
-        return ("The butler could not plan that request right now. Try again, or ask "
-                "for a guide in the Butler chat.")
-
-    parsed = getattr(result, "parsed", None)
-    title, steps, question = _clean_guide_steps(parsed)
-    if question:
-        return question
-
-    try:
-        raw = ctx.dispatch_tool("butler_guide_start", {"title": title, "steps": steps})
-    except Exception as exc:  # noqa: BLE001 - handler must return a usable answer
-        logger.exception("butler /butler guide_start dispatch failed")
-        return "Butler could not start the guide: %s" % exc
-    try:
-        payload = json.loads(raw) if isinstance(raw, str) else raw
-    except (TypeError, ValueError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    if payload.get("error"):
-        return "Butler could not start the guide: %s" % payload["error"]
-
-    state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
-    if state.get("status") == "capture_failed":
-        note = payload.get("capture_note") or state.get("note") or "the screen read failed"
-        return ("Butler started the guide but could not read the screen (%s). "
-                "Run `hermes butler doctor --ask` to check the grant." % note)
-    note = payload.get("note")
-    reply = "Butler is walking the guide now: %s. Step 1: %s" % (title, steps[0]["say"])
-    if note:
-        reply += "\nNote: %s" % note
-    return reply
+    if not _inject_summon(ctx, request):
+        return bp_summon.SUMMON_DENIED
+    return bp_summon.SUMMON_ACK
 
 
 def butler_cli_setup(parser):
@@ -424,6 +209,8 @@ def cli_butler(args: str, **kwargs):
 
 
 def register(ctx):
+    global _PLUGIN_CONTEXT
+    _PLUGIN_CONTEXT = ctx
     ctx.register_tool(name="butler_guide_start", toolset="butler", schema=GUIDE_START_SCHEMA,
                       handler=tool_guide_start, description="Walk the user through a plan: steps shown on screen, verified from the OS layer.", emoji="🎩")
     ctx.register_tool(name="butler_guide_status", toolset="butler", schema=GUIDE_STATUS_SCHEMA,
@@ -435,7 +222,7 @@ def register(ctx):
     ctx.register_command(
         BUTLER_SLASH_NAME,
         handler=lambda raw, _ctx=ctx: _handle_butler_slash(_ctx, raw),
-        description="Plan and start a Butler guide from a request.",
+        description="Inject a Butler guide request into this chat.",
         args_hint=BUTLER_SLASH_ARGS_HINT)
     ctx.register_cli_command(
         name="butler", help="Butler guide status / capture / doctor",
@@ -459,4 +246,4 @@ def register(ctx):
                            description="Butler plugin dev conventions: flat step keys, restart batching, verify-dsh-rule, checklist shape, TCC scope, card etiquette. Load for any butler board or code work.")
     except Exception:
         logger.exception("butler:conventions skill registration failed")
-    logger.info("Butler plugin registered: 4 tools, /butler, CLI 'butler', 2 skills")
+    logger.info("Butler plugin registered: 4 tools, /butler (injected turn), CLI 'butler', 2 skills")
