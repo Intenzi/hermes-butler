@@ -34,17 +34,25 @@ it; the doctor tells you when it is your turn and tells you when you are clear.
 ### Ask the butler
 
 Summon the dedicated **Butler** chat from anywhere in the desktop and hand it a
-text request. The request is sent immediately through the SDK composer door
-(`host.composer.submit`) — the same path as typing it and pressing Enter.
+text request. The bar sends the request as `/butler <request>` — the agent-side
+slash command that plans a short guide and starts it immediately. Typing a plain
+message in any chat without the slash is still ordinary conversation.
 
 - **Keyboard shortcut** — "Ask the butler" (default ⌘⇧A, rebindable in
   Settings → Keybinds). Opens the floating bar; Enter sends, Escape or blur
-  dismisses.
+  dismisses. Focus stays on the text input; the destination buttons are
+  Tab-reachable after it.
+- **Destination** — a segmented choice in the bar: **Butler chat** (the existing
+  chat, default) or **New session** (always creates a fresh Butler-titled chat,
+  never reuses the oldest). The choice is kept in the desktop's localStorage
+  across openings; the success toast names it.
 - **Click the pet** — opt-in only, off by default. Turn it on with the
   "Click the pet to ask the butler" switch on the `/butler` pane. The switch
   writes `summon.pet_click_claim` in the plugin's
   `plugin-data/butler/config.json`; the engine reads it fresh, so it hot-reloads
-  without a gateway restart.
+  without a gateway restart. The receiver only sees an in-window pet canvas: if
+  none is found within ten seconds, the Butler pane header says so once (a
+  popped-out pet cannot be reached; use ⌘⇧A instead).
 - **Existing surfaces** — the status-bar chip, sidebar page, and palette are
   unchanged.
 
@@ -52,7 +60,11 @@ On send the chat is focused (or created if it does not exist yet), and the
 butler's companion pet double appears by the bar before waving off. With no
 petdex pet installed the double is skipped; the bar and the send still work.
 
-Agent-side tools:
+Agent-side tools and commands:
+
+- `/butler <request>` — observe the current screen, plan a butler guide from the
+  request (≤6 flat steps), and start it with `butler_guide_start`; a vague
+  request gets one concrete question instead of guessed labels
 
 - `butler_guide_start` — start a guide from a JSON plan of steps
 - `butler_guide_status` — poll the live state of a running guide
@@ -139,10 +151,10 @@ platforms land. Requires Hermes >= 0.22.5.
    and app restart are manual.
 2. `hermes butler capture` — should print element text and boxes for the
    current foreground app.
-3. Open a new chat and ask your pet to spawn a test guide; rings on-screen and
-   bubbles-and-progress count as confirmation.
-4. `/butler` opens the pane: check its status summary alongside the guide you
-   just ran.
+3. Type `/butler open System Settings` in any chat; a guide should start walking
+   your screen (rings, bubbles, progress) rather than print a plan.
+4. Open the Butler pane from the sidebar: check its status summary and, with the
+   pet-click switch on, the one-line in-window-pet hint.
 
 Desktop-half tests run with `npm test` (Node's built-in test runner); the
 Python side runs with `python -m pytest`.

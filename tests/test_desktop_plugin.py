@@ -48,3 +48,24 @@ def test_plugin_uses_the_composer_submit_send_path_with_a_honest_draft_fallback(
     assert "host.composer.submit" in source
     assert "setDraft" in source
     assert "no_programmatic_send" in source
+
+
+def test_plugin_has_a_persistent_destination_picker_and_sends_the_slash_form() -> None:
+    source = PLUGIN_JS.read_text(encoding="utf-8")
+
+    assert "Butler chat" in source
+    assert "New session" in source
+    assert "butler.summon.destination" in source
+    assert "localStorage" in source
+    assert "/butler " in source
+    assert "Summoned → fresh Butler session" in source
+
+
+def test_plugin_has_the_one_shot_in_window_pet_hint() -> None:
+    source = PLUGIN_JS.read_text(encoding="utf-8")
+
+    assert "No in-window pet found" in source
+    assert "Cmd+Shift+A" in source
+    assert "subscribePetVisibilityHint" in source
+    assert "petVisibilityHint" in source
+    assert "PET_SCAN_TIMEOUT_MS = 10000" in source

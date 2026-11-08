@@ -19,7 +19,10 @@ const INTERNALS = [
   'summonButler', 'sendSummonText', 'summonFromBar', 'summonFailureMessage',
   'writePetClickClaim', 'setPetClickClaim',
   'startPetClickWatcher', 'stopPetClickWatcher', 'openSummonBar',
-  'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar', 'petCanvasNode'
+  'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar', 'petCanvasNode',
+  'readSummonDestination', 'setSummonDestination', 'getSummonDestination', 'butlerCommandText',
+  'PET_HINT_TEXT', 'armPetVisibilityHint', 'petVisibilityHint',
+  'subscribePetVisibilityHint', 'notePetCanvasFound', 'stopPetVisibilityHint'
 ]
 
 function makeDocument({ canvas = null } = {}) {
@@ -64,7 +67,16 @@ function makeDocument({ canvas = null } = {}) {
   }
 }
 
-async function loadPlugin({ host, rest, document }) {
+function makeStorage(initial = {}) {
+  const values = new Map(Object.entries(initial))
+  return {
+    values,
+    getItem(key) { return values.has(key) ? values.get(key) : null },
+    setItem(key, value) { values.set(key, String(value)) }
+  }
+}
+
+async function loadPlugin({ host, rest, document, storage }) {
   const contributions = []
   const disposers = []
   const intervals = []
@@ -86,6 +98,7 @@ async function loadPlugin({ host, rest, document }) {
     clearTimeout,
     queueMicrotask
   })
+  if (storage) context.localStorage = storage
   context.window = {
     setTimeout,
     clearTimeout,
@@ -242,7 +255,7 @@ test('summon reuses an existing Butler session and sends after the mount grace',
 
   assert.equal(result.ok, true)
   assert.deepEqual(opened, ['s1'])
-  assert.deepEqual(submitted, [{ id: 's1', text: 'fix my wifi' }])
+  assert.deepEqual(submitted, [{ id: 's1', text: '/butler fix my wifi' }])
 })
 
 test('summon creates the Butler chat when none exists', async () => {
@@ -267,7 +280,7 @@ test('summon creates the Butler chat when none exists', async () => {
 
   assert.equal(result.ok, true)
   assert.ok(requested.includes('session.create'))
-  assert.deepEqual(submitted, [{ id: 's2', text: 'open system settings' }])
+  assert.deepEqual(submitted, [{ id: 's2', text: '/butler open system settings' }])
 })
 
 test('petless summon still sends and skips the companion double', async () => {
@@ -447,7 +460,7 @@ test('bar failure keeps the text and toasts the exact reason plus an unseated dr
   assert.equal(outcome.result.reason, 'no_visible_composer')
   assert.equal(outcome.clearText, false, 'the typed text stays in the bar')
   assert.equal(outcome.dismiss, false, 'the bar stays open for a retry')
-  assert.deepEqual(draftCalls, [{ id: 's1', text: 'fix my wifi' }])
+  assert.deepEqual(draftCalls, [{ id: 's1', text: '/butler fix my wifi' }])
   const toast = notifications.find(notification => notification.kind === 'error')
   assert.ok(toast, 'a failure toast was shown')
   assert.match(toast.message, /^Could not summon: no visible composer \(no_visible_composer\)/)
@@ -505,7 +518,7 @@ test('bar success clears and dismisses with a Summoned toast', async () => {
   assert.equal(outcome.clearText, true)
   assert.equal(outcome.dismiss, true)
   assert.ok(notifications.some(notification => notification.kind === 'success'
-    && notification.message === 'Summoned → Butler chat'))
+    && notification.message === 'Summoned → Butler chat (existing)'))
 })
 
 test('reach-in listener degrades silently when no pet canvas exists', async () => {
@@ -558,6 +571,132 @@ test('capture-phase pet click summons only when the toggle is on', async () => {
   env.api.setPetClickClaim(false)
   assert.equal(document.listeners.length, 0, 'disabling removes the capture listener')
   assert.equal(document.body.children.length, 0, 'disabling removes the follow overlay')
+  unsubscribe()
+  env.dispose()
+})
+
+test('summon bar sends the /butler slash form and names the existing destination', async () => {
+  const notifications = []
+  const submitted = []
+  const host = defaultHost({
+    request: async method => method === 'session.list'
+      ? [{ id: 's1', title: 'Butler', created_at: 1 }]
+      : [],
+    notify(notification) { notifications.push(notification) },
+    composer: { submit: (id, text) => { submitted.push({ id, text }); return true } }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const outcome = await env.api.summonFromBar('make a guide')
+
+  assert.equal(outcome.result.ok, true)
+  assert.deepEqual(submitted, [{ id: 's1', text: '/butler make a guide' }])
+  assert.ok(notifications.some(notification => notification.kind === 'success'
+    && notification.message === 'Summoned → Butler chat (existing)'))
+})
+
+test('new destination always creates a fresh Butler session, never the oldest', async () => {
+  const clock = makeClock()
+  const requested = []
+  const opened = []
+  const submitted = []
+  const notifications = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      requested.push(method)
+      if (method === 'session.list') return [{ id: 'oldest', title: 'Butler', created_at: 1 }]
+      if (method === 'session.create') return { session_id: 'runtime-new', stored_session_id: 'stored-new' }
+      if (method === 'session.title') return {}
+      throw new Error(`unexpected request ${method}: ${JSON.stringify(params)}`)
+    },
+    openSession: async id => { opened.push(id); return true },
+    notify(notification) { notifications.push(notification) },
+    composer: {
+      submit: (id, text) => { submitted.push({ id, text }); return id === 'stored-new' },
+      setDraft: async () => false
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const outcome = await env.api.summonFromBar('fresh start', {
+    destination: 'new',
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(outcome.result.ok, true)
+  assert.equal(outcome.result.destination, 'new')
+  assert.ok(requested.includes('session.create'))
+  assert.ok(!requested.includes('session.activate'), 'never falls back to focusing the oldest')
+  assert.deepEqual(opened, ['stored-new'])
+  assert.deepEqual(submitted, [{ id: 'stored-new', text: '/butler fresh start' }])
+  assert.ok(notifications.some(notification => notification.kind === 'success'
+    && notification.message === 'Summoned → fresh Butler session'))
+})
+
+test('destination choice persists across plugin loads in localStorage', async () => {
+  const storage = makeStorage()
+  const first = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument(), storage
+  })
+  assert.equal(first.api.readSummonDestination(), 'existing')
+  assert.equal(first.api.butlerCommandText('fix it'), '/butler fix it')
+  assert.equal(first.api.butlerCommandText('/butler already'), '/butler already')
+
+  first.api.setSummonDestination('new')
+  assert.equal(storage.values.get('butler.summon.destination'), 'new')
+  first.dispose()
+
+  const second = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument(), storage
+  })
+  assert.equal(second.api.getSummonDestination(), 'new')
+  assert.equal(second.api.readSummonDestination(), 'new')
+  second.api.setSummonDestination('existing')
+  assert.equal(storage.values.get('butler.summon.destination'), 'existing')
+  second.dispose()
+})
+
+test('pet visibility hint surfaces once per enable and clears when a canvas appears', async () => {
+  let canvas = null
+  const document = makeDocument({ canvas: () => canvas })
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async () => ({ summon: { pet_click_claim: true } }),
+    document
+  })
+  const seen = []
+  const unsubscribe = env.api.subscribePetVisibilityHint(value => seen.push(value))
+
+  // A zero-timeout scan makes the 10 s rule observable without a slow test.
+  // Toggle off first so the config sync's normal 10 s scan cannot win the arm.
+  env.api.setPetClickClaim(false)
+  env.api.setPetClickClaim(true, { timeoutMs: 0 })
+  await new Promise(resolve => setTimeout(resolve, 20))
+
+  assert.equal(env.api.petVisibilityHint(), env.api.PET_HINT_TEXT)
+  assert.match(env.api.PET_HINT_TEXT, /No in-window pet found/)
+  assert.match(env.api.PET_HINT_TEXT, /Cmd\+Shift\+A/)
+  assert.equal(seen.filter(value => value === env.api.PET_HINT_TEXT).length, 1)
+
+  // Once per enable: another scan while the hint stands does not republish it.
+  env.api.armPetVisibilityHint({ timeoutMs: 0 })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(seen.filter(value => value === env.api.PET_HINT_TEXT).length, 1)
+
+  // The first in-window canvas clears the hint immediately.
+  canvas = { getBoundingClientRect: () => ({ left: 1, top: 1, width: 10, height: 10, right: 11, bottom: 11 }) }
+  env.api.notePetCanvasFound()
+  assert.equal(env.api.petVisibilityHint(), null)
+  assert.equal(seen.at(-1), null)
+
+  // ...and a later scan in the same enable must not bring it back.
+  env.api.armPetVisibilityHint({ timeoutMs: 0 })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(env.api.petVisibilityHint(), null)
+
+  env.api.setPetClickClaim(false)
+  assert.equal(env.api.petVisibilityHint(), null)
   unsubscribe()
   env.dispose()
 })

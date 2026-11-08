@@ -47,6 +47,12 @@ const CONFIG_REFRESH_MS = 5000
 // Documented legacy locator for the petdex pet (the core pet canvas). Read-only:
 // we never paint into it and never edit Hermes core to add a hook.
 const PET_CANVAS_SELECTOR = 'canvas[aria-label$=" pet"]'
+const PET_SCAN_TIMEOUT_MS = 10000
+const PET_HINT_TEXT = 'No in-window pet found — click the pet inside the Hermes window, '
+  + 'or use Cmd+Shift+A (a popped-out pet cannot be reached).'
+const SUMMON_DESTINATION_KEY = 'butler.summon.destination'
+const SUMMON_EXISTING = 'existing'
+const SUMMON_NEW = 'new'
 
 let rest = null
 let petCtx = null
@@ -70,6 +76,15 @@ const summonListeners = new Set()
 let petClickClaim = false
 let petClickWatcher = null
 let petClickConfigWrites = 0
+// Destination picker state; localStorage is the cross-opening source of truth.
+let summonDestination = null
+// One honest pet-visibility hint per enable. It lives on the Butler pane, not
+// the summon bar, and clears as soon as the watcher sees a canvas.
+const petHintListeners = new Set()
+let petHintTimer = null
+let petHintArmed = false
+let petHintAnnounced = false
+let petHintText = null
 
 function h(type, props, ...children) {
   let key = undefined
@@ -422,12 +437,13 @@ function notifySummonFailure(message) {
   }
 }
 
-function notifySummonSuccess() {
+function notifySummonSuccess(destination) {
+  const fresh = destination === SUMMON_NEW
   try {
     host && host.notify && host.notify({
       kind: 'success',
       title: 'Butler',
-      message: 'Summoned → Butler chat'
+      message: fresh ? 'Summoned → fresh Butler session' : 'Summoned → Butler chat (existing)'
     })
   } catch (err) {
     // A missing toast surface must not break the send.
@@ -466,6 +482,129 @@ async function openButlerSession() {
 
 function wait(ms) {
   return new Promise(resolve => window.setTimeout(resolve, ms))
+}
+
+// ------------------------------------------------------- summon destination
+
+function localStore() {
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage
+  } catch (err) {
+    return null
+  }
+}
+
+function readSummonDestination() {
+  try {
+    const store = localStore()
+    return store && store.getItem(SUMMON_DESTINATION_KEY) === SUMMON_NEW
+      ? SUMMON_NEW : SUMMON_EXISTING
+  } catch (err) {
+    return SUMMON_EXISTING
+  }
+}
+
+function getSummonDestination() {
+  if (summonDestination === null) summonDestination = readSummonDestination()
+  return summonDestination
+}
+
+function setSummonDestination(value) {
+  summonDestination = value === SUMMON_NEW ? SUMMON_NEW : SUMMON_EXISTING
+  try {
+    const store = localStore()
+    if (store) store.setItem(SUMMON_DESTINATION_KEY, summonDestination)
+  } catch (err) {
+    // A storage-denied renderer still keeps the choice for this session.
+  }
+  return summonDestination
+}
+
+/** The bar always sends the slash form; plain chat still sends plain turns. */
+function butlerCommandText(value) {
+  const text = asText(value) || ''
+  return /^\s*\//.test(text) ? text : `/butler ${text}`
+}
+
+// ------------------------------------------------------- pet visibility hint
+
+function petHintListenersPublish() {
+  for (const listener of [...petHintListeners]) {
+    try {
+      listener(petHintText)
+    } catch (err) {
+      // A broken pane listener must not break the watcher.
+    }
+  }
+}
+
+function subscribePetVisibilityHint(listener) {
+  petHintListeners.add(listener)
+  try {
+    listener(petHintText)
+  } catch (err) {
+    // A broken listener must not break the subscription.
+  }
+  return () => { petHintListeners.delete(listener) }
+}
+
+function petVisibilityHint() {
+  return petHintText
+}
+
+function clearPetHintTimer() {
+  if (petHintTimer !== null) {
+    try { window.clearTimeout(petHintTimer) } catch (err) { }
+  }
+  petHintTimer = null
+}
+
+function publishPetHint(text) {
+  const next = asText(text)
+  if (next === petHintText) return
+  petHintText = next
+  petHintListenersPublish()
+}
+
+/** Clear the hint (and any pending scan) the moment a canvas is found. */
+function notePetCanvasFound() {
+  clearPetHintTimer()
+  petHintArmed = false
+  if (petHintText !== null) publishPetHint(null)
+}
+
+/**
+ * Start one 10 s visibility scan for the current enable. Re-arming is a no-op
+ * while a scan or the surfaced hint is live, so the pane sees it once.
+ */
+function armPetVisibilityHint(options = {}) {
+  if (!petClickClaim || petHintAnnounced) return false
+  if (petHintTimer !== null || petHintArmed) return false
+  if (petCanvasNode()) {
+    notePetCanvasFound()
+    return false
+  }
+  const timeoutMs = timingOption(options.timeoutMs, PET_SCAN_TIMEOUT_MS)
+  petHintArmed = true
+  clearPetHintTimer()
+  petHintTimer = window.setTimeout(() => {
+    petHintTimer = null
+    if (!petClickClaim || petHintAnnounced) return
+    if (petCanvasNode()) {
+      notePetCanvasFound()
+      return
+    }
+    petHintAnnounced = true
+    publishPetHint(PET_HINT_TEXT)
+  }, timeoutMs)
+  return true
+}
+
+function stopPetVisibilityHint() {
+  clearPetHintTimer()
+  petHintArmed = false
+  petHintAnnounced = false
+  if (petHintText !== null) publishPetHint(null)
 }
 
 function petCanvasNode() {
@@ -562,8 +701,11 @@ function startPetClickWatcher() {
   const follow = () => {
     if (disposed) return
     const canvas = petCanvasNode()
-    // No canvas (no pet installed, or a Hermes update moved it): degrade
-    // silently. The watcher keeps looking so a later pet is picked up.
+    // Honest visibility: a canvas clears the hint immediately; no canvas for
+    // the scan window surfaces it once, in the pane, on the next tick. The
+    // watcher keeps looking so a later in-window pet is picked up.
+    if (canvas) notePetCanvasFound()
+    else armPetVisibilityHint()
     if (!canvas || !overlay) {
       if (overlay) overlay.style.opacity = '0'
       frame = window.requestAnimationFrame(follow)
@@ -637,10 +779,22 @@ function stopPetClickWatcher() {
   if (petClickWatcher) petClickWatcher.dispose()
 }
 
-function setPetClickClaim(enabled) {
-  petClickClaim = Boolean(enabled)
-  if (petClickClaim) startPetClickWatcher()
-  else stopPetClickWatcher()
+function setPetClickClaim(enabled, options = {}) {
+  const next = Boolean(enabled)
+  if (!next) {
+    petClickClaim = false
+    stopPetClickWatcher()
+    stopPetVisibilityHint()
+    return
+  }
+  if (!petClickClaim) {
+    // A fresh enable starts a fresh visibility scan; the previous enable's
+    // surfaced hint never carries over.
+    stopPetVisibilityHint()
+  }
+  petClickClaim = true
+  armPetVisibilityHint(options)
+  startPetClickWatcher()
 }
 
 async function syncPetClickClaim() {
@@ -818,14 +972,33 @@ function summonFailureMessage(result) {
   return message
 }
 
-/** Resolve the one Butler chat, send the request, then own the leaving visual. */
+async function openFreshButlerSession() {
+  if (launcherBusy) return false
+  launcherBusy = true
+  launcherTargetId = null
+  launcherTargetAliases = []
+  try {
+    // New means new: never fall back to the oldest matching session.
+    return await createButlerSession()
+  } finally {
+    launcherBusy = false
+  }
+}
+
+/** Resolve the chosen Butler chat, send the slash request, then own the visual. */
 async function summonButler(text, options = {}) {
   const message = asText(text)
-  if (!message) return { ok: false, reason: 'empty' }
-  if (!await openButlerSession()) return { ok: false, reason: 'no_session' }
+  if (!message) return { ok: false, reason: 'empty', destination: SUMMON_EXISTING }
+  const destination = options.destination === SUMMON_NEW
+    || (options.destination === undefined && getSummonDestination() === SUMMON_NEW)
+    ? SUMMON_NEW : SUMMON_EXISTING
+  const opened = destination === SUMMON_NEW
+    ? await openFreshButlerSession()
+    : await openButlerSession()
+  if (!opened) return { ok: false, reason: 'no_session', destination }
   const target = launcherTargetId
-  const result = await sendSummonText(target, message, options)
-  return { ...result, session: result.session || target }
+  const result = await sendSummonText(target, butlerCommandText(message), options)
+  return { ...result, session: result.session || target, destination }
 }
 
 /**
@@ -837,10 +1010,10 @@ async function summonFromBar(value, options = {}) {
   try {
     result = await summonButler(value, options)
   } catch (err) {
-    result = { ok: false, reason: 'threw', error: err, seated: false }
+    result = { ok: false, reason: 'threw', error: err, seated: false, destination: getSummonDestination() }
   }
   if (result.ok) {
-    notifySummonSuccess()
+    notifySummonSuccess(result.destination)
     await spawnSummonDouble()
     return { result, clearText: true, dismiss: true }
   }
@@ -882,6 +1055,7 @@ function SummonBar() {
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [position, setPosition] = useState(null)
+  const [destination, setDestination] = useState(() => getSummonDestination())
   const inputRef = useRef(null)
   const barRef = useRef(null)
   const busyRef = useRef(false)
@@ -895,6 +1069,9 @@ function SummonBar() {
   useEffect(() => {
     if (!open) return undefined
     setText('')
+    // Re-read the persisted choice on every opening. Focus stays on the text
+    // input; the destination buttons are Tab-reachable after it.
+    setDestination(getSummonDestination())
     const id = window.setTimeout(() => {
       try { inputRef.current && inputRef.current.focus() } catch (err) { }
     }, 0)
@@ -944,12 +1121,33 @@ function SummonBar() {
     dismissSummonBar()
   }
 
+  const chooseDestination = next => {
+    const value = setSummonDestination(next)
+    setDestination(value)
+  }
+
+  // Blur inside the bar (including Tab onto the destination buttons) keeps it
+  // open; only leaving the bar dismisses it. The zero-delay re-check gives a
+  // click on a picker button a chance to take focus first.
+  const onBarBlur = event => {
+    if (busyRef.current) return
+    const next = event && event.relatedTarget
+    const bar = barRef.current
+    if (next && bar && typeof bar.contains === 'function' && bar.contains(next)) return
+    window.setTimeout(() => {
+      if (busyRef.current) return
+      const active = typeof document === 'undefined' ? null : document.activeElement
+      if (active && bar && typeof bar.contains === 'function' && bar.contains(active)) return
+      dismissSummonBar()
+    }, 0)
+  }
+
   const submit = async () => {
     if (busyRef.current) return
     const value = text.trim()
     if (!value) return
     setBusy(true)
-    const outcome = await summonFromBar(value)
+    const outcome = await summonFromBar(value, { destination })
     setBusy(false)
     // Failure keeps the typed text in the bar so the user can retry; only a
     // real send clears and dismisses it. The toast names the exact reason.
@@ -960,10 +1158,31 @@ function SummonBar() {
   if (!open) return null
 
   const placement = position || { left: undefined, top: 16 }
+  const destinationButton = (value, label) => h('button', {
+    type: 'button',
+    disabled: busy,
+    'aria-pressed': destination === value,
+    onClick: () => chooseDestination(value),
+    style: {
+      cursor: busy ? 'default' : 'pointer', fontSize: 11, lineHeight: 1.3,
+      color: destination === value ? '#eceef1' : '#9aa3ad',
+      background: destination === value ? 'rgba(122,134,255,.26)' : 'transparent',
+      border: 'none', borderRadius: 6, padding: '4px 9px',
+      outline: 'none'
+    }
+  }, label)
+
   return h('div', {
     ref: barRef,
     role: 'dialog',
     'aria-label': 'Ask the butler',
+    onBlur: onBarBlur,
+    onKeyDown: event => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        if (!busyRef.current) dismissSummonBar()
+      }
+    },
     style: {
       position: 'fixed', left: placement.left === undefined ? undefined : placement.left,
       top: placement.top, right: placement.left === undefined ? 16 : undefined,
@@ -1000,16 +1219,28 @@ function SummonBar() {
           submit()
         }
       },
-      onBlur: () => {
-        if (!busyRef.current) dismissSummonBar()
-      },
       style: {
         width: '100%', boxSizing: 'border-box', fontSize: 13,
         color: '#eceef1', background: 'rgba(255,255,255,.06)',
         border: '1px solid rgba(255,255,255,.12)', borderRadius: 8,
         padding: '8px 10px', outline: 'none'
       }
-    })
+    }),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+      h('span', { style: { fontSize: 10.5, color: '#8a8f98' } }, 'Send to'),
+      h('div', {
+        role: 'group',
+        'aria-label': 'Summon destination',
+        style: {
+          display: 'inline-flex', padding: 2, borderRadius: 8, gap: 2,
+          background: 'rgba(255,255,255,.05)',
+          border: '1px solid rgba(255,255,255,.09)'
+        }
+      },
+        destinationButton(SUMMON_EXISTING, 'Butler chat'),
+        destinationButton(SUMMON_NEW, 'New session')
+      )
+    )
   )
 }
 
@@ -1121,6 +1352,10 @@ function ButlerApp() {
     refetchOnMount: 'always'
   }) || {}
 
+  // Pet-click honesty lives on the pane header, not the summon bar.
+  const [visibilityHint, setVisibilityHint] = useState(() => petVisibilityHint())
+  useEffect(() => subscribePetVisibilityHint(setVisibilityHint), [])
+
   const rawGuide = data && data.guide
   const guide = rawGuide && typeof rawGuide === 'object' && Object.keys(rawGuide).length > 0 ? rawGuide : null
   const state = guide && guide.state && typeof guide.state === 'object' ? guide.state : {}
@@ -1214,6 +1449,16 @@ function ButlerApp() {
           onClick: () => { if (typeof refetch === 'function') refetch() }
         }, 'Refresh'))
     ),
+
+    visibilityHint && h('div', {
+      role: 'status',
+      'aria-live': 'polite',
+      style: {
+        fontSize: 12, lineHeight: 1.4, color: '#f5c26b',
+        border: '1px solid rgba(245,194,107,.35)', borderRadius: 10, padding: '8px 12px',
+        background: 'rgba(245,194,107,.06)'
+      }
+    }, visibilityHint),
 
     h(ButlerPetClickToggle, {}),
 
@@ -1345,6 +1590,8 @@ export default {
       ctx.onDispose(() => {
         stopPetClickWatcher()
         petClickClaim = false
+        stopPetVisibilityHint()
+        petHintListeners.clear()
         summonOpen = false
         summonListeners.clear()
       })
