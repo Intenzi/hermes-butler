@@ -16,7 +16,8 @@ import { fileURLToPath } from 'node:url'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PLUGIN_JS = path.join(HERE, '..', 'desktop', 'plugin.js')
 const INTERNALS = [
-  'summonButler', 'sendSummonText', 'writePetClickClaim', 'setPetClickClaim',
+  'summonButler', 'sendSummonText', 'summonFromBar', 'summonFailureMessage',
+  'writePetClickClaim', 'setPetClickClaim',
   'startPetClickWatcher', 'stopPetClickWatcher', 'openSummonBar',
   'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar', 'petCanvasNode'
 ]
@@ -174,6 +175,25 @@ function defaultHost(overrides = {}) {
   }
 }
 
+// Deterministic clock for the retry ladder: `wait(ms)` advances time instead of
+// actually sleeping, so the default 300 ms grace / 150 ms retry / 6 s budget
+// are exercised without a multi-second test.
+function makeClock(start = 0) {
+  let value = start
+  const waits = []
+  return {
+    now: () => value,
+    wait: async ms => {
+      waits.push(ms)
+      value += Math.max(0, ms)
+    },
+    advance(ms) {
+      value += ms
+    },
+    waits
+  }
+}
+
 test('registers the "Ask the butler" global shortcut', async () => {
   const env = await loadPlugin({ host: defaultHost(), rest: async () => ({}), document: makeDocument() })
   const keybind = env.contributions.find(item => item.area === 'keybinds')
@@ -202,7 +222,7 @@ test('pane header toggle writes the hot-reload config knob', async () => {
   env.api.setPetClickClaim(false)
 })
 
-test('summon reuses an existing Butler session and sends immediately', async () => {
+test('summon reuses an existing Butler session and sends after the mount grace', async () => {
   const opened = []
   const submitted = []
   const host = defaultHost({
@@ -274,6 +294,218 @@ test('petless summon still sends and skips the companion double', async () => {
   assert.equal((await env.api.summonButler('petless request')).ok, true)
   assert.equal(await env.api.spawnSummonDouble(), false)
   assert.deepEqual(posts, ['/summon/pet'])
+})
+
+test('summon ladder waits 300 ms, retries at 150 ms, and ends on the second success', async () => {
+  const clock = makeClock()
+  const submittedAt = []
+  const host = defaultHost({
+    request: async method => method === 'session.list'
+      ? [{ id: 's1', title: 'Butler', created_at: 1 }]
+      : [],
+    composer: {
+      submit() {
+        submittedAt.push(clock.now())
+        return submittedAt.length === 2
+      },
+      setDraft: async () => false
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const result = await env.api.sendSummonText('s1', 'second time lucky', {
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.attempts, 2)
+  assert.equal(submittedAt.length, 2, 'a successful second attempt ends the loop')
+  assert.ok(submittedAt[0] >= 300, `first submit at ${submittedAt[0]} ms is not before the grace`)
+  assert.equal(submittedAt[0], 300)
+  assert.equal(submittedAt[1], 450)
+})
+
+test('summon ladder keeps retrying until the 6 s budget is spent', async () => {
+  const clock = makeClock()
+  const submittedAt = []
+  const host = defaultHost({
+    request: async method => method === 'session.list'
+      ? [{ id: 's1', title: 'Butler', created_at: 1 }]
+      : [],
+    composer: {
+      submit() {
+        submittedAt.push(clock.now())
+        return false
+      },
+      setDraft: async () => false
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const result = await env.api.sendSummonText('s1', 'never lands', {
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'no_visible_composer')
+  assert.equal(result.seated, false)
+  assert.equal(submittedAt[0], 300)
+  assert.ok(submittedAt.at(-1) >= 5700, `last submit at ${submittedAt.at(-1)} ms kept retrying`)
+  assert.ok(submittedAt.at(-1) < 6000, 'the ladder stops at the 6 s budget')
+  assert.ok(submittedAt.length >= 30, `retried ${submittedAt.length} times`)
+  assert.ok(clock.now() >= 6000, 'the whole budget was spent')
+})
+
+test('summon re-derives a stale stored id from the live session list', async () => {
+  const clock = makeClock()
+  const listCalls = []
+  const submitted = []
+  const host = defaultHost({
+    request: async method => {
+      if (method === 'session.list') {
+        listCalls.push(clock.now())
+        return [{ id: 'runtime-9', stored_session_id: 'stored-1', title: 'Butler', created_at: 1 }]
+      }
+      return []
+    },
+    composer: {
+      submit(id, text) {
+        submitted.push({ id, text })
+        return id === 'runtime-9'
+      },
+      setDraft: async () => false
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const result = await env.api.sendSummonText('stored-1', 'stale address', {
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.session, 'runtime-9')
+  assert.ok(listCalls.length >= 1, 'session.list was re-read between attempts')
+  assert.deepEqual(submitted.map(call => call.id), ['stored-1', 'stored-1', 'runtime-9'])
+})
+
+test('summon honors a runtime id returned by openSession', async () => {
+  const clock = makeClock()
+  const submitted = []
+  const host = defaultHost({
+    request: async method => method === 'session.list'
+      ? [{ id: 'stored-1', title: 'Butler', created_at: 1 }]
+      : [],
+    openSession: async () => ({ resolved_id: 'runtime-7' }),
+    composer: {
+      submit(id) {
+        submitted.push(id)
+        return id === 'runtime-7'
+      },
+      setDraft: async () => false
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const result = await env.api.summonButler('open result address', {
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.session, 'runtime-7')
+  assert.deepEqual(submitted, ['stored-1', 'runtime-7'])
+})
+
+test('bar failure keeps the text and toasts the exact reason plus an unseated draft', async () => {
+  const clock = makeClock()
+  const notifications = []
+  const draftCalls = []
+  const host = defaultHost({
+    request: async method => method === 'session.list'
+      ? [{ id: 's1', title: 'Butler', created_at: 1 }]
+      : [],
+    notify(notification) { notifications.push(notification) },
+    composer: {
+      submit: () => false,
+      setDraft: async (id, text) => {
+        draftCalls.push({ id, text })
+        return false
+      }
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const outcome = await env.api.summonFromBar('fix my wifi', {
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(outcome.result.ok, false)
+  assert.equal(outcome.result.reason, 'no_visible_composer')
+  assert.equal(outcome.clearText, false, 'the typed text stays in the bar')
+  assert.equal(outcome.dismiss, false, 'the bar stays open for a retry')
+  assert.deepEqual(draftCalls, [{ id: 's1', text: 'fix my wifi' }])
+  const toast = notifications.find(notification => notification.kind === 'error')
+  assert.ok(toast, 'a failure toast was shown')
+  assert.match(toast.message, /^Could not summon: no visible composer \(no_visible_composer\)/)
+  assert.match(toast.message, /Draft seat: not seated\./)
+})
+
+test('bar failure reports a seated draft without claiming the send succeeded', async () => {
+  const clock = makeClock()
+  const notifications = []
+  const host = defaultHost({
+    request: async method => method === 'session.list'
+      ? [{ id: 's1', title: 'Butler', created_at: 1 }]
+      : [],
+    notify(notification) { notifications.push(notification) },
+    composer: {
+      submit: () => false,
+      setDraft: async () => true
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const outcome = await env.api.summonFromBar('seat this instead', {
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(outcome.result.ok, false)
+  assert.equal(outcome.result.seated, true)
+  assert.equal(outcome.result.reason, 'no_visible_composer')
+  assert.equal(outcome.clearText, false)
+  const toast = notifications.find(notification => notification.kind === 'error')
+  assert.ok(toast)
+  assert.match(toast.message, /Draft seat: seated\./)
+  assert.doesNotMatch(toast.message, /Draft seat: not seated\./)
+})
+
+test('bar success clears and dismisses with a Summoned toast', async () => {
+  const clock = makeClock()
+  const notifications = []
+  const host = defaultHost({
+    request: async method => method === 'session.list'
+      ? [{ id: 's1', title: 'Butler', created_at: 1 }]
+      : [],
+    notify(notification) { notifications.push(notification) },
+    composer: { submit: () => true, setDraft: async () => false }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const outcome = await env.api.summonFromBar('make a guide', {
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(outcome.result.ok, true)
+  assert.equal(outcome.clearText, true)
+  assert.equal(outcome.dismiss, true)
+  assert.ok(notifications.some(notification => notification.kind === 'success'
+    && notification.message === 'Summoned → Butler chat'))
 })
 
 test('reach-in listener degrades silently when no pet canvas exists', async () => {

@@ -34,8 +34,15 @@ const REFRESH_MS = 1500
 const HISTORY_PAGE = 8
 const BUTLER_TITLE = 'Butler'
 const SUMMON_PLACEHOLDER = 'Ask the butler for a guide…'
-const SUMMON_SEND_TIMEOUT_MS = 1500
-const SUMMON_SEND_RETRY_MS = 60
+// The in-place open re-renders the primary and the Butler composer mounts a
+// few frames later; a zero-delay first submit loses that mount race outright.
+// Give it a real grace, then keep re-deriving the live address for six seconds.
+const SUMMON_SEND_GRACE_MS = 300
+const SUMMON_SEND_RETRY_MS = 150
+const SUMMON_SEND_TIMEOUT_MS = 6000
+// A full session.list per 150 ms retry would hammer the gateway. Re-derive
+// between attempts, but at most this often.
+const SUMMON_LIVE_REFRESH_MS = 600
 const CONFIG_REFRESH_MS = 5000
 // Documented legacy locator for the petdex pet (the core pet canvas). Read-only:
 // we never paint into it and never edit Hermes core to add a hook.
@@ -46,6 +53,10 @@ let petCtx = null
 let lastSaid = null
 let launcherBusy = false
 let launcherTargetId = null
+// Runtime/stored aliases learned from session.list or an open-session result.
+// The submit address is the stored id, but a live surface may answer only for
+// the runtime id it was resumed under.
+let launcherTargetAliases = []
 // smoke-test counters so the page can PROVE the plugin side spoke (or not):
 // petSayTicks increments on every say attempt, petLastTick stores wall-clock.
 let petSayTicks = 0
@@ -261,14 +272,63 @@ function sessionTargetId(row) {
     || row.id || row.session_id))
 }
 
+/** Every id a live session row might answer to (stored and runtime). */
+function rowTargetIds(row) {
+  return uniqueIds(
+    row && row.resolved_id,
+    row && row.session_id,
+    row && row.stored_session_id,
+    row && row.id
+  )
+}
+
+/** Ids handed back by a host.openSession implementation, if it returns one. */
+function openResultIds(result) {
+  if (!result || result === true) return []
+  if (typeof result === 'string') return uniqueIds(result)
+  if (typeof result !== 'object') return []
+  return uniqueIds(
+    result.resolved_id,
+    result.resolvedId,
+    result.session_id,
+    result.sessionId,
+    result.stored_session_id,
+    result.storedSessionId,
+    result.runtime_id,
+    result.runtimeId,
+    result.id
+  )
+}
+
+function uniqueIds(...values) {
+  const ids = []
+  const add = value => {
+    if (Array.isArray(value)) {
+      for (const entry of value) add(entry)
+      return
+    }
+    const id = asText(value)
+    if (id && !ids.includes(id)) ids.push(id)
+  }
+  for (const value of values) add(value)
+  return ids
+}
+
+function addTargetIds(list, values) {
+  for (const id of uniqueIds(values)) {
+    if (!list.includes(id)) list.push(id)
+  }
+}
+
 async function focusSession(row) {
   if (!row) return false
   const storedId = sessionTargetId(row)
   if (!storedId) return false
   if (host && typeof host.openSession === 'function') {
     try {
-      await host.openSession(storedId, { intent: 'in-place' })
+      const opened = await host.openSession(storedId, { intent: 'in-place' })
       launcherTargetId = storedId
+      launcherTargetAliases = uniqueIds(launcherTargetAliases, rowTargetIds(row), openResultIds(opened))
       return true
     } catch (err) {
       // Older desktop builds may only expose the gateway RPC.
@@ -276,10 +336,11 @@ async function focusSession(row) {
   }
   if (!host || typeof host.request !== 'function') return false
   try {
-    await host.request('session.activate', {
+    const activated = await host.request('session.activate', {
       session_id: asText(row.session_id) || asText(row.id) || storedId
     })
     launcherTargetId = storedId
+    launcherTargetAliases = uniqueIds(launcherTargetAliases, rowTargetIds(row), openResultIds(activated))
     return true
   } catch (err) {
     return false
@@ -302,8 +363,15 @@ async function createButlerSession() {
   const target = storedId || runtimeId
   if (target && host && typeof host.openSession === 'function') {
     try {
-      await host.openSession(target, { intent: 'in-place' })
+      const opened = await host.openSession(target, { intent: 'in-place' })
       launcherTargetId = target
+      launcherTargetAliases = uniqueIds(
+        launcherTargetAliases,
+        target,
+        runtimeId,
+        openResultIds(created),
+        openResultIds(opened)
+      )
       return true
     } catch (err) {
       // Fall through to activating the runtime session.
@@ -311,14 +379,22 @@ async function createButlerSession() {
   }
   if (runtimeId) {
     try {
-      await host.request('session.activate', { session_id: runtimeId })
+      const activated = await host.request('session.activate', { session_id: runtimeId })
       launcherTargetId = target
+      launcherTargetAliases = uniqueIds(
+        launcherTargetAliases,
+        target,
+        runtimeId,
+        openResultIds(created),
+        openResultIds(activated)
+      )
       return true
     } catch (err) {
       return false
     }
   }
   launcherTargetId = target
+  launcherTargetAliases = uniqueIds(launcherTargetAliases, target, runtimeId)
   return Boolean(target)
 }
 
@@ -346,11 +422,24 @@ function notifySummonFailure(message) {
   }
 }
 
+function notifySummonSuccess() {
+  try {
+    host && host.notify && host.notify({
+      kind: 'success',
+      title: 'Butler',
+      message: 'Summoned → Butler chat'
+    })
+  } catch (err) {
+    // A missing toast surface must not break the send.
+  }
+}
+
 /** Create the one "Butler" chat, or focus the oldest matching one. */
 async function openButlerSession() {
   if (launcherBusy) return false
   launcherBusy = true
   launcherTargetId = null
+  launcherTargetAliases = []
   try {
     const existing = oldestSession(await listButlerSessions())
     if (existing && await focusSession(existing)) return true
@@ -569,35 +658,123 @@ async function syncPetClickClaim() {
  * `host.composer.submit(sessionId, text)` is a real programmatic send (as if
  * the user typed + pressed Enter), not a draft seat. The exact session's
  * composer must be mounted, so right after a focus/create we give the app a
- * short settle window before seating a draft as the honest fallback.
+ * real mount grace, then retry for six seconds while re-deriving the address
+ * from the live session list. If no mounted surface ever claims the send, the
+ * text is seated as a draft and the caller gets the exact failure reason.
  */
-async function sendSummonText(target, text) {
+async function refreshSummonTarget(fallback) {
+  const row = oldestSession(await listButlerSessions())
+  if (!row) return null
+  const ids = rowTargetIds(row)
+  const target = sessionTargetId(row) || asText(fallback) || ids[0]
+  if (!target && !ids.length) return null
+  return { target, ids }
+}
+
+function timingOption(value, fallback) {
+  const number = Number(value)
+  return Number.isFinite(number) && number >= 0 ? number : fallback
+}
+
+async function sendSummonText(target, text, options = {}) {
   const targetId = asText(target)
-  if (!targetId) return { ok: false, reason: 'no_session' }
-  if (!host || !host.composer) return { ok: false, reason: 'no_composer' }
-  const deadline = Date.now() + SUMMON_SEND_TIMEOUT_MS
+  if (!targetId) {
+    return { ok: false, reason: 'no_session', seated: false, error: null, session: null, attempts: 0 }
+  }
+  if (!host || !host.composer) {
+    return { ok: false, reason: 'no_composer', seated: false, error: null, session: targetId, attempts: 0 }
+  }
+
+  const now = typeof options.now === 'function' ? options.now : () => Date.now()
+  const delay = typeof options.wait === 'function' ? options.wait : wait
+  const graceMs = timingOption(options.graceMs, SUMMON_SEND_GRACE_MS)
+  const retryMs = timingOption(options.retryMs, SUMMON_SEND_RETRY_MS)
+  const timeoutMs = timingOption(options.timeoutMs, SUMMON_SEND_TIMEOUT_MS)
+  const refreshMs = timingOption(options.refreshMs, SUMMON_LIVE_REFRESH_MS)
+  const canSubmit = typeof host.composer.submit === 'function'
+  const canDraft = typeof host.composer.setDraft === 'function'
+  const candidates = uniqueIds(
+    targetId,
+    targetId === launcherTargetId ? launcherTargetAliases : []
+  )
+  let currentTarget = targetId
+  let nextRefreshAt = now()
   let lastError = null
-  while (Date.now() < deadline) {
-    try {
-      if (typeof host.composer.submit === 'function' && host.composer.submit(targetId, text)) {
-        return { ok: true, send: 'composer.submit' }
+  let attempts = 0
+  const startedAt = now()
+  const firstAttemptAt = startedAt + graceMs
+  const deadline = startedAt + timeoutMs
+
+  while (canSubmit) {
+    const current = now()
+    if (current < firstAttemptAt) {
+      if (firstAttemptAt >= deadline) break
+      await delay(firstAttemptAt - current)
+      continue
+    }
+    if (current >= deadline) break
+
+    attempts += 1
+    for (const id of [...candidates]) {
+      try {
+        if (host.composer.submit(id, text)) {
+          if (targetId === launcherTargetId) launcherTargetId = id
+          return { ok: true, send: 'composer.submit', session: id, attempts }
+        }
+      } catch (err) {
+        lastError = err
       }
-    } catch (err) {
-      lastError = err
     }
-    await wait(SUMMON_SEND_RETRY_MS)
-  }
-  // No submit verb on this desktop build (older host): seat the text as a
-  // draft and report the gap instead of pretending it was sent.
-  if (typeof host.composer.setDraft === 'function') {
-    try {
-      const seated = await host.composer.setDraft(targetId, text)
-      return { ok: false, seated: Boolean(seated), reason: 'no_programmatic_send', error: lastError }
-    } catch (err) {
-      return { ok: false, reason: 'draft_failed', error: err }
+
+    if (now() >= deadline) break
+
+    // A stored id can be stale while the mounted surface answers for the
+    // runtime id it resumed under. Re-read the live row between attempts.
+    if (now() >= nextRefreshAt) {
+      const live = await refreshSummonTarget(currentTarget)
+      if (live) {
+        addTargetIds(candidates, live.ids)
+        addTargetIds(candidates, live.target)
+        currentTarget = live.target || currentTarget
+        if (targetId === launcherTargetId) launcherTargetId = currentTarget
+      }
+      nextRefreshAt = now() + refreshMs
     }
+
+    const nextAttemptAt = Math.min(deadline, now() + retryMs)
+    if (nextAttemptAt <= now()) break
+    await delay(nextAttemptAt - now())
   }
-  return { ok: false, reason: 'no_visible_composer', error: lastError }
+
+  // No submit verb (older host) or no mounted surface ever claimed it. Seat
+  // the text as the honest fallback and say exactly why the send failed.
+  let reason = canSubmit ? 'no_visible_composer' : 'no_programmatic_send'
+  let seated = false
+  if (canDraft) {
+    let draftThrew = false
+    for (const id of candidates) {
+      try {
+        if (await host.composer.setDraft(id, text)) {
+          seated = true
+          currentTarget = id
+          if (targetId === launcherTargetId) launcherTargetId = id
+          break
+        }
+      } catch (err) {
+        draftThrew = true
+        lastError = err
+      }
+    }
+    if (draftThrew && !seated) reason = 'draft_failed'
+  }
+  return {
+    ok: false,
+    seated,
+    reason,
+    error: lastError,
+    session: currentTarget,
+    attempts
+  }
 }
 
 async function spawnSummonDouble() {
@@ -611,14 +788,64 @@ async function spawnSummonDouble() {
   }
 }
 
+const SUMMON_REASON_LABELS = {
+  no_session: 'no session',
+  no_composer: 'no composer',
+  no_visible_composer: 'no visible composer',
+  no_programmatic_send: 'no_programmatic_send',
+  draft_failed: 'draft_failed'
+}
+
+function summonErrorText(error) {
+  if (!error) return ''
+  if (typeof error === 'string') return asText(error) || ''
+  return asText(error.message) || asText(error) || ''
+}
+
+/** Exact, human-readable failure toast for the bar (never a dead-silent send). */
+function summonFailureMessage(result) {
+  const reason = asText(result && result.reason) || 'failed'
+  const label = SUMMON_REASON_LABELS[reason] || reason
+  let message = `Could not summon: ${label}`
+  if (label !== reason) message += ` (${reason})`
+  const error = summonErrorText(result && result.error)
+  if (error) message += ` — ${error}`
+  if (result && result.seated) {
+    message += '. Draft seat: seated. Press Enter in the Butler composer to send it.'
+  } else {
+    message += '. Draft seat: not seated.'
+  }
+  return message
+}
+
 /** Resolve the one Butler chat, send the request, then own the leaving visual. */
-async function summonButler(text) {
+async function summonButler(text, options = {}) {
   const message = asText(text)
   if (!message) return { ok: false, reason: 'empty' }
   if (!await openButlerSession()) return { ok: false, reason: 'no_session' }
   const target = launcherTargetId
-  const result = await sendSummonText(target, message)
-  return { ...result, session: target }
+  const result = await sendSummonText(target, message, options)
+  return { ...result, session: result.session || target }
+}
+
+/**
+ * Bar-facing submit outcome: owns the success toast/double and the honest
+ * failure toast. On failure the caller keeps the typed text in the input.
+ */
+async function summonFromBar(value, options = {}) {
+  let result
+  try {
+    result = await summonButler(value, options)
+  } catch (err) {
+    result = { ok: false, reason: 'threw', error: err, seated: false }
+  }
+  if (result.ok) {
+    notifySummonSuccess()
+    await spawnSummonDouble()
+    return { result, clearText: true, dismiss: true }
+  }
+  notifySummonFailure(summonFailureMessage(result))
+  return { result, clearText: false, dismiss: false }
 }
 
 function LauncherButton({ compact = false }) {
@@ -722,27 +949,12 @@ function SummonBar() {
     const value = text.trim()
     if (!value) return
     setBusy(true)
-    let result = { ok: false, reason: 'failed' }
-    try {
-      result = await summonButler(value)
-    } catch (err) {
-      result = { ok: false, reason: 'threw', error: err }
-    }
-    if (result.ok) {
-      setText('')
-      await spawnSummonDouble()
-      setBusy(false)
-      dismissSummonBar()
-      return
-    }
-    if (result.seated) {
-      setBusy(false)
-      dismissSummonBar()
-      notifySummonFailure('This desktop build has no programmatic send yet, so the request was placed in the Butler composer. Press Enter there to send it.')
-      return
-    }
+    const outcome = await summonFromBar(value)
     setBusy(false)
-    notifySummonFailure()
+    // Failure keeps the typed text in the bar so the user can retry; only a
+    // real send clears and dismisses it. The toast names the exact reason.
+    if (outcome.clearText) setText('')
+    if (outcome.dismiss) dismissSummonBar()
   }
 
   if (!open) return null
