@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -15,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from dashboard import plugin_api  # noqa: E402  (import after sys.path setup)
+from butler_core import engine, paths as bp_paths  # noqa: E402
 from butler_core.summon import frame_summon_text  # noqa: E402
 
 router = plugin_api.router
@@ -111,23 +114,25 @@ def test_history_shape_sorting_and_cap(client: TestClient, tmp_path: Path) -> No
     }
 
 
-def test_history_reads_plugins_data_candidate(client: TestClient, tmp_path: Path) -> None:
+def test_history_ignores_the_legacy_install_dir_fallback(
+        client: TestClient, tmp_path: Path) -> None:
+    """History and config now share plugin-data; the install dir cannot arm it."""
     guides = tmp_path / "plugins" / "butler" / "data" / "guides"
     guides.mkdir(parents=True)
     guide = {
-        "id": "fallback",
-        "title": "Fallback guide",
+        "id": "legacy",
+        "title": "Legacy guide",
         "state": {"status": "done"},
         "steps": [],
         "verifications": [],
         "started_at": 12.0,
     }
-    (guides / "fallback.json").write_text(json.dumps(guide), encoding="utf-8")
+    (guides / "legacy.json").write_text(json.dumps(guide), encoding="utf-8")
 
     response = client.get("/history")
 
     assert response.status_code == 200
-    assert [row["id"] for row in response.json()] == ["fallback"]
+    assert response.json() == []
 
 
 def test_config_defaults_pet_click_claim_off(client: TestClient) -> None:
@@ -154,6 +159,43 @@ def test_config_write_persists_and_hot_reloads(client: TestClient, tmp_path: Pat
     assert json.loads(path.read_text(encoding="utf-8"))["summon"]["pet_click_claim"] is False
 
 
+def test_dashboard_and_engine_share_one_config_file(
+        client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The watcher's /config and the engine's _cfg must round-trip one file."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    canonical = tmp_path / "plugin-data" / "butler" / "config.json"
+
+    assert plugin_api._config_candidates() == [bp_paths.config_path()]
+    assert plugin_api._state_candidates() == [bp_paths.state_path()]
+    assert plugin_api._config_path() == canonical
+
+    assert client.post("/config", json={"summon": {"pet_click_claim": True}}).status_code == 200
+    engine.init(canonical.parent)
+    assert canonical.exists()
+    assert engine.pet_click_claim() is True
+
+    # A stale copy in the old install-dir fallback must not win (or arm the
+    # receiver while the canonical file says off).
+    legacy = tmp_path / "plugins" / "butler" / "data" / "config.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"summon": {"pet_click_claim": True}}), encoding="utf-8")
+    assert client.post("/config", json={"summon": {"pet_click_claim": False}}).status_code == 200
+    assert engine.pet_click_claim() is False
+
+
+def test_state_and_guides_read_the_same_plugin_data_dir(
+        client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state = {"guide": {"id": "same-file", "state": {"status": "running"}}}
+    path = bp_paths.state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    assert plugin_api._state_candidates() == [path]
+    assert plugin_api._guides_candidates() == [path.parent / "guides"]
+    assert client.get("/state").json() == state
+
+
 def test_summon_pet_is_a_noop_without_a_petdex_pet(
         client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     (Path(os.environ["HERMES_HOME"]) / "pets").mkdir()
@@ -177,6 +219,133 @@ class FakePluginCtx:
         return self.accepted
 
 
+class FakeEntry:
+    def __init__(self, session_key):
+        self.session_key = session_key
+
+
+class FakeStore:
+    def __init__(self, by_id=None, by_key=None):
+        self.by_id = dict(by_id or {})
+        self.by_key = dict(by_key or {})
+        self.calls = []
+
+    def lookup_by_session_id(self, session_id):
+        self.calls.append(("id", session_id))
+        return self.by_id.get(session_id)
+
+    def lookup_by_session_key(self, session_key):
+        self.calls.append(("key", session_key))
+        return self.by_key.get(session_key)
+
+
+class ResolvingPluginCtx(FakePluginCtx):
+    """A plugin context whose manager publishes a live gateway runner."""
+
+    def __init__(self, store, accepted=True, raises=False):
+        super().__init__(accepted=accepted, raises=raises)
+        runner = SimpleNamespace(session_store=store)
+        self._manager = SimpleNamespace(
+            _gateway_message_injector=(runner, lambda **kwargs: True))
+
+
+def test_summon_send_derives_the_store_route_for_a_bare_local_id(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    bare = "local-ec39b9cb"
+    route = "agent:main:local:dm:local-ec39b9cb"
+    store = FakeStore(by_id={bare: FakeEntry(route)})
+    ctx = ResolvingPluginCtx(store)
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={"text": "turn off wifi", "session_id": bare})
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "session": bare, "session_key": route}
+    assert ctx.injected == [{
+        "text": frame_summon_text("turn off wifi"),
+        "role": "user",
+        "session_key": route,
+    }]
+    assert store.calls[0] == ("id", bare), "the runner's own store resolver was asked"
+
+
+def test_summon_send_accepts_an_already_full_route_only_when_the_store_knows_it(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    route = "agent:main:local:dm:local-known"
+    store = FakeStore(by_key={route: FakeEntry(route)})
+    ctx = ResolvingPluginCtx(store)
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={"text": "fix it", "session_id": route})
+
+    assert response.json() == {"ok": True, "session": route, "session_key": route}
+    assert ctx.injected[0]["session_key"] == route
+
+
+class KeyBuildingStore(FakeStore):
+    """A store with no id lookup, only the gateway's own key builder."""
+
+    def __init__(self, route):
+        super().__init__(by_key={route: FakeEntry(route)})
+        self.route = route
+        self.generated = []
+
+    def lookup_by_session_id(self, session_id):
+        self.calls.append(("id", session_id))
+        return None
+
+    def _generate_session_key(self, source):
+        self.generated.append((source.platform.value, source.chat_type, source.chat_id))
+        return self.route
+
+
+def test_summon_send_falls_back_to_the_stores_own_key_builder(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    bare = "local-generated"
+    route = "agent:main:local:dm:local-generated"
+    store = KeyBuildingStore(route)
+    ctx = ResolvingPluginCtx(store)
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    class FakeSource:
+        def __init__(self, platform, chat_type, chat_id):
+            self.platform = platform
+            self.chat_type = chat_type
+            self.chat_id = chat_id
+
+    gateway = types.ModuleType("gateway")
+    gateway.__path__ = []
+    gateway_config = types.ModuleType("gateway.config")
+    gateway_config.Platform = SimpleNamespace(LOCAL=SimpleNamespace(value="local"))
+    gateway_session = types.ModuleType("gateway.session")
+    gateway_session.SessionSource = FakeSource
+    monkeypatch.setitem(sys.modules, "gateway", gateway)
+    monkeypatch.setitem(sys.modules, "gateway.config", gateway_config)
+    monkeypatch.setitem(sys.modules, "gateway.session", gateway_session)
+
+    response = client.post("/summon/send", json={"text": "fix it", "session_id": bare})
+
+    assert response.json() == {"ok": True, "session": bare, "session_key": route}
+    assert store.generated == [("local", "dm", bare)]
+    assert ctx.injected[0]["session_key"] == route
+
+
+def test_summon_send_refuses_an_unknown_bare_id_as_unroutable(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = FakeStore()
+    ctx = ResolvingPluginCtx(store)
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={"text": "fix it", "session_id": "local-missing"})
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["ok"] is False
+    assert body["reason"] == "unroutable_session"
+    assert "local-missing" in body["detail"]
+    assert ctx.injected == [], "a bare id is never handed to inject_message as a route"
+
+
 def test_summon_send_injects_the_exact_frame_into_the_selected_session(
         client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = FakePluginCtx()
@@ -188,7 +357,7 @@ def test_summon_send_injects_the_exact_frame_into_the_selected_session(
     })
 
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "session": "ses_123"}
+    assert response.json() == {"ok": True, "session": "ses_123", "session_key": "ses_123"}
     assert ctx.injected == [{
         "text": frame_summon_text("turn off wifi"),
         "role": "user",
@@ -208,7 +377,10 @@ def test_summon_send_returns_the_denied_contract_when_injection_is_refused(
     })
 
     assert response.status_code == 200
-    assert response.json() == {"ok": False, "reason": "injection_denied"}
+    body = response.json()
+    assert body["ok"] is False
+    assert body["reason"] == "injection_denied"
+    assert body["detail"] == "gateway refused session_key ses_123"
     assert len(ctx.injected) == 1
 
 
@@ -223,7 +395,10 @@ def test_summon_send_fails_closed_when_injection_raises(
     })
 
     assert response.status_code == 200
-    assert response.json() == {"ok": False, "reason": "injection_denied"}
+    body = response.json()
+    assert body["ok"] is False
+    assert body["reason"] == "injection_denied"
+    assert body["detail"] == "gateway refused session_key ses_123"
 
 
 def test_summon_send_fails_closed_without_a_live_plugin_context(
@@ -239,3 +414,42 @@ def test_summon_send_fails_closed_without_a_live_plugin_context(
 def test_summon_send_requires_text_and_a_session_id(client: TestClient) -> None:
     assert client.post("/summon/send", json={"text": "", "session_id": "ses_123"}).status_code == 400
     assert client.post("/summon/send", json={"text": "fix it", "session_id": ""}).status_code == 400
+
+
+def test_summon_claim_endpoint_toggles_the_companion_chip(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def fake_sync(enabled):
+        calls.append(enabled)
+        return {"enabled": bool(enabled), "running": bool(enabled)}
+
+    monkeypatch.setattr(plugin_api, "_sync_claim_chip", fake_sync)
+
+    assert client.post("/summon/claim", json={"enabled": True}).json() == {
+        "ok": True, "enabled": True, "running": True
+    }
+    assert client.post("/summon/claim", json={"enabled": False}).json() == {
+        "ok": True, "enabled": False, "running": False
+    }
+    assert calls == [True, False]
+
+
+def test_summon_ack_consumes_only_the_named_pending_row(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    consumed = []
+
+    def fake_consume(pending_id):
+        consumed.append(pending_id)
+        return pending_id == "abc123"
+
+    monkeypatch.setattr(plugin_api, "_engine_module",
+                        lambda: SimpleNamespace(consume_summon_pending=fake_consume))
+
+    assert client.post("/summon/ack", json={"id": "abc123"}).json() == {
+        "ok": True, "cleared": True
+    }
+    assert client.post("/summon/ack", json={"id": "other"}).json() == {
+        "ok": True, "cleared": False
+    }
+    assert consumed == ["abc123", "other"]

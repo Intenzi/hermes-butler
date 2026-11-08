@@ -17,6 +17,12 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from butler_core import paths as bp_paths  # noqa: E402  (import after sys.path setup)
+
 
 router = APIRouter()
 logger = logging.getLogger("hermes.plugins.butler.api")
@@ -26,26 +32,18 @@ CONFIG_KEY = "summon.pet_click_claim"
 
 
 def _state_candidates() -> list[Path]:
-    out = []
-    hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    out.append(Path(hermes_home) / "plugin-data" / "butler" / "state.json")
-    out.append(Path(hermes_home) / "plugins" / "butler" / "data" / "state.json")
-    return out
+    """The ONE host-owned state file (never the plugin install dir)."""
+    return [bp_paths.state_path()]
 
 
 def _guides_candidates() -> list[Path]:
-    """The guides folder beside each state candidate, in /state's order."""
-    out = []
-    for state_path in _state_candidates():
-        guides = state_path.parent / "guides"
-        if guides not in out:
-            out.append(guides)
-    return out
+    """The guides folder beside the canonical state file."""
+    return [bp_paths.guides_dir()]
 
 
 def _config_candidates() -> list[Path]:
-    """plugin-data config first, mirroring the engine's data-dir order."""
-    return [state_path.parent / "config.json" for state_path in _state_candidates()]
+    """The ONE host-owned config file the engine also polls."""
+    return [bp_paths.config_path()]
 
 
 def _config_path() -> Path:
@@ -155,6 +153,63 @@ def _load_overlay_module():
     return bp_overlay
 
 
+def _engine_module():
+    """Load the plugin's engine (claim-chip + summon-pending owner)."""
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from butler_core import engine as bp_engine
+
+    return bp_engine
+
+
+_CLAIM_SYNCING = False
+_CLAIM_SYNC_LOCK = threading.Lock()
+
+
+def _sync_claim_chip(enabled: bool) -> dict[str, Any]:
+    """Best-effort: arm/disarm the companion's pop-out click chip.
+
+    Arming may compile/start the companion on first use, so it runs off the
+    gateway request thread; a disabled chip is hidden synchronously. The
+    desktop polls this every few seconds, so a repeated arm while the first
+    start is in flight is a no-op rather than another process/build.
+    """
+    global _CLAIM_SYNCING
+    try:
+        bp_engine = _engine_module()
+    except Exception:
+        logger.exception("butler claim-chip engine unavailable")
+        return {"enabled": bool(enabled), "running": False, "detail": "engine unavailable"}
+
+    if not enabled:
+        with _CLAIM_SYNC_LOCK:
+            _CLAIM_SYNCING = False
+        try:
+            return bp_engine.set_claim_chip(False)
+        except Exception:
+            logger.exception("butler claim-chip disarm failed")
+            return {"enabled": False, "running": False, "detail": "engine unavailable"}
+
+    with _CLAIM_SYNC_LOCK:
+        if _CLAIM_SYNCING:
+            return {"enabled": True, "running": False, "detail": "starting"}
+        _CLAIM_SYNCING = True
+
+    def _arm() -> None:
+        global _CLAIM_SYNCING
+        try:
+            bp_engine.set_claim_chip(True)
+        except Exception:
+            logger.exception("butler claim-chip arm failed")
+        finally:
+            with _CLAIM_SYNC_LOCK:
+                _CLAIM_SYNCING = False
+
+    threading.Thread(target=_arm, name="butler-claim-chip", daemon=True).start()
+    return {"enabled": True, "running": False, "detail": "starting"}
+
+
 def _summon_pet_double() -> bool:
     try:
         bp_overlay = _load_overlay_module()
@@ -166,6 +221,104 @@ def _summon_pet_double() -> bool:
         return True
     except Exception:
         return False
+
+
+def _gateway_runner(ctx):
+    """The live gateway runner published for plugin injection, or None.
+
+    ``PluginContext._manager`` carries the same owner/injector tuple
+    ``hermes_cli.plugins.publish_gateway_message_host`` stamps, so the runner
+    (and its ``session_store``) is reachable without importing gateway state.
+    """
+    manager = getattr(ctx, "_manager", None)
+    host = getattr(manager, "_gateway_message_injector", None)
+    if not (isinstance(host, tuple) and len(host) == 2 and host[0] is not None):
+        try:
+            from hermes_cli import plugins as hermes_plugins
+
+            host = getattr(hermes_plugins, "_published_gateway_message_injector", None)
+        except Exception:
+            host = None
+    if isinstance(host, tuple) and len(host) == 2 and host[0] is not None:
+        return host[0]
+    return None
+
+
+def _entry_session_key(entry: Any) -> str | None:
+    if isinstance(entry, dict):
+        value = entry.get("session_key")
+    else:
+        value = getattr(entry, "session_key", None)
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _generated_local_route(store: Any, session_id: str) -> str | None:
+    """Ask the store's own key builder for the local DM route, if it exists.
+
+    This is only a fallback after a direct ``lookup_by_session_id`` miss: the
+    key template lives in ``gateway.session`` and the profile resolution lives
+    in the store, never in this plugin.
+    """
+    generate = getattr(store, "_generate_session_key", None)
+    if not callable(generate):
+        return None
+    try:
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        source = SessionSource(platform=Platform.LOCAL, chat_type="dm", chat_id=session_id)
+        route = generate(source)
+    except Exception:
+        return None
+    if not isinstance(route, str) or not route.strip():
+        return None
+    # A generated key only counts when the same store can resolve it.
+    lookup_key = getattr(store, "lookup_by_session_key", None)
+    if callable(lookup_key):
+        try:
+            return route if lookup_key(route) is not None else None
+        except Exception:
+            return None
+    return route
+
+
+def _resolve_session_route(ctx, session_id: str) -> tuple[str | None, str | None]:
+    """Derive the gateway routing key for a desktop session id.
+
+    Returns ``(route, detail)``. ``route`` is None when the gateway cannot
+    resolve the id; ``detail`` then carries the honest reason. A live runner's
+    store is authoritative; a bare ``local-…`` id is never used as a route.
+    """
+    runner = _gateway_runner(ctx)
+    if runner is None:
+        # No gateway host in this process: preserve the old caller-keyed path.
+        return session_id, None
+    store = getattr(runner, "session_store", None)
+    if store is None:
+        return None, f"gateway has no session store to resolve {session_id}"
+
+    lookup_id = getattr(store, "lookup_by_session_id", None)
+    if callable(lookup_id):
+        try:
+            route = _entry_session_key(lookup_id(session_id))
+        except Exception as exc:  # noqa: BLE001 - report, never 500 the send
+            return None, f"gateway session lookup failed for {session_id}: {exc}"
+        if route:
+            return route, None
+
+    # Already a routing key? Accept it only when the store confirms the row.
+    lookup_key = getattr(store, "lookup_by_session_key", None)
+    if callable(lookup_key):
+        try:
+            if lookup_key(session_id) is not None:
+                return session_id, None
+        except Exception:
+            pass
+
+    route = _generated_local_route(store, session_id)
+    if route:
+        return route, None
+    return None, f"no gateway session route for {session_id}"
 
 
 def _read_state() -> dict[str, Any]:
@@ -273,6 +426,36 @@ def set_config(body: dict[str, Any]) -> dict[str, Any]:
     return {"summon": {"pet_click_claim": _pet_click_claim(cfg)}}
 
 
+@router.post("/summon/claim")
+def summon_claim(body: dict[str, Any]) -> dict[str, Any]:
+    """Arm/disarm the companion's pop-out pet click chip.
+
+    The desktop calls this after each ``/config`` sync, so a config-file value
+    survives a gateway reload without a second manual toggle.
+    """
+    requested = body.get("enabled") if isinstance(body, dict) else None
+    if requested is None:
+        enabled = _pet_click_claim(_read_config())
+    elif isinstance(requested, str):
+        enabled = requested.strip().lower() in ("true", "yes", "on", "1")
+    else:
+        enabled = bool(requested)
+    return {"ok": True, **_sync_claim_chip(enabled)}
+
+
+@router.post("/summon/ack")
+def summon_ack(body: dict[str, Any]) -> dict[str, Any]:
+    """Consume a companion-click summon after the desktop opened the bar."""
+    pending_id = body.get("id") if isinstance(body, dict) else None
+    pending_id = pending_id.strip() if isinstance(pending_id, str) else ""
+    try:
+        cleared = _engine_module().consume_summon_pending(pending_id or None)
+    except Exception:
+        logger.exception("butler summon ack failed")
+        cleared = False
+    return {"ok": True, "cleared": bool(cleared)}
+
+
 @router.post("/summon/pet")
 def summon_pet() -> dict[str, Any]:
     spawned = _summon_pet_double()
@@ -300,14 +483,18 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
     inject = getattr(ctx, "inject_message", None)
     if not callable(inject):
         return {"ok": False, "reason": "injection_denied"}
+    route, detail = _resolve_session_route(ctx, session_id)
+    if route is None:
+        return {"ok": False, "reason": "unroutable_session", "detail": detail}
     try:
-        accepted = bool(inject(_summon_frame(text), role="user", session_key=session_id))
+        accepted = bool(inject(_summon_frame(text), role="user", session_key=route))
     except Exception:
         logger.exception("butler summon injection failed")
         accepted = False
     if not accepted:
-        return {"ok": False, "reason": "injection_denied"}
-    return {"ok": True, "session": session_id}
+        return {"ok": False, "reason": "injection_denied",
+                "detail": f"gateway refused session_key {route}"}
+    return {"ok": True, "session": session_id, "session_key": route}
 
 
 @router.get("/health")

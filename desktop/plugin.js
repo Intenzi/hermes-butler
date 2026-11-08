@@ -45,8 +45,9 @@ const SUMMON_SEND_TIMEOUT_MS = 6000
 const SUMMON_LIVE_REFRESH_MS = 600
 const CONFIG_REFRESH_MS = 5000
 // Documented legacy locator for the petdex pet (the core pet canvas). Read-only:
-// we never paint into it and never edit Hermes core to add a hook.
-const PET_CANVAS_SELECTOR = 'canvas[aria-label$=" pet"]'
+// we never paint into it and never edit Hermes core to add a hook. The bare
+// "pet" form is what the core emits when the pet has no displayName.
+const PET_CANVAS_SELECTORS = ['canvas[aria-label$=" pet"]', 'canvas[aria-label="pet"]']
 const SUMMON_DESTINATION_KEY = 'butler.summon.destination'
 const SUMMON_EXISTING = 'existing'
 const SUMMON_NEW = 'new'
@@ -73,6 +74,10 @@ const summonListeners = new Set()
 let petClickClaim = false
 let petClickWatcher = null
 let petClickConfigWrites = 0
+let claimConfigTimer = null
+// Has the in-window core pet canvas ever been found while the receiver was on?
+// The pane chip uses this to say "armed" only when there is something to click.
+let petCanvasSeen = false
 // Destination picker state; localStorage is the cross-opening source of truth.
 let summonDestination = null
 
@@ -450,8 +455,15 @@ function notifySummonSuccess(result) {
     // Say so: the user must not read this as the full agent conversation.
     kind = 'warning'
     const reason = asText(result.injection_reason) || 'injection_unavailable'
-    message += ` — gateway injection was ${reason === 'injection_denied' ? 'denied' : 'unavailable'}`
+    const reasonLabel = reason === 'injection_denied'
+      ? 'was denied'
+      : reason === 'unroutable_session'
+        ? 'could not route this session (session not routable through the gateway)'
+        : 'was unavailable'
+    message += ` — gateway injection ${reasonLabel}`
       + ' (' + reason + '); sent /butler instead, so this chat could not host the full conversation.'
+    const detail = asText(result.injection_detail)
+    if (detail) message += ` — ${detail}`
   }
   try {
     host && host.notify && host.notify({ kind, title: 'Butler', message })
@@ -540,11 +552,24 @@ function butlerCommandText(value) {
 
 function petCanvasNode() {
   if (typeof document === 'undefined') return null
-  try {
-    return document.querySelector(PET_CANVAS_SELECTOR) || null
-  } catch (err) {
-    return null
+  for (const selector of PET_CANVAS_SELECTORS) {
+    try {
+      const canvas = document.querySelector(selector)
+      if (canvas) return canvas
+    } catch (err) {
+      // Try the next documented spelling.
+    }
   }
+  return null
+}
+
+/** Honest pane status: only claim "armed" when the in-window canvas exists. */
+function petClaimStatusText() {
+  if (!petClickClaim) return 'Off — use Cmd+Shift+A'
+  if (petCanvasSeen || petCanvasNode()) {
+    return 'Armed — click your pet (in-window)'
+  }
+  return 'No in-window pet — use Cmd+Shift+A'
 }
 
 function subscribeSummonBar(listener) {
@@ -642,6 +667,7 @@ function startPetClickWatcher() {
       if (!rect || rect.width <= 0 || rect.height <= 0) {
         overlay.style.opacity = '0'
       } else {
+        petCanvasSeen = true
         const box = { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
         if (!lastRect || Math.abs(lastRect.left - box.left) > 0.5
           || Math.abs(lastRect.top - box.top) > 0.5
@@ -667,6 +693,7 @@ function startPetClickWatcher() {
       if (event && typeof event.button === 'number' && event.button !== 0) return
       const canvas = petCanvasNode()
       if (!canvas) return
+      petCanvasSeen = true
       const rect = canvas.getBoundingClientRect()
       if (!rect || rect.width <= 0 || rect.height <= 0) return
       const x = Number(event && event.clientX)
@@ -709,6 +736,7 @@ function setPetClickClaim(enabled) {
   const next = Boolean(enabled)
   if (!next) {
     petClickClaim = false
+    petCanvasSeen = false
     stopPetClickWatcher()
     return
   }
@@ -716,13 +744,50 @@ function setPetClickClaim(enabled) {
   startPetClickWatcher()
 }
 
+async function syncCompanionClaim(enabled) {
+  if (!rest || typeof rest !== 'function') return false
+  try {
+    const result = await rest('/summon/claim', {
+      method: 'POST',
+      body: { enabled: Boolean(enabled) }
+    })
+    return Boolean(result && result.enabled === Boolean(enabled))
+  } catch (err) {
+    // Companion unavailable is a degrade: the in-window listener and the
+    // shortcut still work, so this is not a toggle failure.
+    return false
+  }
+}
+
 async function syncPetClickClaim() {
   if (!rest || typeof rest !== 'function') return
   try {
     const result = await rest('/config')
-    setPetClickClaim(configPetClickClaim(result))
+    const enabled = configPetClickClaim(result)
+    setPetClickClaim(enabled)
+    // Keep the pop-out chip on the same config value, and refresh its process
+    // heartbeat so the companion's idle watchdog does not retire it.
+    await syncCompanionClaim(enabled)
   } catch (err) {
     // Backend not mounted yet; the toggle still writes once it is.
+  }
+}
+
+/** Poll the config even on older hosts whose ctx lacks a tracked setInterval. */
+function startClaimConfigPolling(ctx) {
+  const tick = () => { syncPetClickClaim().catch(() => {}) }
+  try {
+    if (ctx && typeof ctx.setInterval === 'function') {
+      ctx.setInterval(tick, CONFIG_REFRESH_MS)
+      return
+    }
+  } catch (err) {
+    // Fall through to the window timer below.
+  }
+  try {
+    claimConfigTimer = window.setInterval(tick, CONFIG_REFRESH_MS)
+  } catch (err) {
+    // No timer surface: the pane toggle still applies directly.
   }
 }
 
@@ -870,6 +935,7 @@ const SUMMON_REASON_LABELS = {
   draft_failed: 'draft_failed',
   injection_denied: 'gateway injection denied',
   injection_unavailable: 'gateway injection unavailable',
+  unroutable_session: 'session not routable through the gateway',
   session_create_failed: 'could not create a fresh Butler session',
   session_create_unavailable: 'session creation unsupported',
   session_focus_failed: 'could not focus the Butler session'
@@ -889,6 +955,8 @@ function summonFailureMessage(result) {
   if (label !== reason) message += ` (${reason})`
   const error = summonErrorText(result && result.error) || summonErrorText(result && result.injection_error)
   if (error) message += ` — ${error}`
+  const detail = asText(result && result.detail)
+  if (detail && detail !== error) message += ` — ${detail}`
   const injectionReason = asText(result && result.injection_reason)
   if (injectionReason) {
     message += `. Full-conversation injection was unavailable (${injectionReason}); /butler fallback also failed`
@@ -925,6 +993,7 @@ async function sendSummonInjection(target, text) {
         ok: true,
         send: 'inject',
         session: asText(response.session) || targetId,
+        session_key: asText(response.session_key) || null,
         attempts: 1
       }
     }
@@ -932,6 +1001,7 @@ async function sendSummonInjection(target, text) {
       ok: false,
       reason: asText(response && response.reason) || 'injection_denied',
       error: response && response.error,
+      detail: response && response.detail,
       session: targetId
     }
   } catch (err) {
@@ -1001,7 +1071,8 @@ async function summonButler(text, options = {}) {
     destination,
     fallback: true,
     injection_reason: injection.reason,
-    injection_error: injection.error
+    injection_error: injection.error,
+    injection_detail: injection.detail
   }
 }
 
@@ -1064,6 +1135,31 @@ function SummonBar() {
   const barRef = useRef(null)
   const busyRef = useRef(false)
   busyRef.current = busy
+
+  // The companion chip cannot touch the desktop renderer directly; the engine
+  // publishes a one-shot summon_pending row in /state instead. The bar is the
+  // always-mounted surface, so it consumes that row and opens the SAME picker.
+  const pendingQuery = useQuery({
+    queryKey: ['butler', 'summon-pending'],
+    queryFn: () => (typeof rest === 'function' ? rest('/state') : Promise.resolve({})),
+    refetchInterval: REFRESH_MS,
+    refetchOnMount: 'always'
+  }) || {}
+  const pending = pendingQuery.data && pendingQuery.data.summon_pending
+  const pendingId = asText(pending && pending.id)
+  const seenPendingRef = useRef(null)
+  useEffect(() => {
+    if (!pendingId || seenPendingRef.current === pendingId) return
+    seenPendingRef.current = pendingId
+    openSummonBar('pet')
+    if (typeof rest !== 'function') return
+    try {
+      const ack = rest('/summon/ack', { method: 'POST', body: { id: pendingId } })
+      if (ack && typeof ack.catch === 'function') ack.catch(() => {})
+    } catch (err) {
+      // The row stays unconsumed; a later poll retries the ack.
+    }
+  }, [pendingId])
 
   useEffect(() => subscribeSummonBar(state => {
     setOpen(state.open)
@@ -1258,11 +1354,26 @@ function ButlerPetClickToggle() {
   const configured = configPetClickClaim(configQuery.data)
   const [enabled, setEnabled] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [canvasSeen, setCanvasSeen] = useState(() => Boolean(petCanvasNode()))
 
   useEffect(() => {
+    // A null initial query must not disarm the register-time watcher: only a
+    // real config response decides the switch/listener state.
+    if (configQuery.data === null || configQuery.data === undefined) return
     setEnabled(configured)
     setPetClickClaim(configured)
-  }, [configured])
+  }, [configured, configQuery.data])
+
+  useEffect(() => {
+    if (!enabled) {
+      setCanvasSeen(false)
+      return undefined
+    }
+    const check = () => setCanvasSeen(Boolean(petCanvasNode()))
+    check()
+    const id = window.setInterval(check, 1000)
+    return () => window.clearInterval(id)
+  }, [enabled])
 
   const onToggle = async (event) => {
     const next = Boolean(event.target.checked)
@@ -1270,39 +1381,62 @@ function ButlerPetClickToggle() {
     setSaving(true)
     const saved = await writePetClickClaim(next)
     setSaving(false)
-    if (!saved) {
-      setEnabled(!next)
-      setPetClickClaim(!next)
-      try {
-        host && host.notify && host.notify({
-          kind: 'error',
-          title: 'Butler',
-          message: 'Could not save the pet-click setting. The receiver is off; the shortcut still works.'
-        })
-      } catch (err) {
-        // No toast surface: the reverted switch is the report.
-      }
+    if (saved) {
+      await syncCompanionClaim(next)
+      return
+    }
+    setEnabled(!next)
+    setPetClickClaim(!next)
+    try {
+      host && host.notify && host.notify({
+        kind: 'error',
+        title: 'Butler',
+        message: 'Could not save the pet-click setting. The receiver is off; the shortcut still works.'
+      })
+    } catch (err) {
+      // No toast surface: the reverted switch is the report.
     }
   }
 
-  return h('label', {
-    style: {
-      display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
-      fontSize: 12, color: '#c7cbd2', padding: '7px 10px', borderRadius: 9,
-      border: '1px solid rgba(255,255,255,.08)', background: 'rgba(255,255,255,.03)'
-    }
+  const claimStatus = !enabled
+    ? 'Off — use Cmd+Shift+A'
+    : (canvasSeen
+      ? 'Armed — click your pet (in-window)'
+      : 'No in-window pet — use Cmd+Shift+A')
+
+  return h('div', {
+    style: { display: 'flex', flexDirection: 'column', gap: 6 }
   },
-    h('input', {
-      type: 'checkbox',
-      checked: enabled,
-      disabled: saving,
-      'aria-label': 'Click the pet to ask the butler',
-      onChange: onToggle,
-      style: { cursor: 'pointer', accentColor: 'var(--ui-accent-local, #9aa3ea)' }
-    }),
-    h('span', { style: { flex: 1 } }, 'Click the pet to ask the butler'),
-    h('span', { style: { fontSize: 10, color: enabled ? '#6fd39a' : '#6f7784' } },
-      saving ? 'saving…' : (enabled ? 'on' : 'off'))
+    h('label', {
+      style: {
+        display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+        fontSize: 12, color: '#c7cbd2', padding: '7px 10px', borderRadius: 9,
+        border: '1px solid rgba(255,255,255,.08)', background: 'rgba(255,255,255,.03)'
+      }
+    },
+      h('input', {
+        type: 'checkbox',
+        checked: enabled,
+        disabled: saving,
+        'aria-label': 'Click the pet to ask the butler',
+        onChange: onToggle,
+        style: { cursor: 'pointer', accentColor: 'var(--ui-accent-local, #9aa3ea)' }
+      }),
+      h('span', { style: { flex: 1 } }, 'Click the pet to ask the butler'),
+      h('span', { style: { fontSize: 10, color: enabled ? '#6fd39a' : '#6f7784' } },
+        saving ? 'saving…' : (enabled ? 'on' : 'off'))
+    ),
+    h('div', {
+      role: 'status',
+      'aria-live': 'polite',
+      style: {
+        alignSelf: 'flex-start', fontSize: 10.5, lineHeight: 1.4,
+        padding: '2px 8px', borderRadius: 99,
+        color: enabled && canvasSeen ? '#6fd39a' : '#8a8f98',
+        border: `1px solid ${enabled && canvasSeen ? 'rgba(111,211,154,.35)' : 'rgba(255,255,255,.09)'}`,
+        background: enabled && canvasSeen ? 'rgba(111,211,154,.08)' : 'rgba(255,255,255,.03)'
+      }
+    }, claimStatus)
   )
 }
 
@@ -1580,15 +1714,16 @@ export default {
       ctx.onDispose(() => {
         stopPetClickWatcher()
         petClickClaim = false
+        petCanvasSeen = false
         summonOpen = false
         summonListeners.clear()
+        try {
+          if (claimConfigTimer !== null) window.clearInterval(claimConfigTimer)
+        } catch (err) { }
+        claimConfigTimer = null
       })
     } catch (err) { }
     try { syncPetClickClaim() } catch (err) { }
-    try {
-      if (typeof ctx.setInterval === 'function') ctx.setInterval(syncPetClickClaim, CONFIG_REFRESH_MS)
-    } catch (err) {
-      // Older hosts: no tracked timer; the pane toggle still applies directly.
-    }
+    startClaimConfigPolling(ctx)
   }
 }

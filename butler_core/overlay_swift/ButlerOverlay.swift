@@ -13,12 +13,17 @@
 //    {"op":"ring","box":[x,y,w,h],"label":"...","say":"...","step":n,"total":m}
 //    {"op":"chip","step":n}
 //    {"op":"pet","frames_dir":"...","scale":0.33,"pet_enabled":true}
+//    {"op":"claim_chip","enabled":true}
 //    {"op":"launcher"}
 //    {"op":"done"}
 //    {"op":"axtrusted","prompt":true}
 //    {"op":"axcapture","target":null,"max_elements":150,"depth":10}
 //    {"op":"idle"}
 //    {"op":"quit"}
+//
+//  Event lines the renderer writes to stdout (never a request response):
+//    {"op":"launcher_click"}
+//    {"op":"claim_click"}
 //
 //  Coordinates in "box" are global Accessibility (Quartz) screen coordinates:
 //  origin at the top-left of the primary display, y increasing downward.
@@ -437,10 +442,63 @@ private func axWindowTitle(_ window: AXUIElement) -> String? {
     return axString(window, "AXDescription")
 }
 
+/// AX frames for every top-level window of *pid* (Quartz top-left coords).
+/// Used by the pop-out claim chip so it anchors to the real pet panel, not a
+/// guessed CG shape; an untrusted process returns [] and the caller falls back
+/// to the CGWindow bounds.
+private func axWindowFrameList(pid: pid_t) -> [(title: String?, frame: CGRect)] {
+    let root = AXUIElementCreateApplication(pid)
+    guard let rawWindows = copyAXAttribute(root, "AXWindows") as? [Any] else {
+        return []
+    }
+    var out: [(title: String?, frame: CGRect)] = []
+    for rawWindow in rawWindows {
+        guard let window = axElement(from: rawWindow) else {
+            continue
+        }
+        let fields = readAXFields(window)
+        guard fields.box.count == 4,
+              let x = numberValue(fields.box[0]),
+              let y = numberValue(fields.box[1]),
+              let width = numberValue(fields.box[2]),
+              let height = numberValue(fields.box[3]),
+              width > 0.0, height > 0.0 else {
+            continue
+        }
+        out.append((axWindowTitle(window),
+                    CGRect(x: x, y: y, width: width, height: height)))
+    }
+    return out
+}
+
+private func hermesPid() -> pid_t? {
+    if let app = NSRunningApplication
+        .runningApplications(withBundleIdentifier: "com.nousresearch.hermes")
+        .first {
+        return app.processIdentifier
+    }
+    return NSWorkspace.shared.runningApplications.first {
+        !$0.isTerminated && ($0.localizedName ?? "").lowercased().contains("hermes")
+    }?.processIdentifier
+}
+
 private struct AXRunningWindow {
     let pid: pid_t
     let name: String
     let title: String?
+    let bounds: CGRect?
+}
+
+private func windowBounds(_ window: [String: Any]) -> CGRect? {
+    guard let raw = window[kCGWindowBounds as String] as? [String: Any],
+          let x = numberValue(raw["X"]),
+          let y = numberValue(raw["Y"]),
+          let width = numberValue(raw["Width"]),
+          let height = numberValue(raw["Height"]),
+          width > 0.0, height > 0.0 else {
+        return nil
+    }
+    return CGRect(x: x, y: y, width: width, height: height)
 }
 
 private func axTopmostLayer0Windows() -> [AXRunningWindow] {
@@ -457,7 +515,8 @@ private func axTopmostLayer0Windows() -> [AXRunningWindow] {
         out.append(AXRunningWindow(
             pid: pid_t(rawPid),
             name: (window[kCGWindowOwnerName as String] as? String) ?? "",
-            title: window[kCGWindowName as String] as? String))
+            title: window[kCGWindowName as String] as? String,
+            bounds: windowBounds(window)))
     }
     return out
 }
@@ -609,10 +668,15 @@ private struct PetSpec {
     let enabled: Bool
 }
 
+private struct ClaimChipSpec {
+    let enabled: Bool
+}
+
 private enum OverlayCommand {
     case ring(RingSpec)
     case chip(Int)
     case pet(PetSpec)
+    case claimChip(ClaimChipSpec)
     case launcher
     case done
     case axtrusted(prompt: Bool)
@@ -733,6 +797,17 @@ private func parseCommand(line: String) -> OverlayCommand? {
             enabled = parsedEnabled
         }
         return .pet(PetSpec(framesDir: framesDir, scale: scale, enabled: enabled))
+
+    case "claim_chip":
+        var enabled = true
+        if let rawEnabled = object["enabled"], !(rawEnabled is NSNull) {
+            guard let parsedEnabled = rawEnabled as? Bool else {
+                logMalformedOnce(line: line, reason: "claim_chip has an invalid enabled")
+                return nil
+            }
+            enabled = parsedEnabled
+        }
+        return .claimChip(ClaimChipSpec(enabled: enabled))
 
     case "launcher":
         return .launcher
@@ -1014,6 +1089,76 @@ private final class ChipView: NSView {
         let textRect = NSRect(x: 10.0,
                               y: (bounds.height - textHeight) / 2.0,
                               width: max(0.0, bounds.width - 20.0),
+                              height: textHeight)
+        (text as NSString).draw(in: textRect, withAttributes: attributes)
+    }
+}
+
+// MARK: - Pop-out pet claim chip
+
+/// A separate, clickable mini window that sits NEXT TO the core Hermes pet
+/// pop-out. It never overlaps the pet's sprite bounds, so the pet keeps its
+/// own drag/pop-in gestures; this chip is the plugin-owned summon door.
+private final class ClaimChipView: NSView {
+    private let text: String
+    private let font: NSFont
+    var onClick: (() -> Void)?
+
+    init(frame: NSRect, text: String, font: NSFont) {
+        self.text = text
+        self.font = font
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override var isFlipped: Bool {
+        return true
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let background = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: background,
+                                xRadius: background.height / 2.0,
+                                yRadius: background.height / 2.0)
+        NSColor(red: 22.0 / 255.0,
+                green: 23.0 / 255.0,
+                blue: 26.0 / 255.0,
+                alpha: 0.92).setFill()
+        path.fill()
+        NSColor(red: 122.0 / 255.0,
+                green: 134.0 / 255.0,
+                blue: 255.0 / 255.0,
+                alpha: 0.55).setStroke()
+        path.lineWidth = 1.0
+        path.stroke()
+
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: style
+        ]
+        let textHeight = (text as NSString).size(withAttributes: attributes).height
+        let textRect = NSRect(x: 8.0,
+                              y: (bounds.height - textHeight) / 2.0,
+                              width: max(0.0, bounds.width - 16.0),
                               height: textHeight)
         (text as NSString).draw(in: textRect, withAttributes: attributes)
     }
@@ -1337,6 +1482,11 @@ private final class NameplateView: NSView {
 private final class OverlayController {
     private var ringWindows: [NSWindow] = []
     private var chipWindow: NSWindow?
+    private var claimChipWindow: NSWindow?
+    private var claimChipView: ClaimChipView?
+    private var claimChipTimer: Timer?
+    private var claimChipEnabled = false
+    private let claimChipGap: CGFloat = 10.0
     private var stdinThread: Thread?
     private var activeRing: RingSpec?
     private var observerTokens: [(NotificationCenter, NSObjectProtocol)] = []
@@ -1449,6 +1599,9 @@ private final class OverlayController {
         case .pet(let spec):
             cancelPendingExit()
             showPet(spec)
+        case .claimChip(let spec):
+            cancelPendingExit()
+            setClaimChip(spec.enabled)
         case .launcher:
             cancelPendingExit()
             showLauncher()
@@ -1678,6 +1831,185 @@ private final class OverlayController {
             window.close()
         }
         chipWindow = nil
+    }
+
+    // MARK: Pop-out pet claim chip
+
+    private func setClaimChip(_ enabled: Bool) {
+        guard !isShuttingDown else {
+            return
+        }
+        claimChipEnabled = enabled
+        if !enabled {
+            claimChipTimer?.invalidate()
+            claimChipTimer = nil
+            hideClaimChip()
+            return
+        }
+        if claimChipTimer == nil {
+            let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                self?.positionClaimChip()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            claimChipTimer = timer
+        }
+        positionClaimChip()
+    }
+
+    /// Find the core Hermes pet pop-out. With Accessibility the AX window
+    /// frame is authoritative; otherwise the same layer-0 CGWindow enumeration
+    /// capture() uses supplies the bounds. The pet panel is a small, near-square
+    /// Hermes window with no title; the main window and HUD carry titles and/or
+    /// are much larger.
+    private func hermesPetWindowFrame(primaryHeight: CGFloat) -> CGRect? {
+        func isPetShaped(_ bounds: CGRect) -> Bool {
+            guard bounds.width >= 60.0, bounds.height >= 60.0,
+                  bounds.width <= 480.0, bounds.height <= 480.0 else {
+                return false
+            }
+            let aspect = bounds.width / max(bounds.height, 1.0)
+            return aspect >= 0.6 && aspect <= 1.67
+        }
+
+        if let pid = hermesPid(), AXIsProcessTrusted() {
+            for window in axWindowFrameList(pid: pid) {
+                let title = (window.title ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if title.isEmpty, isPetShaped(window.frame),
+                   boxIntersectsAnyScreen(window.frame, primaryHeight: primaryHeight) {
+                    return window.frame
+                }
+            }
+        }
+
+        let bundlePid = hermesPid()
+        for window in axTopmostLayer0Windows() {
+            let isHermes = (bundlePid != nil && window.pid == bundlePid)
+                || window.name.lowercased().contains("hermes")
+            guard isHermes, let bounds = window.bounds else {
+                continue
+            }
+            let title = (window.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard title.isEmpty, isPetShaped(bounds),
+                  boxIntersectsAnyScreen(bounds, primaryHeight: primaryHeight) else {
+                continue
+            }
+            return bounds
+        }
+        return nil
+    }
+
+    private func claimChipSize() -> CGSize {
+        let font = NSFont.systemFont(ofSize: 11.0, weight: .semibold)
+        let textBounds = ("Ask butler" as NSString).size(withAttributes: [.font: font])
+        return CGSize(width: max(84.0, ceil(textBounds.width) + 24.0), height: 24.0)
+    }
+
+    private func claimChipFrame(nextTo pet: CGRect,
+                                size: CGSize,
+                                primaryHeight: CGFloat) -> CGRect? {
+        guard let screen = screenContaining(pet, primaryHeight: primaryHeight) else {
+            return nil
+        }
+        let visible = quartzRect(fromAppKit: screen.visibleFrame,
+                                 primaryHeight: primaryHeight)
+        let gap = claimChipGap
+        let candidates = [
+            CGRect(x: pet.maxX + gap, y: pet.midY - size.height / 2.0,
+                   width: size.width, height: size.height),
+            CGRect(x: pet.minX - gap - size.width, y: pet.midY - size.height / 2.0,
+                   width: size.width, height: size.height),
+            CGRect(x: pet.midX - size.width / 2.0, y: pet.minY - gap - size.height,
+                   width: size.width, height: size.height),
+            CGRect(x: pet.midX - size.width / 2.0, y: pet.maxY + gap,
+                   width: size.width, height: size.height),
+        ]
+        for candidate in candidates {
+            var frame = candidate
+            frame.origin.x = min(max(frame.origin.x, visible.minX + 4.0),
+                                 visible.maxX - frame.width - 4.0)
+            frame.origin.y = min(max(frame.origin.y, visible.minY + 4.0),
+                                 visible.maxY - frame.height - 4.0)
+            // Separate mini window: never overlap the pet's sprite bounds.
+            if !frame.intersects(pet) {
+                return frame
+            }
+        }
+        return nil
+    }
+
+    private func positionClaimChip() {
+        guard claimChipEnabled, !isShuttingDown,
+              let primaryHeight = primaryScreenHeight() else {
+            hideClaimChip()
+            return
+        }
+        let size = claimChipSize()
+        guard let pet = hermesPetWindowFrame(primaryHeight: primaryHeight),
+              let frame = claimChipFrame(nextTo: pet, size: size,
+                                         primaryHeight: primaryHeight) else {
+            // Unknown/renamed pet window: stay hidden rather than guess.
+            hideClaimChip()
+            return
+        }
+        let appKitFrame = appKitRect(fromQuartz: frame, primaryHeight: primaryHeight)
+
+        if let window = claimChipWindow, let view = claimChipView {
+            if window.frame != appKitFrame {
+                window.setFrame(appKitFrame, display: true)
+                view.frame = NSRect(origin: .zero, size: appKitFrame.size)
+                view.needsDisplay = true
+            }
+            return
+        }
+
+        let font = NSFont.systemFont(ofSize: 11.0, weight: .semibold)
+        let window = NSWindow(contentRect: appKitFrame,
+                              styleMask: [.borderless],
+                              backing: .buffered,
+                              defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.level = .statusBar
+        window.collectionBehavior = [.canJoinAllSpaces,
+                                     .stationary,
+                                     .fullScreenAuxiliary,
+                                     .ignoresCycle]
+        window.ignoresMouseEvents = false
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
+        window.isReleasedWhenClosed = false
+        window.acceptsMouseMovedEvents = false
+
+        let view = ClaimChipView(frame: NSRect(origin: .zero, size: appKitFrame.size),
+                                 text: "Ask butler",
+                                 font: font)
+        view.autoresizingMask = [.width, .height]
+        view.onClick = { [weak self] in
+            self?.writeClaimClick()
+        }
+        window.contentView = view
+        claimChipWindow = window
+        claimChipView = view
+        window.orderFrontRegardless()
+    }
+
+    private func hideClaimChip() {
+        if let window = claimChipWindow {
+            window.orderOut(nil)
+            window.close()
+        }
+        claimChipWindow = nil
+        claimChipView = nil
+    }
+
+    private func writeClaimClick() {
+        guard claimChipEnabled else {
+            return
+        }
+        let payload = "{\"op\":\"claim_click\"}\n"
+        FileHandle.standardOutput.write(Data(payload.utf8))
     }
 
     // MARK: Pet double
@@ -2284,6 +2616,10 @@ private final class OverlayController {
         activeRing = nil
         hideRings(close: true)
         hideChip()
+        claimChipEnabled = false
+        claimChipTimer?.invalidate()
+        claimChipTimer = nil
+        hideClaimChip()
         petTimer?.invalidate()
         petTimer = nil
         closePetWindow()

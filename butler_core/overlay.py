@@ -9,13 +9,19 @@ Protocol: one JSON line per op on stdin -
   {"op":"ring","box":[x,y,w,h],"label":"...","say":"...","step":3,"total":7}
   {"op":"chip","step":3}
   {"op":"pet","frames_dir":"...","scale":0.33,"pet_enabled":true}
+  {"op":"claim_chip","enabled":true}
   {"op":"launcher"}
   {"op":"done"}
   {"op":"idle"}
   {"op":"quit"}
+
+The companion writes one event line on clickable mini-windows:
+  {"op":"launcher_click"}
+  {"op":"claim_click"}
 """
 import json
 import os
+import queue
 import select
 import shutil
 import subprocess
@@ -224,6 +230,11 @@ class Overlay:
         self.starting = True
         self._io_lock = threading.RLock()
         self._stdout_buf = b""
+        self._inbox = queue.Queue()
+        self._reader_thread = None
+        self._claim_chip_enabled = False
+        # Optional callback for unsolicited companion event lines (chip clicks).
+        self.on_event = None
         _SHARED_OVERLAY = self
 
     def _is_running(self):
@@ -255,9 +266,12 @@ class Overlay:
             if self._is_running():
                 if show_pet:
                     self._send_pet_op()
+                if self._claim_chip_enabled:
+                    self.claim_chip(True)
                 return True, "already running pid %d" % self.proc.pid
             self.proc = None
             self._stdout_buf = b""
+            self._inbox = queue.Queue()
             try:
                 ok, detail = build_if_needed()
                 if not ok:
@@ -271,10 +285,13 @@ class Overlay:
                     bufsize=0,
                 )
                 self.starting = False
+                self._start_reader()
                 # Send the pet once, before any ring can arrive, so the double is
                 # already loaded when the first step is highlighted.
                 if show_pet:
                     self._send_pet_op()
+                if self._claim_chip_enabled:
+                    self.claim_chip(True)
                 return True, "spawned pid %d" % self.proc.pid
             except Exception as exc:  # noqa: BLE001
                 self.proc = None
@@ -288,6 +305,62 @@ class Overlay:
                 self._send(pet_op)
         except Exception:  # noqa: BLE001
             pass
+
+    def claim_chip(self, enabled):
+        """Show/hide the companion's pop-out pet click chip (idempotent)."""
+        self._claim_chip_enabled = bool(enabled)
+        self._send({"op": "claim_chip", "enabled": self._claim_chip_enabled})
+
+    def _start_reader(self):
+        """Read unsolicited events (mini-window clicks) off the companion pipe.
+
+        Requests still go through ``request``; its caller waits on the same
+        inbox, so event lines never get mistaken for an AX response.
+        """
+        proc = self.proc
+        stdout = getattr(proc, "stdout", None)
+        if stdout is None:
+            return
+
+        def _read():
+            while True:
+                try:
+                    raw = stdout.readline()
+                except Exception:  # noqa: BLE001
+                    break
+                if not raw:
+                    break
+                if isinstance(raw, bytes):
+                    text = raw.decode("utf-8", "replace")
+                else:
+                    text = str(raw)
+                text = text.strip()
+                if not text:
+                    continue
+                try:
+                    message = json.loads(text)
+                except Exception:  # noqa: BLE001
+                    continue
+                self._handle_message(message)
+            if self.proc is proc:
+                self.proc = None
+
+        thread = threading.Thread(target=_read, name="butler-overlay-reader", daemon=True)
+        self._reader_thread = thread
+        thread.start()
+
+    def _handle_message(self, message):
+        if not isinstance(message, dict):
+            return
+        if message.get("op") in ("claim_click", "launcher_click"):
+            callback = self.on_event
+            if callable(callback):
+                try:
+                    callback(message)
+                except Exception:  # noqa: BLE001 - a click must never kill the pipe
+                    pass
+            return
+        self._inbox.put(message)
 
     def request(self, op, timeout=5.0):
         """Send one op and return its single JSON response line, or None.
@@ -309,9 +382,23 @@ class Overlay:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     return None
+                if self._reader_thread is not None and self._reader_thread.is_alive():
+                    while True:
+                        try:
+                            self._inbox.get_nowait()
+                        except queue.Empty:
+                            break
                 self._send(op)
                 if not self._is_running():
                     return None
+                if self._reader_thread is not None and self._reader_thread.is_alive():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        return None
+                    try:
+                        return self._inbox.get(timeout=remaining)
+                    except queue.Empty:
+                        return None
                 return self._read_response(remaining)
             except Exception:  # noqa: BLE001
                 return None

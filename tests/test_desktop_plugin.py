@@ -40,6 +40,27 @@ def test_plugin_registers_a_fixed_summon_bar_and_pet_click_toggle() -> None:
     assert "Click the pet to ask the butler" in source
     assert "pet_click_claim" in source
     assert "canvas[aria-label$=\" pet\"]" in source
+    assert "canvas[aria-label=\"pet\"]" in source
+
+
+def test_plugin_has_an_honest_in_window_claim_status_and_popout_bridge() -> None:
+    source = PLUGIN_JS.read_text(encoding="utf-8")
+
+    assert "Armed — click your pet (in-window)" in source
+    assert "No in-window pet — use Cmd+Shift+A" in source
+    assert "petClaimStatusText" in source
+    assert "/summon/claim" in source
+    assert "summon_pending" in source
+    assert "/summon/ack" in source
+    assert "openSummonBar('pet')" in source
+
+
+def test_plugin_surfaces_unroutable_session_and_the_resolved_route() -> None:
+    source = PLUGIN_JS.read_text(encoding="utf-8")
+
+    assert "unroutable_session" in source
+    assert "session not routable through the gateway" in source
+    assert "session_key" in source
 
 
 def test_plugin_uses_the_composer_submit_send_path_with_a_honest_draft_fallback() -> None:

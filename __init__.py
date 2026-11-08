@@ -13,6 +13,7 @@ import os
 from .butler_core import capture as bp_capture
 from .butler_core import doctor as bp_doctor
 from .butler_core import engine as bp_engine
+from .butler_core import paths as bp_paths
 from .butler_core import summon as bp_summon
 
 logger = logging.getLogger("hermes.plugins.butler")
@@ -229,9 +230,14 @@ def register(ctx):
         setup_fn=butler_cli_setup,
         handler_fn=butler_cli_command)
     try:
-        bp_engine.init(ctx.plugin_data_dir())
+        # One host-owned data dir for the engine, dashboard, and desktop
+        # config watcher. Older hosts expose the directory on the context;
+        # current hosts reserve <hermes home>/plugin-data/<plugin>/.
+        data_dir = getattr(ctx, "plugin_data_dir", None)
+        bp_engine.init(data_dir() if callable(data_dir) else bp_paths.plugin_data_dir("butler"))
     except Exception:
-        bp_engine.init(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+        logger.exception("butler engine init failed; using the host plugin-data dir")
+        bp_engine.init(bp_paths.plugin_data_dir("butler"))
     try:
         skill_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "skills", "butler-follow", "SKILL.md")

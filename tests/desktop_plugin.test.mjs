@@ -20,11 +20,15 @@ const INTERNALS = [
   'summonFailureMessage', 'writePetClickClaim', 'setPetClickClaim',
   'startPetClickWatcher', 'stopPetClickWatcher', 'openSummonBar',
   'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar', 'petCanvasNode',
+  'petClaimStatusText', 'syncCompanionClaim',
   'readSummonDestination', 'setSummonDestination', 'getSummonDestination', 'butlerCommandText',
   'openFreshButlerSession', 'openButlerSession'
 ]
 
-function makeDocument({ canvas = null } = {}) {
+function makeDocument({
+  canvas = null,
+  selectors = ['canvas[aria-label$=" pet"]', 'canvas[aria-label="pet"]']
+} = {}) {
   const listeners = []
   const body = {
     children: [],
@@ -43,7 +47,7 @@ function makeDocument({ canvas = null } = {}) {
     body,
     listeners,
     querySelector(selector) {
-      return selector === 'canvas[aria-label$=" pet"]'
+      return selectors.includes(selector)
         ? (typeof canvas === 'function' ? canvas() : canvas)
         : null
     },
@@ -160,9 +164,8 @@ async function loadPlugin({ host, rest, document, storage }) {
     setInterval(fn, ms) { intervals.push({ fn, ms }); return () => {} }
   }
   plugin.register(ctx)
-  // Let register()'s config sync settle.
-  await Promise.resolve()
-  await Promise.resolve()
+  // Let register()'s config sync (GET /config then POST /summon/claim) settle.
+  for (let i = 0; i < 8; i += 1) await Promise.resolve()
 
   return {
     plugin,
@@ -612,6 +615,155 @@ test('capture-phase pet click summons only when the toggle is on', async () => {
   assert.equal(document.listeners.length, 0, 'disabling removes the capture listener')
   assert.equal(document.body.children.length, 0, 'disabling removes the follow overlay')
   unsubscribe()
+  env.dispose()
+})
+
+test('config loaded true arms the in-window receiver without a manual toggle', async () => {
+  // Reproduces the runtime condition: plugin register reads the gateway
+  // /config (which now round-trips the engine's file) and the toggle is on.
+  const rect = { left: 40, top: 60, width: 80, height: 90, right: 120, bottom: 150 }
+  const canvas = { getBoundingClientRect: () => rect }
+  const document = makeDocument({ canvas })
+  const calls = []
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async (requestPath, opts) => {
+      calls.push({ path: requestPath, opts })
+      if (requestPath === '/config') return { summon: { pet_click_claim: true } }
+      if (requestPath === '/summon/claim') return { ok: true, enabled: true, running: true }
+      return {}
+    },
+    document
+  })
+
+  const listener = document.listeners.find(entry => entry.type === 'pointerdown')
+  assert.ok(listener, 'register() armed the capture listener from the config file')
+  const events = []
+  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
+  listener.listener({ button: 0, clientX: 80, clientY: 100 })
+  assert.equal(events.at(-1).open, true)
+  assert.equal(events.at(-1).origin, 'pet')
+  const claim = calls.find(call => call.path === '/summon/claim' && call.opts?.method === 'POST')
+  assert.ok(claim, 'the companion chip is synced from the same config value')
+  assert.equal(claim.opts.body.enabled, true)
+  unsubscribe()
+  env.dispose()
+})
+
+test('the pet locator accepts the core bare aria-label="pet" spelling', async () => {
+  const rect = { left: 10, top: 10, width: 32, height: 32, right: 42, bottom: 42 }
+  const canvas = { getBoundingClientRect: () => rect }
+  const document = makeDocument({ canvas, selectors: ['canvas[aria-label="pet"]'] })
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async requestPath => requestPath === '/config'
+      ? { summon: { pet_click_claim: true } }
+      : { ok: true, enabled: true },
+    document
+  })
+
+  assert.equal(env.api.petCanvasNode(), canvas)
+  env.api.setPetClickClaim(true)
+  const listener = document.listeners.find(entry => entry.type === 'pointerdown')
+  const events = []
+  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
+  listener.listener({ button: 0, clientX: 20, clientY: 20 })
+  assert.equal(events.at(-1).open, true)
+  assert.equal(events.at(-1).origin, 'pet')
+  unsubscribe()
+  env.dispose()
+})
+
+test('the pane claim status is honest about armed / no in-window pet', async () => {
+  const rect = { left: 10, top: 10, width: 32, height: 32, right: 42, bottom: 42 }
+  const withCanvas = await loadPlugin({
+    host: defaultHost(),
+    rest: async requestPath => requestPath === '/config'
+      ? { summon: { pet_click_claim: true } }
+      : { ok: true, enabled: true },
+    document: makeDocument({ canvas: { getBoundingClientRect: () => rect } })
+  })
+  assert.equal(withCanvas.api.petClaimStatusText(), 'Armed — click your pet (in-window)')
+  withCanvas.api.setPetClickClaim(false)
+  assert.equal(withCanvas.api.petClaimStatusText(), 'Off — use Cmd+Shift+A')
+  withCanvas.dispose()
+
+  const withoutCanvas = await loadPlugin({
+    host: defaultHost(),
+    rest: async requestPath => requestPath === '/config'
+      ? { summon: { pet_click_claim: true } }
+      : { ok: true, enabled: true },
+    document: makeDocument({ canvas: null })
+  })
+  assert.equal(withoutCanvas.api.petClaimStatusText(),
+    'No in-window pet — use Cmd+Shift+A')
+  withoutCanvas.dispose()
+})
+
+test('unroutable session surfaces the gateway detail and still runs the /butler fallback',
+  async () => {
+    const submitted = []
+    const notifications = []
+    const host = defaultHost({
+      request: async method => method === 'session.list'
+        ? [{ id: 's1', title: 'Butler', created_at: 1 }]
+        : [],
+      notify(notification) { notifications.push(notification) },
+      composer: { submit: (id, text) => { submitted.push({ id, text }); return true } }
+    })
+    const env = await loadPlugin({
+      host,
+      rest: async (requestPath, opts) => {
+        if (requestPath === '/config') return { summon: { pet_click_claim: false } }
+        if (requestPath === '/summon/claim') return { ok: true, enabled: false }
+        if (requestPath === '/summon/send') {
+          return {
+            ok: false,
+            reason: 'unroutable_session',
+            detail: 'no gateway session route for s1'
+          }
+        }
+        return {}
+      },
+      document: makeDocument()
+    })
+
+    const outcome = await env.api.summonFromBar('make a guide')
+
+    assert.equal(outcome.result.ok, true)
+    assert.equal(outcome.result.fallback, true)
+    assert.equal(outcome.result.injection_reason, 'unroutable_session')
+    assert.deepEqual(submitted, [{ id: 's1', text: '/butler make a guide' }])
+    const toast = notifications.find(notification => notification.kind === 'warning')
+    assert.ok(toast)
+    assert.match(toast.message, /session not routable through the gateway/)
+    assert.match(toast.message, /no gateway session route for s1/)
+    env.dispose()
+  })
+
+test('a successful injection keeps the gateway routing key for debugging', async () => {
+  const host = defaultHost({
+    request: async method => method === 'session.list'
+      ? [{ id: 'local-abc', title: 'Butler', created_at: 1 }]
+      : []
+  })
+  const env = await loadPlugin({
+    host,
+    rest: async (requestPath, opts) => {
+      if (requestPath === '/config') return { summon: { pet_click_claim: false } }
+      if (requestPath === '/summon/claim') return { ok: true, enabled: false }
+      if (requestPath === '/summon/send') {
+        return { ok: true, session: opts.body.session_id, session_key: 'agent:main:local:dm:local-abc' }
+      }
+      return {}
+    },
+    document: makeDocument()
+  })
+
+  const result = await env.api.sendSummonInjection('local-abc', 'fix it')
+
+  assert.equal(result.ok, true)
+  assert.equal(result.session_key, 'agent:main:local:dm:local-abc')
   env.dispose()
 })
 

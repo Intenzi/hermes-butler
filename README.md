@@ -50,10 +50,17 @@ a plain message in any chat without the slash is still ordinary conversation.
   across openings; the success toast names it.
 - **Click the pet** — opt-in only, off by default. Turn it on with the
   "Click the pet to ask the butler" switch on the `/butler` pane. The switch
-  writes `summon.pet_click_claim` in the plugin's
-  `plugin-data/butler/config.json`; the engine reads it fresh, so it hot-reloads
-  without a gateway restart. The receiver only acts on the in-window pet canvas;
-  a popped-out pet window cannot receive the click, so use ⌘⇧A there.
+  writes `summon.pet_click_claim` in the plugin's one canonical
+  `plugin-data/butler/config.json`; the engine, dashboard, and desktop watcher
+  all read that same file fresh, so it hot-reloads without a gateway restart.
+  The pane chip says **Armed — click your pet (in-window)** only when the
+  in-window pet canvas is present; otherwise it says **No in-window pet — use
+  Cmd+Shift+A**. When the pet is popped out into its own OS window, the bundled
+  companion draws a small **Ask butler** chip next to it; clicking that chip
+  opens the same bar and destination picker as the shortcut. The chip is found
+  as a small, near-square, title-less on-screen Hermes window; if a future
+  Hermes build names or shapes that panel differently, the chip stays hidden
+  and the shortcut remains the fallback.
 - **Existing surfaces** — the status-bar chip, sidebar page, and palette are
   unchanged.
 
@@ -114,15 +121,18 @@ Plain statements about what this plugin does when it runs.
 1. The bundled Swift overlay source ships inside the plugin at
    `butler_core/services/ButlerOverlay` and is compiled on first use with
    `swiftc`. It is local source, not a fetched binary.
-2. Overlay rendering runs in a spawned local companion process, one per guide,
-   driven by a JSON-over-stdin protocol. It exits with the guide.
+2. Overlay rendering runs in a spawned local companion process, driven by a
+   JSON-over-stdin protocol. The same shared process serves guides, captures,
+   the summon double, and the opt-in pop-out claim chip; it exits when idle or
+   when the host closes its pipe.
 3. The plugin reads the foreground app via the Accessibility framework and,
    where needed, Apple Vision OCR. It reads element text and geometry boxes
    only. No screenshots are stored or transmitted. Element text goes to the
    chat's own model provider, same as any other tool output in the session.
-4. Guide plans, live state, and transcripts are small JSON files under
-   `plugin-data/butler` (`guides/*.json`, `state.json`); nothing else is
-   written outside the plugin's own data directory.
+4. Guide plans, live state, the summon config, and transcripts are small JSON
+   files under `plugin-data/butler` (`guides/*.json`, `state.json`,
+   `config.json`); nothing else is written outside the plugin's own data
+   directory. There is no second runtime config path in the plugin install dir.
 5. No network destination other than the model provider. No telemetry, no
    auto-updater, no phoning home.
 6. Guides fail closed under unattended runs. From cron or a headless context,
@@ -132,16 +142,19 @@ Plain statements about what this plugin does when it runs.
    state, and never types or clicks for the user. It is guide-only by design.
 8. The opt-in pet-click receiver is a narrow reach-in into the Hermes desktop
    window, not into any app or the screen. When enabled, it reads the position
-   and size of the petdex pet canvas (`canvas[aria-label$=" pet"]`), places a
-   transparent fixed overlay over it that follows the canvas each frame, and
-   installs document-level capture-phase `pointerdown` listeners to notice a
-   click on that canvas. It never paints into the canvas, never edits Hermes
-   core files, and never types or clicks. It is **off by default**; turning the
-   `/butler` switch off removes the overlay and listeners immediately. If a
-   Hermes desktop update changes the canvas markup or label, the receiver
-   quietly stops matching (no crash, no console spam) until the selector is
+   and size of the petdex pet canvas (`canvas[aria-label$=" pet"]`, plus the
+   core's bare `canvas[aria-label="pet"]` spelling), places a transparent fixed
+   overlay over it that follows the canvas each frame, and installs
+   document-level capture-phase `pointerdown` listeners to notice a click on
+   that canvas. The pop-out chip rides the same single companion subject and
+   is a separate mini window placed outside the pet's sprite bounds. It never
+   paints into the canvas, never edits Hermes core files, and never types or
+   clicks. It is **off by default**; turning the `/butler` switch off removes
+   the overlay, listeners, and chip immediately. If a Hermes desktop update
+   changes the canvas markup or the pop-out window shape, the matching surface
+   quietly goes dark (no crash, no console spam) until the selector is
    re-glued. This receiver needs no Accessibility, Screen Recording, or other
-   TCC grant.
+   TCC grant beyond the companion that already exists for capture.
 
 ## Platform
 

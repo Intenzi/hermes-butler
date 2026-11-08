@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -182,6 +183,65 @@ def test_done_sends_the_farewell_op() -> None:
 
     lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
     assert [json.loads(line) for line in lines] == [{"op": "done"}]
+
+
+def test_claim_chip_op_is_sent_when_armed() -> None:
+    proc = _FakeProc()
+    controller = overlay.Overlay()
+    controller.proc = proc
+
+    controller.claim_chip(True)
+    controller.claim_chip(False)
+
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    assert [json.loads(line) for line in lines] == [
+        {"op": "claim_chip", "enabled": True},
+        {"op": "claim_chip", "enabled": False},
+    ]
+
+
+def test_claim_click_event_reaches_the_engine_callback() -> None:
+    controller = overlay.Overlay()
+    seen = []
+    controller.on_event = seen.append
+
+    controller._handle_message({"op": "claim_click"})
+
+    assert seen == [{"op": "claim_click"}]
+
+
+def test_reader_dispatches_click_events_and_queues_ax_responses() -> None:
+    read_fd, write_fd = os.pipe()
+    proc = _FakeProc()
+    proc.stdout = os.fdopen(read_fd, "rb", buffering=0)
+    controller = overlay.Overlay()
+    controller.proc = proc
+    seen = []
+    controller.on_event = seen.append
+    try:
+        controller._start_reader()
+        os.write(write_fd, b'{"op":"claim_click"}\n')
+        os.write(write_fd, b'{"trusted": true, "count": 0}\n')
+        reply = controller._inbox.get(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while not seen and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        os.close(write_fd)
+        proc.stdout.close()
+
+    assert seen == [{"op": "claim_click"}]
+    assert reply == {"trusted": True, "count": 0}
+
+
+def test_companion_source_has_the_popout_claim_chip_contract() -> None:
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert 'case "claim_chip"' in source
+    assert '{"op":"claim_click"}' in source
+    assert "CGWindowListCopyWindowInfo" in source
+    assert "hermesPetWindowFrame" in source
+    assert "!frame.intersects(pet)" in source
 
 
 def test_start_sends_no_pet_op_when_no_pets(tmp_path: Path, monkeypatch) -> None:

@@ -29,6 +29,8 @@ _lock = threading.Lock()
 _session = None           # latest guide dict
 _thread = None
 _stop_flag = False
+_summon_pending = None    # companion chip click waiting for the desktop bar
+_claim_chip_enabled = False
 
 
 def init(data_dir):
@@ -37,6 +39,9 @@ def init(data_dir):
         raise ValueError("butler engine: init() requires a data_dir")
     DATA_DIR = data_dir
     os.makedirs(os.path.join(str(data_dir), "guides"), exist_ok=True)
+    # The companion is a long-lived shared transport; route its click events
+    # back into the same state snapshot the desktop already polls.
+    _OVERLAY.on_event = _on_overlay_event
 
 
 def _guides_dir():
@@ -144,12 +149,14 @@ def _write_state():
     if not DATA_DIR:
         return
     snap = {}
+    if _summon_pending is not None:
+        snap["summon_pending"] = dict(_summon_pending)
     if _session is not None:
-        snap = {
+        snap.update({
             "guide": _session,
             "overlay": _session.get("overlay", "unavailable"),
             "generated_at": time.time(),
-        }
+        })
     path = os.path.join(str(DATA_DIR), "state.json")
     tmp = path + ".tmp"
     try:
@@ -158,6 +165,55 @@ def _write_state():
         os.replace(tmp, path)
     except Exception:
         pass
+
+
+def _on_overlay_event(event):
+    """A companion mini-window was clicked: queue a summon for the desktop."""
+    global _summon_pending
+    if not isinstance(event, dict) or event.get("op") != "claim_click":
+        return
+    _summon_pending = {
+        "origin": "pet",
+        "id": uuid.uuid4().hex[:8],
+        "at": time.time(),
+    }
+    _write_state()
+
+
+def summon_pending():
+    """The pending companion-click summon (or None), for tests/diagnostics."""
+    return dict(_summon_pending) if _summon_pending is not None else None
+
+
+def consume_summon_pending(pending_id=None):
+    """Clear the pending summon after the desktop opened its bar (idempotent)."""
+    global _summon_pending
+    if _summon_pending is None:
+        return False
+    if pending_id and _summon_pending.get("id") != pending_id:
+        return False
+    _summon_pending = None
+    _write_state()
+    return True
+
+
+def set_claim_chip(enabled):
+    """Arm/disarm the companion's pop-out pet click chip.
+
+    Starts the shared companion (without a pet double) when the claim is armed
+    and no guide/summon owns it yet. A failed build/degrade is reported, never
+    raised: the in-app listener and the shortcut remain usable.
+    """
+    global _claim_chip_enabled
+    _claim_chip_enabled = bool(enabled)
+    if not _claim_chip_enabled:
+        _OVERLAY.claim_chip(False)
+        return {"enabled": False, "running": _OVERLAY.is_running()}
+    ok, detail = _OVERLAY.start(show_pet=False)
+    if not ok:
+        return {"enabled": True, "running": False, "detail": str(detail)}
+    _OVERLAY.claim_chip(True)
+    return {"enabled": True, "running": True, "detail": str(detail)}
 
 
 def _save_session():
