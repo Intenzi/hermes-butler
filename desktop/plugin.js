@@ -1104,7 +1104,7 @@ export default {
         data: {
           id: 'butler.summon',
           label: 'Ask the butler',
-          category: 'Butler',
+          category: 'view',
           defaults: ['mod+shift+a'],
           run: () => openSummonBar('shortcut')
         }
