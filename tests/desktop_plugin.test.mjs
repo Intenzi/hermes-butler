@@ -20,9 +20,10 @@ const INTERNALS = [
   'summonFailureMessage', 'writePetClickClaim', 'setPetClickClaim',
   'startPetClickWatcher', 'stopPetClickWatcher', 'openSummonBar',
   'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar', 'petCanvasNode',
-  'petClaimStatusText', 'syncCompanionClaim',
+  'petClaimStatusText', 'syncCompanionClaim', 'petStatusRowText', 'summonBarState',
   'readSummonDestination', 'setSummonDestination', 'getSummonDestination', 'butlerCommandText',
-  'openFreshButlerSession', 'openButlerSession'
+  'openFreshButlerSession', 'openButlerSession', 'createButlerSession', 'listButlerSessions',
+  'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey', 'dismissSummonBar'
 ]
 
 function makeDocument({
@@ -800,18 +801,23 @@ test('summon bar injects into the existing destination and shows the success toa
     && notification.message === 'Summoned → Butler chat (existing)'))
 })
 
-test('new destination creates a fresh id, waits for focus, then injects into it only', async () => {
+test('new destination mints an UNTITLED fresh id, retitles, and posts that exact id', async () => {
   const clock = makeClock()
-  const requested = []
+  const calls = []
   const opened = []
   const injected = []
   const submitted = []
   const notifications = []
   const host = defaultHost({
+    state: { profile: { get: () => 'default' } },
     request: async (method, params) => {
-      requested.push(method)
-      if (method === 'session.list') return [{ id: 'oldest', title: 'Butler', created_at: 1 }]
-      if (method === 'session.create') return { session_id: 'runtime-new', stored_session_id: 'stored-new' }
+      calls.push({ method, params: { ...(params || {}) } })
+      if (method === 'session.list') {
+        return [{ id: 'oldest', session_id: 'oldest', title: 'Butler', created_at: 1 }]
+      }
+      if (method === 'session.create') {
+        return { session_id: 'runtime-new', stored_session_id: 'stored-new' }
+      }
       if (method === 'session.title') return {}
       throw new Error(`unexpected request ${method}: ${JSON.stringify(params)}`)
     },
@@ -827,7 +833,11 @@ test('new destination creates a fresh id, waits for focus, then injects into it 
     rest: async (requestPath, opts) => {
       if (requestPath === '/summon/send') {
         injected.push({ text: opts.body.text, session_id: opts.body.session_id })
-        return { ok: true, session: opts.body.session_id }
+        return {
+          ok: true,
+          session: opts.body.session_id,
+          session_key: 'agent:main:local:dm:stored-new'
+        }
       }
       return {}
     },
@@ -843,14 +853,63 @@ test('new destination creates a fresh id, waits for focus, then injects into it 
   assert.equal(outcome.result.ok, true)
   assert.equal(outcome.result.destination, 'new')
   assert.equal(outcome.result.send, 'inject')
-  assert.ok(requested.includes('session.create'))
-  assert.ok(!requested.includes('session.activate'), 'never falls back to focusing the oldest')
+  assert.equal(outcome.result.session_key, 'agent:main:local:dm:stored-new')
+
+  // Exact RPC params, in order: list -> untitled create -> free old title ->
+  // set the fresh title. No title rides on session.create.
+  assert.deepEqual(calls.map(call => call.method), [
+    'session.list', 'session.create', 'session.title', 'session.title'
+  ])
+  assert.deepEqual(calls[0].params, { limit: 200 })
+  assert.deepEqual(calls[1].params, {}, 'session.create must be UNTITLED')
+  assert.deepEqual(calls[2].params, { session_id: 'oldest', title: 'Butler (previous)' })
+  assert.deepEqual(calls[3].params, { session_id: 'runtime-new', title: 'Butler' })
+
+  // The fresh id is the key, not the title: it differs from the oldest chat
+  // and every subsequent action uses its stored value.
+  assert.notEqual(outcome.result.session, 'oldest')
+  assert.equal(outcome.result.session, 'stored-new')
   assert.deepEqual(opened, ['stored-new'])
   assert.deepEqual(injected, [{ text: 'fresh start', session_id: 'stored-new' }])
   assert.ok(!injected.some(body => body.session_id === 'oldest'))
   assert.deepEqual(submitted, [])
   assert.ok(notifications.some(notification => notification.kind === 'success'
     && notification.message === 'Summoned → fresh Butler session'))
+  env.dispose()
+})
+
+test('fresh flow only lists sessions once, before the untitled create', async () => {
+  const clock = makeClock()
+  const calls = []
+  const host = defaultHost({
+    state: { profile: { get: () => 'better-butler' } },
+    request: async (method, params) => {
+      calls.push({ method, params })
+      if (method === 'session.list') return []
+      if (method === 'session.create') return { session_id: 'runtime-x', stored_session_id: 'stored-x' }
+      if (method === 'session.title') return {}
+      throw new Error(`unexpected request ${method}`)
+    },
+    openSession: async () => true
+  })
+  const env = await loadPlugin({
+    host,
+    rest: async requestPath => requestPath === '/summon/send'
+      ? { ok: true, session: 'stored-x', session_key: 'agent:better-butler:local:dm:stored-x' }
+      : {},
+    document: makeDocument()
+  })
+
+  const outcome = await env.api.summonFromBar('one list only', {
+    destination: 'new', now: clock.now, wait: clock.wait
+  })
+
+  assert.equal(outcome.result.ok, true)
+  assert.equal(calls.filter(call => call.method === 'session.list').length, 1,
+    'the fresh flow lists once to find old titles; the fallback never re-reads')
+  assert.ok(!calls.some(call => call.method === 'session.create' && 'title' in (call.params || {})),
+    'no title is sent to session.create')
+  env.dispose()
 })
 
 test('fresh creation failure surfaces the true reason and never reuses the oldest', async () => {
@@ -912,7 +971,7 @@ test('fresh-denied fallback stays on the new id and never re-reads the oldest', 
   const host = defaultHost({
     request: async (method, params) => {
       if (method === 'session.list') {
-        listCalls.push(params)
+        listCalls.push({ ...(params || {}) })
         return [{ id: 'oldest', title: 'Butler', created_at: 1 }]
       }
       if (method === 'session.create') return { session_id: 'runtime-new', stored_session_id: 'stored-new' }
@@ -941,11 +1000,241 @@ test('fresh-denied fallback stays on the new id and never re-reads the oldest', 
   assert.equal(outcome.result.fallback, true)
   assert.equal(outcome.result.session, 'stored-new')
   assert.deepEqual(submitted, [{ id: 'stored-new', text: '/butler fresh fallback' }])
-  assert.deepEqual(listCalls, [], 'a fresh fallback must not re-derive the oldest chat')
+  assert.deepEqual(listCalls, [{ limit: 200 }],
+    'one title scan at create; the fresh fallback itself never re-derives the oldest chat')
   assert.deepEqual(opened, ['stored-new'])
   const toast = notifications.find(notification => notification.kind === 'warning')
   assert.ok(toast)
   assert.match(toast.message, /could not host the full conversation/)
+})
+
+test('a second fresh chat frees every prior Butler title before claiming it', async () => {
+  const titleCalls = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      if (method === 'session.create') return { session_id: 'runtime-3', stored_session_id: 'stored-3' }
+      if (method === 'session.title') { titleCalls.push({ ...params }); return {} }
+      throw new Error(`unexpected request ${method}`)
+    },
+    openSession: async () => true
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const created = await env.api.createButlerSession([
+    { id: 'old-b', title: 'Butler', created_at: 2 },
+    { id: 'old-a', title: 'Butler', created_at: 1 }
+  ])
+
+  assert.equal(created.ok, true)
+  assert.equal(created.target, 'stored-3')
+  // Oldest first, then the fresh id last: the new chat owns the clean title.
+  assert.deepEqual(titleCalls, [
+    { session_id: 'old-a', title: 'Butler (previous)' },
+    { session_id: 'old-b', title: 'Butler (previous 2)' },
+    { session_id: 'runtime-3', title: 'Butler' }
+  ])
+  env.dispose()
+})
+
+test('a revision-fenced title rename primes quietly with a resume and retries', async () => {
+  const calls = []
+  let titleAttempts = 0
+  const host = defaultHost({
+    request: async (method, params) => {
+      calls.push({ method, params: { ...(params || {}) } })
+      if (method === 'session.create') {
+        return { session_id: 'runtime-9', stored_session_id: 'stored-9' }
+      }
+      if (method === 'session.resume') return { session_id: 'oldest', revision: 7, messages: [] }
+      if (method === 'session.title') {
+        titleAttempts += 1
+        if (titleAttempts === 1) {
+          throw new Error('Session revision unavailable; reopen the session before editing metadata')
+        }
+        return {}
+      }
+      throw new Error(`unexpected request ${method}`)
+    },
+    openSession: async () => true
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const created = await env.api.createButlerSession([
+    { id: 'oldest', title: 'Butler', created_at: 1 }
+  ])
+
+  assert.equal(created.ok, true)
+  assert.deepEqual(calls.map(call => call.method), [
+    'session.create', 'session.title', 'session.resume', 'session.title', 'session.title'
+  ])
+  assert.deepEqual(calls[1].params, { session_id: 'oldest', title: 'Butler (previous)' })
+  assert.deepEqual(calls[2].params, { session_id: 'oldest', omit_messages: true })
+  assert.deepEqual(calls[3].params, { session_id: 'oldest', title: 'Butler (previous)' })
+  assert.deepEqual(calls[4].params, { session_id: 'runtime-9', title: 'Butler' })
+  env.dispose()
+})
+
+test('a create that reuses the oldest id is refused, never sent', async () => {
+  const titleCalls = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      if (method === 'session.create') return { session_id: 'oldest', stored_session_id: 'oldest' }
+      if (method === 'session.title') { titleCalls.push({ ...params }); return {} }
+      throw new Error(`unexpected request ${method}`)
+    },
+    openSession: async () => true
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const created = await env.api.createButlerSession([
+    { id: 'oldest', title: 'Butler', created_at: 1 }
+  ])
+
+  assert.equal(created.ok, false)
+  assert.equal(created.reason, 'session_create_reused')
+  assert.deepEqual(titleCalls, [], 'a reused id must not be retitled')
+  env.dispose()
+})
+
+test('fresh send failure toast names the wrong gateway session key', async () => {
+  const clock = makeClock()
+  const notifications = []
+  const host = defaultHost({
+    state: { profile: { get: () => 'default' } },
+    request: async method => {
+      if (method === 'session.list') return [{ id: 'oldest', title: 'Butler', created_at: 1 }]
+      if (method === 'session.create') return { session_id: 'runtime-new', stored_session_id: 'stored-new' }
+      if (method === 'session.title') return {}
+      throw new Error(`unexpected request ${method}`)
+    },
+    openSession: async () => true,
+    notify(notification) { notifications.push(notification) }
+  })
+  const env = await loadPlugin({
+    host,
+    rest: async requestPath => requestPath === '/summon/send'
+      ? { ok: true, session: 'oldest', session_key: 'agent:main:local:dm:oldest' }
+      : {},
+    document: makeDocument()
+  })
+
+  const outcome = await env.api.summonFromBar('fresh start', {
+    destination: 'new', now: clock.now, wait: clock.wait
+  })
+
+  assert.equal(outcome.result.ok, false)
+  assert.equal(outcome.result.reason, 'session_key_mismatch')
+  assert.equal(outcome.result.session_key, 'agent:main:local:dm:oldest')
+  assert.equal(outcome.result.expected_session_key, 'agent:main:local:dm:stored-new')
+  assert.equal(outcome.clearText, false, 'the typed text stays for a retry')
+  assert.equal(outcome.dismiss, false)
+  const toast = notifications.find(notification => notification.kind === 'error')
+  assert.ok(toast)
+  assert.match(toast.message, /wrong session/)
+  assert.match(toast.message, /agent:main:local:dm:oldest/)
+  assert.match(toast.message, /agent:main:local:dm:stored-new/)
+  env.dispose()
+})
+
+test('session key namespaces follow the gateway default-profile rule', async () => {
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument()
+  })
+
+  assert.equal(env.api.sessionKeyNamespace(null), 'main')
+  assert.equal(env.api.sessionKeyNamespace('default'), 'main')
+  assert.equal(env.api.sessionKeyNamespace('main'), 'main~')
+  assert.equal(env.api.sessionKeyNamespace('better-butler'), 'better-butler')
+  assert.equal(env.api.expectedSummonSessionKey('default', 'local-abc'),
+    'agent:main:local:dm:local-abc')
+  assert.equal(env.api.expectedSummonSessionKey('work', 'local-def'),
+    'agent:work:local:dm:local-def')
+  env.dispose()
+})
+
+test('the pane status row always names claim and in-app pet, and flashes once', async () => {
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument()
+  })
+
+  assert.equal(env.api.petStatusRowText({ claim: false, petFound: false }),
+    'claim: off · pet (in-app): not found')
+  assert.equal(env.api.petStatusRowText({ claim: true, petFound: false }),
+    'claim: on · pet (in-app): not found')
+  assert.equal(env.api.petStatusRowText({ claim: false, petFound: true }),
+    'claim: off · pet (in-app): found')
+  assert.equal(env.api.petStatusRowText({ claim: true, petFound: true }),
+    'claim: on · pet (in-app): found')
+  assert.equal(env.api.petStatusRowText({ claim: true, petFound: true, flash: true }),
+    'claim: on · pet (in-app): found · → bar opened')
+  env.dispose()
+})
+
+test('a pet-origin open publishes a new click sequence; dismiss and shortcut do not', async () => {
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument()
+  })
+  const states = []
+  const unsubscribe = env.api.subscribeSummonBar(state => states.push(state))
+  const start = states.at(-1).petClickSeq
+
+  env.api.openSummonBar('pet')
+  assert.equal(states.at(-1).open, true)
+  assert.equal(states.at(-1).origin, 'pet')
+  assert.equal(states.at(-1).petClickSeq, start + 1, 'a pet click bumps the flash sequence')
+
+  env.api.dismissSummonBar()
+  assert.equal(states.at(-1).open, false)
+  assert.equal(states.at(-1).petClickSeq, start + 1, 'dismiss is not a click')
+
+  env.api.openSummonBar('shortcut')
+  assert.equal(states.at(-1).petClickSeq, start + 1, 'the shortcut is not a pet click')
+
+  unsubscribe()
+  env.dispose()
+})
+
+test('a click while the claim is off never opens the bar', async () => {
+  const rect = { left: 40, top: 60, width: 80, height: 90, right: 120, bottom: 150 }
+  const canvas = { getBoundingClientRect: () => rect }
+  const document = makeDocument({ canvas })
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async () => ({ summon: { pet_click_claim: false } }),
+    document
+  })
+  const events = []
+  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
+
+  // A watcher can be alive before the authoritative config poll turns it on.
+  env.api.startPetClickWatcher()
+  const listener = document.listeners.find(entry => entry.type === 'pointerdown').listener
+  listener({ button: 0, clientX: 80, clientY: 100 })
+  assert.equal(events.at(-1).open, false, 'claim off ignores the pet click')
+
+  env.api.setPetClickClaim(true)
+  listener({ button: 0, clientX: 80, clientY: 100 })
+  assert.equal(events.at(-1).open, true, 'claim on opens the bar')
+  assert.equal(events.at(-1).origin, 'pet')
+
+  unsubscribe()
+  env.dispose()
+})
+
+test('the in-app pet readout re-queries the canvas instead of trusting a stale flag', async () => {
+  let canvas = null
+  const document = makeDocument({ canvas: () => canvas })
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async () => ({ summon: { pet_click_claim: true } }),
+    document
+  })
+
+  assert.equal(env.api.petClaimStatusText(), 'No in-window pet — use Cmd+Shift+A')
+  canvas = { getBoundingClientRect: () => ({ left: 1, top: 1, width: 8, height: 8, right: 9, bottom: 9 }) }
+  assert.equal(env.api.petClaimStatusText(), 'Armed — click your pet (in-window)',
+    'the status query sees a canvas that appeared after register')
+  env.dispose()
 })
 
 test('destination choice persists across plugin loads in localStorage', async () => {

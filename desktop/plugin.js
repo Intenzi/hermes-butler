@@ -48,6 +48,12 @@ const CONFIG_REFRESH_MS = 5000
 // we never paint into it and never edit Hermes core to add a hook. The bare
 // "pet" form is what the core emits when the pet has no displayName.
 const PET_CANVAS_SELECTORS = ['canvas[aria-label$=" pet"]', 'canvas[aria-label="pet"]']
+const PET_STATUS_REFRESH_MS = 2000
+// The click-flash is a confirmation, not a readout: keep it brief.
+const SUMMON_FLASH_MS = 1500
+// A fresh session frees the shared display title by renaming the prior chat.
+// Identity is the id; the sentence after it is only how the chat reads.
+const BUTLER_PREVIOUS_TITLE = 'Butler (previous)'
 const SUMMON_DESTINATION_KEY = 'butler.summon.destination'
 const SUMMON_EXISTING = 'existing'
 const SUMMON_NEW = 'new'
@@ -70,6 +76,8 @@ let petLastTick = null
 // keybind and the opt-in pet-click listener just publish "open".
 let summonOpen = false
 let summonOrigin = 'shortcut'
+// Increments on every pet-origin open; the pane row flashes when it changes.
+let petClickSeq = 0
 const summonListeners = new Set()
 let petClickClaim = false
 let petClickWatcher = null
@@ -282,6 +290,66 @@ function sessionTargetId(row) {
     || row.id || row.session_id))
 }
 
+/** Profile the live gateway is routed to, as the gateway names it in a key. */
+function hostProfileName() {
+  try {
+    const state = host && host.state
+    for (const atom of [state && state.focusedSessionProfile, state && state.profile]) {
+      if (atom && typeof atom.get === 'function') {
+        const value = asText(atom.get())
+        if (value) return value
+      }
+    }
+  } catch (err) {
+    // An older host without host.state simply skips key verification.
+  }
+  return null
+}
+
+/** `agent:<ns>` uses `main` for the default profile and `main~` for a literal main. */
+function sessionKeyNamespace(profile) {
+  const name = asText(profile)
+  if (!name || name === 'default') return 'main'
+  return name === 'main' ? 'main~' : name
+}
+
+/** The key the gateway must report for a local DM routed to this exact session. */
+function expectedSummonSessionKey(profile, sessionId) {
+  const id = asText(sessionId)
+  if (!id) return null
+  return `agent:${sessionKeyNamespace(profile)}:local:dm:${id}`
+}
+
+/** A collision rename that keeps the sentence readable and unique per old id. */
+function previousButlerTitle(index = 0) {
+  if (index <= 0) return BUTLER_PREVIOUS_TITLE
+  return `${BUTLER_PREVIOUS_TITLE.slice(0, -1)} ${index + 1})`
+}
+
+/**
+ * Set a display title, tolerating the canonical gateway's revision fence.
+ * Metadata edits travel as `session.mutate` and need a revision the renderer
+ * learns from a resume snapshot. A quiet resume (no navigation, no messages)
+ * primes it for a chat that is not on screen; it is only attempted on failure.
+ */
+async function renameButlerTitle(sessionId, title) {
+  const id = asText(sessionId)
+  if (!id || !host || typeof host.request !== 'function') return false
+  try {
+    await host.request('session.title', { session_id: id, title })
+    return true
+  } catch (err) {
+    // Fall through to a quiet revision prime.
+  }
+  try {
+    await host.request('session.resume', { session_id: id, omit_messages: true })
+    await host.request('session.title', { session_id: id, title })
+    return true
+  } catch (err) {
+    return false
+  }
+}
+
 /** Every id a live session row might answer to (stored and runtime). */
 function rowTargetIds(row) {
   return uniqueIds(
@@ -373,13 +441,22 @@ async function focusSession(row) {
   }
 }
 
-async function createButlerSession() {
+/**
+ * Mint a genuinely new chat, then label it.
+ *
+ * `session.create` with a `title` is title-as-identity on the gateway: it
+ * resolves and returns the EXISTING chat holding that title instead of minting
+ * one. That is correct for a forever-chat, wrong for "New session". So create
+ * UNTITLED (the id is fresh), free the display title from the old chats, and
+ * only then set 'Butler' on the new id. Titles are labels; ids route the send.
+ */
+async function createButlerSession(previousSessions = []) {
   if (!host || typeof host.request !== 'function') {
     return launcherState(false, 'session_create_unavailable')
   }
   let created = null
   try {
-    created = await host.request('session.create', { title: BUTLER_TITLE })
+    created = await host.request('session.create', {})
   } catch (err) {
     return launcherState(false, 'session_create_failed', err)
   }
@@ -389,14 +466,26 @@ async function createButlerSession() {
     return launcherState(false, 'session_create_failed',
       new Error('session.create returned no session id'))
   }
-  if (runtimeId) {
-    try {
-      await host.request('session.title', { session_id: runtimeId, title: BUTLER_TITLE })
-    } catch (err) {
-      // The create-time title is enough on builds without eager titling.
-    }
-  }
   const target = storedId || runtimeId
+  const previous = asArray(previousSessions)
+    .slice()
+    .sort((a, b) => sessionStartedAt(a) - sessionStartedAt(b))
+  if (previous.some(row => sessionTargetId(row) === target)) {
+    // Defensive: an untitled create must never answer with a titled chat.
+    return launcherState(false, 'session_create_reused')
+  }
+  // Free 'Butler' from every prior titled chat before claiming it. A failed
+  // rename is not a send failure: the fresh id still owns the route.
+  for (let index = 0; index < previous.length; index += 1) {
+    const oldId = sessionTargetId(previous[index])
+    if (!oldId || oldId === target) continue
+    await renameButlerTitle(oldId, previousButlerTitle(index))
+  }
+  if (runtimeId) {
+    // The untitled chat is still a valid destination if this fails; the title
+    // is cosmetic, the id is the route.
+    await renameButlerTitle(runtimeId, BUTLER_TITLE)
+  }
   let lastError = null
   if (host && typeof host.openSession === 'function') {
     try {
@@ -572,10 +661,25 @@ function petClaimStatusText() {
   return 'No in-window pet — use Cmd+Shift+A'
 }
 
+/**
+ * The pane's persistent two-field readout. `claim` is the authoritative config
+ * poll, `petFound` is the in-app canvas query; `flash` is the brief confirmation
+ * after a claimed click opened the bar. It never becomes a multi-line nag.
+ */
+function petStatusRowText({ claim = false, petFound = false, flash = false } = {}) {
+  const row = `claim: ${claim ? 'on' : 'off'} · pet (in-app): ${petFound ? 'found' : 'not found'}`
+  return flash ? `${row} · → bar opened` : row
+}
+
+/** The shared publish payload: open state plus the pet-click confirmation seq. */
+function summonBarState() {
+  return { open: summonOpen, origin: summonOrigin, petClickSeq }
+}
+
 function subscribeSummonBar(listener) {
   summonListeners.add(listener)
   try {
-    listener({ open: summonOpen, origin: summonOrigin })
+    listener(summonBarState())
   } catch (err) {
     // A broken listener must not break the summon.
   }
@@ -583,9 +687,10 @@ function subscribeSummonBar(listener) {
 }
 
 function publishSummonBar() {
+  const state = summonBarState()
   for (const listener of [...summonListeners]) {
     try {
-      listener({ open: summonOpen, origin: summonOrigin })
+      listener(state)
     } catch (err) {
       // Keep the remaining listeners alive.
     }
@@ -593,6 +698,7 @@ function publishSummonBar() {
 }
 
 function openSummonBar(origin = 'shortcut') {
+  if (origin === 'pet') petClickSeq += 1
   summonOpen = true
   summonOrigin = origin
   publishSummonBar()
@@ -938,6 +1044,8 @@ const SUMMON_REASON_LABELS = {
   unroutable_session: 'session not routable through the gateway',
   session_create_failed: 'could not create a fresh Butler session',
   session_create_unavailable: 'session creation unsupported',
+  session_create_reused: 'the gateway reused an existing Butler session',
+  session_key_mismatch: 'the gateway delivered to the wrong session',
   session_focus_failed: 'could not focus the Butler session'
 }
 
@@ -957,6 +1065,11 @@ function summonFailureMessage(result) {
   if (error) message += ` — ${error}`
   const detail = asText(result && result.detail)
   if (detail && detail !== error) message += ` — ${detail}`
+  const expectedKey = asText(result && result.expected_session_key)
+  const actualKey = asText(result && result.session_key)
+  if (expectedKey && !detail) {
+    message += ` — gateway session key ${actualKey || 'unknown'}; expected ${expectedKey}`
+  }
   const injectionReason = asText(result && result.injection_reason)
   if (injectionReason) {
     message += `. Full-conversation injection was unavailable (${injectionReason}); /butler fallback also failed`
@@ -1020,7 +1133,10 @@ async function openFreshButlerSession(options = {}) {
   launcherTargetId = null
   launcherTargetAliases = []
   try {
-    const created = await createButlerSession()
+    // The old titled chats are only renamed here: their ids stay untouched,
+    // and the fresh send below is addressed by the id create returns.
+    const previous = await listButlerSessions()
+    const created = await createButlerSession(previous)
     if (!created || !created.ok) return created || launcherState(false, 'session_create_failed')
     const delay = typeof options.wait === 'function' ? options.wait : wait
     await delay(timingOption(options.graceMs, SUMMON_SEND_GRACE_MS))
@@ -1055,7 +1171,29 @@ async function summonButler(text, options = {}) {
   if (!target) return { ok: false, reason: 'no_session', destination, phase: 'session' }
 
   const injection = await sendSummonInjection(target, message)
-  if (injection.ok) return { ...injection, destination }
+  if (injection.ok) {
+    if (destination === SUMMON_NEW) {
+      // The fresh id is the whole point of this destination. Round 5 proved the
+      // gateway reports the routing key; verify it names THIS id, not the old
+      // chat the titled-create bug used to resolve.
+      const expectedKey = expectedSummonSessionKey(hostProfileName(), target)
+      const actualKey = asText(injection.session_key)
+      if (expectedKey && actualKey && actualKey !== expectedKey) {
+        return {
+          ok: false,
+          reason: 'session_key_mismatch',
+          error: null,
+          detail: `gateway routed to ${actualKey}; expected ${expectedKey}`,
+          session: target,
+          session_key: actualKey,
+          expected_session_key: expectedKey,
+          destination,
+          phase: 'send'
+        }
+      }
+    }
+    return { ...injection, destination }
+  }
 
   // The gateway could not host the turn. Preserve the grounded chip ladder:
   // composer.submit('/butler <text>') reaches the slash handler, which reports
@@ -1354,7 +1492,15 @@ function ButlerPetClickToggle() {
   const configured = configPetClickClaim(configQuery.data)
   const [enabled, setEnabled] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [canvasSeen, setCanvasSeen] = useState(() => Boolean(petCanvasNode()))
+  // Re-evaluated on a fixed 2 s clock while the pane is mounted, whether or
+  // not the claim is on: "not found" is the honest answer when the pet is
+  // popped out into its own OS window.
+  const [petFound, setPetFound] = useState(() => Boolean(petCanvasNode()))
+  const [flash, setFlash] = useState(false)
+  const flashTimerRef = useRef(null)
+  const lastClickSeqRef = useRef(null)
+  const liveRef = useRef({ claim: false, petFound: false })
+  liveRef.current = { claim: configured, petFound }
 
   useEffect(() => {
     // A null initial query must not disarm the register-time watcher: only a
@@ -1365,15 +1511,37 @@ function ButlerPetClickToggle() {
   }, [configured, configQuery.data])
 
   useEffect(() => {
-    if (!enabled) {
-      setCanvasSeen(false)
-      return undefined
-    }
-    const check = () => setCanvasSeen(Boolean(petCanvasNode()))
+    const check = () => setPetFound(Boolean(petCanvasNode()))
     check()
-    const id = window.setInterval(check, 1000)
+    const id = window.setInterval(check, PET_STATUS_REFRESH_MS)
     return () => window.clearInterval(id)
-  }, [enabled])
+  }, [])
+
+  useEffect(() => subscribeSummonBar(state => {
+    const seq = Number(state && state.petClickSeq) || 0
+    if (lastClickSeqRef.current === null) {
+      lastClickSeqRef.current = seq
+      return
+    }
+    if (seq === lastClickSeqRef.current) return
+    lastClickSeqRef.current = seq
+    // Only a claimed in-app click gets the confirmation: a companion-chip open
+    // with no in-app pet must not pretend the row saw something.
+    if (!liveRef.current.claim || !liveRef.current.petFound) return
+    setFlash(true)
+    if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current)
+    flashTimerRef.current = window.setTimeout(() => {
+      flashTimerRef.current = null
+      setFlash(false)
+    }, SUMMON_FLASH_MS)
+  }), [])
+
+  useEffect(() => () => {
+    if (flashTimerRef.current !== null) {
+      window.clearTimeout(flashTimerRef.current)
+      flashTimerRef.current = null
+    }
+  }, [])
 
   const onToggle = async (event) => {
     const next = Boolean(event.target.checked)
@@ -1383,6 +1551,13 @@ function ButlerPetClickToggle() {
     setSaving(false)
     if (saved) {
       await syncCompanionClaim(next)
+      try {
+        // Pull the authoritative value forward; the row reads the poll, not
+        // the optimistic switch.
+        if (typeof configQuery.refetch === 'function') configQuery.refetch()
+      } catch (err) {
+        // The next 5 s poll still lands the same value.
+      }
       return
     }
     setEnabled(!next)
@@ -1398,11 +1573,13 @@ function ButlerPetClickToggle() {
     }
   }
 
-  const claimStatus = !enabled
-    ? 'Off — use Cmd+Shift+A'
-    : (canvasSeen
-      ? 'Armed — click your pet (in-window)'
-      : 'No in-window pet — use Cmd+Shift+A')
+  const claimedAndFound = configured && petFound
+  const rowText = petStatusRowText({ claim: configured, petFound, flash })
+  const rowColor = flash ? '#f5c26b' : (claimedAndFound ? '#6fd39a' : '#8a8f98')
+  const rowBorder = flash ? 'rgba(245,194,107,.4)'
+    : (claimedAndFound ? 'rgba(111,211,154,.35)' : 'rgba(255,255,255,.09)')
+  const rowBackground = flash ? 'rgba(245,194,107,.10)'
+    : (claimedAndFound ? 'rgba(111,211,154,.08)' : 'rgba(255,255,255,.03)')
 
   return h('div', {
     style: { display: 'flex', flexDirection: 'column', gap: 6 }
@@ -1432,11 +1609,10 @@ function ButlerPetClickToggle() {
       style: {
         alignSelf: 'flex-start', fontSize: 10.5, lineHeight: 1.4,
         padding: '2px 8px', borderRadius: 99,
-        color: enabled && canvasSeen ? '#6fd39a' : '#8a8f98',
-        border: `1px solid ${enabled && canvasSeen ? 'rgba(111,211,154,.35)' : 'rgba(255,255,255,.09)'}`,
-        background: enabled && canvasSeen ? 'rgba(111,211,154,.08)' : 'rgba(255,255,255,.03)'
+        color: rowColor, border: `1px solid ${rowBorder}`,
+        background: rowBackground
       }
-    }, claimStatus)
+    }, rowText)
   )
 }
 
