@@ -238,6 +238,10 @@ class Overlay:
         except Exception:
             return False
 
+    def is_running(self):
+        """Public read-only check for callers (the summon door)."""
+        return self._is_running()
+
     def start(self, show_pet=True):
         """Spawn the companion, or re-assert the pet double on a live one.
 
@@ -422,3 +426,35 @@ def shared_overlay():
     if _SHARED_OVERLAY is None:
         _SHARED_OVERLAY = Overlay()
     return _SHARED_OVERLAY
+
+
+def summon_double(hold_seconds=2.2):
+    """Spawn the pet double for a summon, then let it wave off and exit.
+
+    This is the engine overlay path, not a second binary: no petdex pet means
+    resolve_frames_dir() returns None and we skip the spawn entirely. A live
+    guide already owns the companion, so summoning never steals or duplicates
+    it. Returns True only when a double was actually spawned.
+    """
+    if resolve_frames_dir() is None:
+        return False
+    overlay = shared_overlay()
+    if overlay.is_running():
+        return False
+    ok, _detail = overlay.start(show_pet=True)
+    if not ok:
+        return False
+
+    def _farewell():
+        try:
+            time.sleep(max(0.2, float(hold_seconds)))
+        except (TypeError, ValueError):
+            time.sleep(2.2)
+        try:
+            overlay.done()
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_farewell, name="butler-summon-farewell",
+                     daemon=True).start()
+    return True

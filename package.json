@@ -1,0 +1,9 @@
+{
+  "name": "butler-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "node --experimental-vm-modules --test tests/desktop_plugin.test.mjs",
+    "test:desktop": "node --experimental-vm-modules --test tests/desktop_plugin.test.mjs"
+  }
+}

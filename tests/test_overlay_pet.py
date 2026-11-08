@@ -235,3 +235,46 @@ def test_guide_start_reasserts_the_pet_on_a_capture_spawned_companion(tmp_path: 
         "scale": 0.5,
         "pet_enabled": True,
     }]
+
+
+def test_summon_double_skips_entirely_when_no_petdex_pet(
+        tmp_path: Path, monkeypatch) -> None:
+    """Petless: the summon must not spawn a companion or send a pet op."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "pets").mkdir()
+    monkeypatch.setattr(overlay, "_SHARED_OVERLAY", None)
+    monkeypatch.setattr(
+        overlay.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("petless summon must not spawn the companion")),
+    )
+
+    assert overlay.summon_double() is False
+
+
+def test_summon_double_spawns_pet_then_farewells(
+        tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    wanted = _make_pet(tmp_path, "robotocat")
+    _write_config(tmp_path, "display:\n  pet:\n    slug: robotocat\n    scale: 0.5\n")
+    monkeypatch.setattr(overlay, "_SHARED_OVERLAY", None)
+
+    proc = _FakeProc()
+    monkeypatch.setattr(overlay, "build_if_needed", lambda: (True, "present"))
+    monkeypatch.setattr(overlay.subprocess, "Popen", lambda *args, **kwargs: proc)
+
+    assert overlay.summon_double() is True
+    for _ in range(100):
+        if b"done" in proc.stdin.data:
+            break
+        __import__("time").sleep(0.01)
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    ops = [json.loads(line) for line in lines]
+    assert ops[0] == {
+        "op": "pet",
+        "frames_dir": str(wanted),
+        "scale": 0.5,
+        "pet_enabled": True,
+    }
+    assert {"op": "done"} in ops

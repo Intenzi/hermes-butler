@@ -31,6 +31,27 @@ it; the doctor tells you when it is your turn and tells you when you are clear.
 
 ## Usage
 
+### Ask the butler
+
+Summon the dedicated **Butler** chat from anywhere in the desktop and hand it a
+text request. The request is sent immediately through the SDK composer door
+(`host.composer.submit`) — the same path as typing it and pressing Enter.
+
+- **Keyboard shortcut** — "Ask the butler" (default ⌘⇧A, rebindable in
+  Settings → Keybinds). Opens the floating bar; Enter sends, Escape or blur
+  dismisses.
+- **Click the pet** — opt-in only, off by default. Turn it on with the
+  "Click the pet to ask the butler" switch on the `/butler` pane. The switch
+  writes `summon.pet_click_claim` in the plugin's
+  `plugin-data/butler/config.json`; the engine reads it fresh, so it hot-reloads
+  without a gateway restart.
+- **Existing surfaces** — the status-bar chip, sidebar page, and palette are
+  unchanged.
+
+On send the chat is focused (or created if it does not exist yet), and the
+butler's companion pet double appears by the bar before waving off. With no
+petdex pet installed the double is skipped; the bar and the send still work.
+
 Agent-side tools:
 
 - `butler_guide_start` — start a guide from a JSON plan of steps
@@ -93,6 +114,18 @@ Plain statements about what this plugin does when it runs.
    become a background screenreader.
 7. Butler never writes to other tools' secrets, workspace files, or system
    state, and never types or clicks for the user. It is guide-only by design.
+8. The opt-in pet-click receiver is a narrow reach-in into the Hermes desktop
+   window, not into any app or the screen. When enabled, it reads the position
+   and size of the petdex pet canvas (`canvas[aria-label$=" pet"]`), places a
+   transparent fixed overlay over it that follows the canvas each frame, and
+   installs document-level capture-phase `pointerdown` listeners to notice a
+   click on that canvas. It never paints into the canvas, never edits Hermes
+   core files, and never types or clicks. It is **off by default**; turning the
+   `/butler` switch off removes the overlay and listeners immediately. If a
+   Hermes desktop update changes the canvas markup or label, the receiver
+   quietly stops matching (no crash, no console spam) until the selector is
+   re-glued. This receiver needs no Accessibility, Screen Recording, or other
+   TCC grant.
 
 ## Platform
 
@@ -110,3 +143,6 @@ platforms land. Requires Hermes >= 0.22.5.
    bubbles-and-progress count as confirmation.
 4. `/butler` opens the pane: check its status summary alongside the guide you
    just ran.
+
+Desktop-half tests run with `npm test` (Node's built-in test runner); the
+Python side runs with `python -m pytest`.

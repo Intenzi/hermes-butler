@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -124,3 +125,37 @@ def test_history_reads_plugins_data_candidate(client: TestClient, tmp_path: Path
 
     assert response.status_code == 200
     assert [row["id"] for row in response.json()] == ["fallback"]
+
+
+def test_config_defaults_pet_click_claim_off(client: TestClient) -> None:
+    response = client.get("/config")
+
+    assert response.status_code == 200
+    assert response.json() == {"summon": {"pet_click_claim": False}}
+
+
+def test_config_write_persists_and_hot_reloads(client: TestClient, tmp_path: Path) -> None:
+    response = client.post("/config", json={"summon": {"pet_click_claim": True}})
+
+    assert response.status_code == 200
+    assert response.json() == {"summon": {"pet_click_claim": True}}
+    path = tmp_path / "plugin-data" / "butler" / "config.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["summon"]["pet_click_claim"] is True
+    # The same GET reads the file fresh (no restart).
+    assert client.get("/config").json() == {"summon": {"pet_click_claim": True}}
+
+    assert client.post("/config", json={"pet_click_claim": False}).json() == {
+        "summon": {"pet_click_claim": False}
+    }
+    assert json.loads(path.read_text(encoding="utf-8"))["summon"]["pet_click_claim"] is False
+
+
+def test_summon_pet_is_a_noop_without_a_petdex_pet(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    (Path(os.environ["HERMES_HOME"]) / "pets").mkdir()
+
+    response = client.post("/summon/pet")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "pet": False}

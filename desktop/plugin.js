@@ -6,16 +6,21 @@
  * for finished ones. The status bar carries a small Butler launcher that
  * creates or focuses the "Butler" chat.
  *
- * SDK-only surface (routes, nav, palette, status bar, host sessions). No
- * pet-canvas touching: bubble rendering stays on the Python side via ctx.pet.say.
+ * SDK-first surface (routes, nav, palette, status bar, keybinds, host sessions,
+ * composer submit). The one deliberate reach-in is the opt-in pet-click
+ * receiver: it only READS the pet canvas rect and observes pointerdown; it
+ * never paints into the canvas and is torn down when the toggle is off.
+ * Bubble rendering stays on the Python side via ctx.pet.say.
  */
 import {
   Button,
   Codicon,
   EmptyState,
+  KEYBINDS_AREA,
   PALETTE_AREA,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
+  TITLEBAR_AREAS,
   cn,
   host,
   useQuery
@@ -28,15 +33,32 @@ const ROUTE = '/butler'
 const REFRESH_MS = 1500
 const HISTORY_PAGE = 8
 const BUTLER_TITLE = 'Butler'
+const SUMMON_PLACEHOLDER = 'Ask the butler for a guide…'
+const SUMMON_SEND_TIMEOUT_MS = 1500
+const SUMMON_SEND_RETRY_MS = 60
+const CONFIG_REFRESH_MS = 5000
+// Documented legacy locator for the petdex pet (the core pet canvas). Read-only:
+// we never paint into it and never edit Hermes core to add a hook.
+const PET_CANVAS_SELECTOR = 'canvas[aria-label$=" pet"]'
 
 let rest = null
 let petCtx = null
 let lastSaid = null
 let launcherBusy = false
+let launcherTargetId = null
 // smoke-test counters so the page can PROVE the plugin side spoke (or not):
 // petSayTicks increments on every say attempt, petLastTick stores wall-clock.
 let petSayTicks = 0
 let petLastTick = null
+
+// Summon door state. The bar component is the only visible surface; the
+// keybind and the opt-in pet-click listener just publish "open".
+let summonOpen = false
+let summonOrigin = 'shortcut'
+const summonListeners = new Set()
+let petClickClaim = false
+let petClickWatcher = null
+let petClickConfigWrites = 0
 
 function h(type, props, ...children) {
   let key = undefined
@@ -234,14 +256,19 @@ async function listButlerSessions() {
   }
 }
 
+function sessionTargetId(row) {
+  return asText(row && (row.resolved_id || row.stored_session_id
+    || row.id || row.session_id))
+}
+
 async function focusSession(row) {
   if (!row) return false
-  const storedId = asText(row.resolved_id) || asText(row.stored_session_id)
-    || asText(row.id) || asText(row.session_id)
+  const storedId = sessionTargetId(row)
   if (!storedId) return false
   if (host && typeof host.openSession === 'function') {
     try {
       await host.openSession(storedId, { intent: 'in-place' })
+      launcherTargetId = storedId
       return true
     } catch (err) {
       // Older desktop builds may only expose the gateway RPC.
@@ -252,6 +279,7 @@ async function focusSession(row) {
     await host.request('session.activate', {
       session_id: asText(row.session_id) || asText(row.id) || storedId
     })
+    launcherTargetId = storedId
     return true
   } catch (err) {
     return false
@@ -275,6 +303,7 @@ async function createButlerSession() {
   if (target && host && typeof host.openSession === 'function') {
     try {
       await host.openSession(target, { intent: 'in-place' })
+      launcherTargetId = target
       return true
     } catch (err) {
       // Fall through to activating the runtime session.
@@ -283,11 +312,13 @@ async function createButlerSession() {
   if (runtimeId) {
     try {
       await host.request('session.activate', { session_id: runtimeId })
+      launcherTargetId = target
       return true
     } catch (err) {
       return false
     }
   }
+  launcherTargetId = target
   return Boolean(target)
 }
 
@@ -303,10 +334,23 @@ function notifyLauncherFailure() {
   }
 }
 
+function notifySummonFailure(message) {
+  try {
+    host && host.notify && host.notify({
+      kind: 'error',
+      title: 'Butler',
+      message: message || 'Could not send that request to the Butler chat on this desktop build.'
+    })
+  } catch (err) {
+    // A missing toast surface must not break the summon.
+  }
+}
+
 /** Create the one "Butler" chat, or focus the oldest matching one. */
 async function openButlerSession() {
   if (launcherBusy) return false
   launcherBusy = true
+  launcherTargetId = null
   try {
     const existing = oldestSession(await listButlerSessions())
     if (existing && await focusSession(existing)) return true
@@ -329,6 +373,254 @@ async function openButlerSession() {
   }
 }
 
+// ------------------------------------------------------------ summon door
+
+function wait(ms) {
+  return new Promise(resolve => window.setTimeout(resolve, ms))
+}
+
+function petCanvasNode() {
+  if (typeof document === 'undefined') return null
+  try {
+    return document.querySelector(PET_CANVAS_SELECTOR) || null
+  } catch (err) {
+    return null
+  }
+}
+
+function subscribeSummonBar(listener) {
+  summonListeners.add(listener)
+  try {
+    listener({ open: summonOpen, origin: summonOrigin })
+  } catch (err) {
+    // A broken listener must not break the summon.
+  }
+  return () => { summonListeners.delete(listener) }
+}
+
+function publishSummonBar() {
+  for (const listener of [...summonListeners]) {
+    try {
+      listener({ open: summonOpen, origin: summonOrigin })
+    } catch (err) {
+      // Keep the remaining listeners alive.
+    }
+  }
+}
+
+function openSummonBar(origin = 'shortcut') {
+  summonOpen = true
+  summonOrigin = origin
+  publishSummonBar()
+}
+
+function dismissSummonBar() {
+  summonOpen = false
+  publishSummonBar()
+}
+
+function configPetClickClaim(data) {
+  if (!data || typeof data !== 'object') return false
+  if (data.summon && typeof data.summon === 'object'
+    && typeof data.summon.pet_click_claim === 'boolean') {
+    return data.summon.pet_click_claim
+  }
+  if (typeof data['summon.pet_click_claim'] === 'boolean') {
+    return data['summon.pet_click_claim']
+  }
+  return data.pet_click_claim === true
+}
+
+async function writePetClickClaim(enabled) {
+  const next = Boolean(enabled)
+  // Apply locally first so the switch cannot lag the listener; revert if the
+  // backend refuses the write.
+  setPetClickClaim(next)
+  if (!rest || typeof rest !== 'function') return false
+  const writeId = ++petClickConfigWrites
+  try {
+    const result = await rest('/config', {
+      method: 'POST',
+      body: { summon: { pet_click_claim: next }, pet_click_claim: next }
+    })
+    return configPetClickClaim(result) === next
+  } catch (err) {
+    if (writeId === petClickConfigWrites) setPetClickClaim(!next)
+    return false
+  }
+}
+
+function startPetClickWatcher() {
+  if (petClickWatcher || typeof document === 'undefined' || !document.body) return
+  let overlay = null
+  let frame = null
+  let disposed = false
+  let lastRect = null
+  try {
+    overlay = document.createElement('div')
+    overlay.setAttribute('data-butler-pet-claim', '')
+    overlay.setAttribute('aria-hidden', 'true')
+    Object.assign(overlay.style, {
+      position: 'fixed', pointerEvents: 'none', zIndex: '2147483000',
+      left: '0px', top: '0px', width: '0px', height: '0px',
+      opacity: '0', borderRadius: '10px'
+    })
+    document.body.appendChild(overlay)
+  } catch (err) {
+    overlay = null
+  }
+
+  const follow = () => {
+    if (disposed) return
+    const canvas = petCanvasNode()
+    // No canvas (no pet installed, or a Hermes update moved it): degrade
+    // silently. The watcher keeps looking so a later pet is picked up.
+    if (!canvas || !overlay) {
+      if (overlay) overlay.style.opacity = '0'
+      frame = window.requestAnimationFrame(follow)
+      return
+    }
+    try {
+      const rect = canvas.getBoundingClientRect()
+      if (!rect || rect.width <= 0 || rect.height <= 0) {
+        overlay.style.opacity = '0'
+      } else {
+        const box = { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+        if (!lastRect || Math.abs(lastRect.left - box.left) > 0.5
+          || Math.abs(lastRect.top - box.top) > 0.5
+          || Math.abs(lastRect.width - box.width) > 0.5
+          || Math.abs(lastRect.height - box.height) > 0.5) {
+          overlay.style.left = `${box.left}px`
+          overlay.style.top = `${box.top}px`
+          overlay.style.width = `${box.width}px`
+          overlay.style.height = `${box.height}px`
+          lastRect = box
+        }
+        overlay.style.opacity = '1'
+      }
+    } catch (err) {
+      if (overlay) overlay.style.opacity = '0'
+    }
+    frame = window.requestAnimationFrame(follow)
+  }
+
+  const onPointerDown = (event) => {
+    if (!petClickClaim || disposed) return
+    try {
+      if (event && typeof event.button === 'number' && event.button !== 0) return
+      const canvas = petCanvasNode()
+      if (!canvas) return
+      const rect = canvas.getBoundingClientRect()
+      if (!rect || rect.width <= 0 || rect.height <= 0) return
+      const x = Number(event && event.clientX)
+      const y = Number(event && event.clientY)
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        openSummonBar('pet')
+      }
+    } catch (err) {
+      // Never let the reach-in listener break the pet's own click handling.
+    }
+  }
+
+  try {
+    document.addEventListener('pointerdown', onPointerDown, true)
+  } catch (err) {
+    // A DOM without capture-phase events still leaves the shortcut working.
+  }
+  frame = window.requestAnimationFrame(follow)
+
+  petClickWatcher = {
+    dispose() {
+      if (disposed) return
+      disposed = true
+      try { document.removeEventListener('pointerdown', onPointerDown, true) } catch (err) { }
+      try { if (frame !== null) window.cancelAnimationFrame(frame) } catch (err) { }
+      frame = null
+      try { if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay) } catch (err) { }
+      overlay = null
+      petClickWatcher = null
+    }
+  }
+}
+
+function stopPetClickWatcher() {
+  if (petClickWatcher) petClickWatcher.dispose()
+}
+
+function setPetClickClaim(enabled) {
+  petClickClaim = Boolean(enabled)
+  if (petClickClaim) startPetClickWatcher()
+  else stopPetClickWatcher()
+}
+
+async function syncPetClickClaim() {
+  if (!rest || typeof rest !== 'function') return
+  try {
+    const result = await rest('/config')
+    setPetClickClaim(configPetClickClaim(result))
+  } catch (err) {
+    // Backend not mounted yet; the toggle still writes once it is.
+  }
+}
+
+/**
+ * Send a summon message to the Butler chat through the SDK composer door.
+ * `host.composer.submit(sessionId, text)` is a real programmatic send (as if
+ * the user typed + pressed Enter), not a draft seat. The exact session's
+ * composer must be mounted, so right after a focus/create we give the app a
+ * short settle window before seating a draft as the honest fallback.
+ */
+async function sendSummonText(target, text) {
+  const targetId = asText(target)
+  if (!targetId) return { ok: false, reason: 'no_session' }
+  if (!host || !host.composer) return { ok: false, reason: 'no_composer' }
+  const deadline = Date.now() + SUMMON_SEND_TIMEOUT_MS
+  let lastError = null
+  while (Date.now() < deadline) {
+    try {
+      if (typeof host.composer.submit === 'function' && host.composer.submit(targetId, text)) {
+        return { ok: true, send: 'composer.submit' }
+      }
+    } catch (err) {
+      lastError = err
+    }
+    await wait(SUMMON_SEND_RETRY_MS)
+  }
+  // No submit verb on this desktop build (older host): seat the text as a
+  // draft and report the gap instead of pretending it was sent.
+  if (typeof host.composer.setDraft === 'function') {
+    try {
+      const seated = await host.composer.setDraft(targetId, text)
+      return { ok: false, seated: Boolean(seated), reason: 'no_programmatic_send', error: lastError }
+    } catch (err) {
+      return { ok: false, reason: 'draft_failed', error: err }
+    }
+  }
+  return { ok: false, reason: 'no_visible_composer', error: lastError }
+}
+
+async function spawnSummonDouble() {
+  if (!rest || typeof rest !== 'function') return false
+  try {
+    const result = await rest('/summon/pet', { method: 'POST' })
+    return Boolean(result && result.pet)
+  } catch (err) {
+    // No companion is a petless/overlay-missing path, not a send failure.
+    return false
+  }
+}
+
+/** Resolve the one Butler chat, send the request, then own the leaving visual. */
+async function summonButler(text) {
+  const message = asText(text)
+  if (!message) return { ok: false, reason: 'empty' }
+  if (!await openButlerSession()) return { ok: false, reason: 'no_session' }
+  const target = launcherTargetId
+  const result = await sendSummonText(target, message)
+  return { ...result, session: target }
+}
+
 function LauncherButton({ compact = false }) {
   const onClick = () => { openButlerSession() }
   if (!compact) {
@@ -345,6 +637,226 @@ function LauncherButton({ compact = false }) {
       borderRadius: 5, padding: '1px 7px'
     }
   }, 'Butler')
+}
+
+// ---------------------------------------------------------------- summon bar
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max)
+}
+
+/**
+ * Floating "Ask the butler" bar. It is mounted once by the permanent titlebar
+ * slot and only paints while the shortcut / pet click has opened it.
+ */
+function SummonBar() {
+  const [open, setOpen] = useState(false)
+  const [origin, setOrigin] = useState('shortcut')
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [position, setPosition] = useState(null)
+  const inputRef = useRef(null)
+  const barRef = useRef(null)
+  const busyRef = useRef(false)
+  busyRef.current = busy
+
+  useEffect(() => subscribeSummonBar(state => {
+    setOpen(state.open)
+    setOrigin(state.origin)
+  }), [])
+
+  useEffect(() => {
+    if (!open) return undefined
+    setText('')
+    const id = window.setTimeout(() => {
+      try { inputRef.current && inputRef.current.focus() } catch (err) { }
+    }, 0)
+    return () => window.clearTimeout(id)
+  }, [open])
+
+  // Follow the pet while the bar is open; otherwise park upper-right. The
+  // same read-only locator the opt-in click listener uses.
+  useEffect(() => {
+    if (!open) return undefined
+    let frame = null
+    let last = ''
+    const follow = () => {
+      const bar = barRef.current
+      const width = bar && bar.offsetWidth ? bar.offsetWidth : 360
+      const height = bar && bar.offsetHeight ? bar.offsetHeight : 48
+      let left = Math.max(12, window.innerWidth - width - 16)
+      let top = 16
+      const canvas = petCanvasNode()
+      if (canvas) {
+        try {
+          const rect = canvas.getBoundingClientRect()
+          if (rect && rect.width > 0 && rect.height > 0) {
+            left = rect.left - width - 14
+            if (left < 12) left = rect.right + 14
+            left = clamp(left, 12, Math.max(12, window.innerWidth - width - 12))
+            top = clamp(rect.top + rect.height / 2 - height / 2,
+              12, Math.max(12, window.innerHeight - height - 12))
+          }
+        } catch (err) {
+          // Keep the upper-right seat when the canvas is unreadable.
+        }
+      }
+      const key = `${Math.round(left)}:${Math.round(top)}`
+      if (key !== last) {
+        last = key
+        setPosition({ left: Math.round(left), top: Math.round(top) })
+      }
+      frame = window.requestAnimationFrame(follow)
+    }
+    follow()
+    return () => { if (frame !== null) window.cancelAnimationFrame(frame) }
+  }, [open])
+
+  const close = () => {
+    if (busyRef.current) return
+    dismissSummonBar()
+  }
+
+  const submit = async () => {
+    if (busyRef.current) return
+    const value = text.trim()
+    if (!value) return
+    setBusy(true)
+    let result = { ok: false, reason: 'failed' }
+    try {
+      result = await summonButler(value)
+    } catch (err) {
+      result = { ok: false, reason: 'threw', error: err }
+    }
+    if (result.ok) {
+      setText('')
+      await spawnSummonDouble()
+      setBusy(false)
+      dismissSummonBar()
+      return
+    }
+    if (result.seated) {
+      setBusy(false)
+      dismissSummonBar()
+      notifySummonFailure('This desktop build has no programmatic send yet, so the request was placed in the Butler composer. Press Enter there to send it.')
+      return
+    }
+    setBusy(false)
+    notifySummonFailure()
+  }
+
+  if (!open) return null
+
+  const placement = position || { left: undefined, top: 16 }
+  return h('div', {
+    ref: barRef,
+    role: 'dialog',
+    'aria-label': 'Ask the butler',
+    style: {
+      position: 'fixed', left: placement.left === undefined ? undefined : placement.left,
+      top: placement.top, right: placement.left === undefined ? 16 : undefined,
+      width: 380, maxWidth: 'calc(100vw - 24px)',
+      zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 7,
+      padding: '10px 12px', borderRadius: 12,
+      background: 'var(--ui-bg-elevated, #1f2126)',
+      border: '1px solid var(--ui-border, rgba(255,255,255,.14))',
+      boxShadow: '0 12px 34px rgba(0,0,0,.38)'
+    }
+  },
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 7 } },
+      h('span', { style: { fontSize: 13, fontWeight: 600, color: '#eceef1' } }, 'Ask the butler'),
+      h('span', { style: { flex: 1 } }),
+      h('span', { style: { fontSize: 10, color: '#8a8f98' } },
+        busy ? 'Sending…' : (origin === 'pet' ? 'from your pet' : 'Enter to send · Esc to dismiss'))
+    ),
+    h('input', {
+      ref: inputRef,
+      type: 'text',
+      value: text,
+      placeholder: SUMMON_PLACEHOLDER,
+      disabled: busy,
+      'aria-label': 'Ask the butler for a guide',
+      onChange: event => setText(event.target.value),
+      onKeyDown: event => {
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          if (!busyRef.current) dismissSummonBar()
+          return
+        }
+        if (event.key === 'Enter') {
+          event.preventDefault()
+          submit()
+        }
+      },
+      onBlur: () => {
+        if (!busyRef.current) dismissSummonBar()
+      },
+      style: {
+        width: '100%', boxSizing: 'border-box', fontSize: 13,
+        color: '#eceef1', background: 'rgba(255,255,255,.06)',
+        border: '1px solid rgba(255,255,255,.12)', borderRadius: 8,
+        padding: '8px 10px', outline: 'none'
+      }
+    })
+  )
+}
+
+function ButlerPetClickToggle() {
+  const configQuery = useQuery({
+    queryKey: ['butler', 'config'],
+    queryFn: () => (typeof rest === 'function' ? rest('/config') : Promise.resolve({})),
+    refetchInterval: CONFIG_REFRESH_MS,
+    refetchOnMount: 'always'
+  }) || {}
+  const configured = configPetClickClaim(configQuery.data)
+  const [enabled, setEnabled] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    setEnabled(configured)
+    setPetClickClaim(configured)
+  }, [configured])
+
+  const onToggle = async (event) => {
+    const next = Boolean(event.target.checked)
+    setEnabled(next)
+    setSaving(true)
+    const saved = await writePetClickClaim(next)
+    setSaving(false)
+    if (!saved) {
+      setEnabled(!next)
+      setPetClickClaim(!next)
+      try {
+        host && host.notify && host.notify({
+          kind: 'error',
+          title: 'Butler',
+          message: 'Could not save the pet-click setting. The receiver is off; the shortcut still works.'
+        })
+      } catch (err) {
+        // No toast surface: the reverted switch is the report.
+      }
+    }
+  }
+
+  return h('label', {
+    style: {
+      display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+      fontSize: 12, color: '#c7cbd2', padding: '7px 10px', borderRadius: 9,
+      border: '1px solid rgba(255,255,255,.08)', background: 'rgba(255,255,255,.03)'
+    }
+  },
+    h('input', {
+      type: 'checkbox',
+      checked: enabled,
+      disabled: saving,
+      'aria-label': 'Click the pet to ask the butler',
+      onChange: onToggle,
+      style: { cursor: 'pointer', accentColor: 'var(--ui-accent-local, #9aa3ea)' }
+    }),
+    h('span', { style: { flex: 1 } }, 'Click the pet to ask the butler'),
+    h('span', { style: { fontSize: 10, color: enabled ? '#6fd39a' : '#6f7784' } },
+      saving ? 'saving…' : (enabled ? 'on' : 'off'))
+  )
 }
 
 // ---------------------------------------------------------------- pet speech
@@ -491,6 +1003,8 @@ function ButlerApp() {
         }, 'Refresh'))
     ),
 
+    h(ButlerPetClickToggle, {}),
+
     error && h('div', {
       style: { fontSize: 12, color: '#f08080', border: '1px solid rgba(240,128,128,.3)', borderRadius: 10, padding: '9px 12px' }
     }, 'Butler backend not reachable: install and enable the butler plugin, then reload desktop plugins (⌘K → Reload desktop plugins).'),
@@ -585,6 +1099,23 @@ export default {
         render: () => h(LauncherButton, { compact: true })
       },
       {
+        id: 'summon',
+        area: KEYBINDS_AREA,
+        data: {
+          id: 'butler.summon',
+          label: 'Ask the butler',
+          category: 'Butler',
+          defaults: ['mod+shift+a'],
+          run: () => openSummonBar('shortcut')
+        }
+      },
+      {
+        id: 'summon-bar',
+        area: TITLEBAR_AREAS.right,
+        order: 60,
+        render: () => h(SummonBar, {})
+      },
+      {
         id: 'open',
         area: PALETTE_AREA,
         data: {
@@ -595,5 +1126,22 @@ export default {
         }
       }
     ])
+
+    // pet-click claim is opt-in and hot-reloads from plugin data on every
+    // config poll; disabling it tears the listener + overlay down.
+    try {
+      ctx.onDispose(() => {
+        stopPetClickWatcher()
+        petClickClaim = false
+        summonOpen = false
+        summonListeners.clear()
+      })
+    } catch (err) { }
+    try { syncPetClickClaim() } catch (err) { }
+    try {
+      if (typeof ctx.setInterval === 'function') ctx.setInterval(syncPetClickClaim, CONFIG_REFRESH_MS)
+    } catch (err) {
+      // Older hosts: no tracked timer; the pane toggle still applies directly.
+    }
   }
 }

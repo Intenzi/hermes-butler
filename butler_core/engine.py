@@ -22,6 +22,7 @@ _OVERLAY = bp_overlay.Overlay()
 DATA_DIR = None
 DEFAULT_POLL = 1.5
 DEFAULT_TIMEOUT = 120.0
+DEFAULT_PET_CLICK_CLAIM = False
 ERROR_STREAK_NOTE = 3  # consecutive poll errors before the note surfaces
 
 _lock = threading.Lock()
@@ -60,6 +61,35 @@ def poll_seconds():
 
 def step_timeout():
     return float(_cfg().get("step_timeout_seconds", DEFAULT_TIMEOUT))
+
+
+def _as_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "yes", "on", "1"):
+            return True
+        if text in ("false", "no", "off", "0", ""):
+            return False
+    return default
+
+
+def pet_click_claim():
+    """Whether the desktop may listen for pet clicks to summon the butler.
+
+    Read from plugin data on every call (poll_seconds pattern), so the pane's
+    opt-in toggle hot-reloads without a gateway restart. Default: off.
+    """
+    cfg = _cfg()
+    value = cfg.get("summon.pet_click_claim")
+    if value is None:
+        summon = cfg.get("summon")
+        if isinstance(summon, dict):
+            value = summon.get("pet_click_claim")
+    return _as_bool(value, DEFAULT_PET_CLICK_CLAIM)
 
 
 def _normalize_step(step):
