@@ -66,15 +66,22 @@ def _read_config() -> dict[str, Any]:
 
 
 def _pet_click_claim(cfg: dict[str, Any]) -> bool:
-    """Read the nested knob, with the flat dotted spelling as a fallback."""
+    """Read the nested knob, with the flat dotted spelling as a fallback.
+
+    A missing key means on: installing the plugin is the opt-in. Only a stored
+    ``false`` (or an off spelling) disarms the chip as a manual escape hatch.
+    """
     value: Any = None
     summon = cfg.get("summon")
     if isinstance(summon, dict):
         value = summon.get("pet_click_claim")
     if value is None:
         value = cfg.get(CONFIG_KEY)
+    if value is None:
+        return True
     if isinstance(value, str):
-        return value.strip().lower() in ("true", "yes", "on", "1")
+        text = value.strip().lower()
+        return text not in ("false", "no", "off", "0", "")
     return bool(value)
 
 
@@ -430,8 +437,9 @@ def set_config(body: dict[str, Any]) -> dict[str, Any]:
 def summon_claim(body: dict[str, Any]) -> dict[str, Any]:
     """Arm/disarm the companion's pop-out pet click chip.
 
-    The desktop calls this after each ``/config`` sync, so a config-file value
-    survives a gateway reload without a second manual toggle.
+    The desktop calls this after each ``/config`` sync. A missing ``enabled``
+    means on (installing the plugin is the opt-in); only an explicit stored
+    ``false`` disarms, and that escape hatch survives a gateway reload.
     """
     requested = body.get("enabled") if isinstance(body, dict) else None
     if requested is None:

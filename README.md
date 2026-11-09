@@ -48,14 +48,15 @@ a plain message in any chat without the slash is still ordinary conversation.
   chat, default) or **New session** (always creates a fresh Butler-titled chat,
   never reuses the oldest). The choice is kept in the desktop's localStorage
   across openings; the success toast names it.
-- **Click the pet** — opt-in only, off by default. Turn it on with the
-  "Click the pet to ask the butler" switch on the `/butler` pane. The switch
-  writes `summon.pet_click_claim` in the plugin's one canonical
-  `plugin-data/butler/config.json`; the engine, dashboard, and desktop watcher
-  all read that same file fresh, so it hot-reloads without a gateway restart.
-  The pane chip says **Armed — click your pet (in-window)** only when the
-  in-window pet canvas is present; otherwise it says **No in-window pet — use
-  Cmd+Shift+A**. When the pet is popped out into its own OS window, the bundled
+- **Click the pet** — on for every installed plugin; installing is the opt-in.
+  There is no switch. The stored config key `summon.pet_click_claim` in
+  `plugin-data/butler/config.json` remains as a manual escape hatch: set it to
+  `false` to disarm (the next config sync applies it, including after a reload).
+  The engine, dashboard, and desktop watcher all read that
+  same file fresh, so the change hot-reloads without a gateway restart. The
+  `/butler` pane shows an honest readout — **chip: on · pet (in-app): found** or
+  **not found** — and flashes **→ bar opened** after a claimed click. When the
+  pet is popped out into its own OS window, the bundled
   companion draws a small **Ask butler** chip next to it; clicking that chip
   opens the same bar and destination picker as the shortcut. The chip is found
   as a small, near-square, title-less on-screen Hermes window; if a future
@@ -123,7 +124,7 @@ Plain statements about what this plugin does when it runs.
    `swiftc`. It is local source, not a fetched binary.
 2. Overlay rendering runs in a spawned local companion process, driven by a
    JSON-over-stdin protocol. The same shared process serves guides, captures,
-   the summon double, and the opt-in pop-out claim chip; it exits when idle or
+   the summon double, and the pop-out claim chip; it exits when idle or
    when the host closes its pipe.
 3. The plugin reads the foreground app via the Accessibility framework and,
    where needed, Apple Vision OCR. It reads element text and geometry boxes
@@ -140,8 +141,9 @@ Plain statements about what this plugin does when it runs.
    become a background screenreader.
 7. Butler never writes to other tools' secrets, workspace files, or system
    state, and never types or clicks for the user. It is guide-only by design.
-8. The opt-in pet-click receiver is a narrow reach-in into the Hermes desktop
-   window, not into any app or the screen. When enabled, it reads the position
+8. The pet-click receiver is on for every installed plugin: installing is the
+   opt-in. It is a narrow reach-in into the Hermes desktop
+   window, not into any app or the screen. It reads the position
    and size of the petdex pet canvas (`canvas[aria-label$=" pet"]`, plus the
    core's bare `canvas[aria-label="pet"]` spelling), places a transparent fixed
    overlay over it that follows the canvas each frame, and installs
@@ -149,8 +151,9 @@ Plain statements about what this plugin does when it runs.
    that canvas. The pop-out chip rides the same single companion subject and
    is a separate mini window placed outside the pet's sprite bounds. It never
    paints into the canvas, never edits Hermes core files, and never types or
-   clicks. It is **off by default**; turning the `/butler` switch off removes
-   the overlay, listeners, and chip immediately. If a Hermes desktop update
+   clicks. The stored `summon.pet_click_claim: false` config key remains a
+   manual escape hatch; the next config sync removes the overlay, listeners, and
+   chip. If a Hermes desktop update
    changes the canvas markup or the pop-out window shape, the matching surface
    quietly goes dark (no crash, no console spam) until the selector is
    re-glued. This receiver needs no Accessibility, Screen Recording, or other

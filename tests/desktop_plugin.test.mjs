@@ -17,10 +17,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PLUGIN_JS = path.join(HERE, '..', 'desktop', 'plugin.js')
 const INTERNALS = [
   'summonButler', 'sendSummonText', 'sendSummonInjection', 'summonFromBar',
-  'summonFailureMessage', 'writePetClickClaim', 'setPetClickClaim',
+  'summonFailureMessage', 'setPetClickClaim',
   'startPetClickWatcher', 'stopPetClickWatcher', 'openSummonBar',
   'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar', 'petCanvasNode',
-  'petClaimStatusText', 'syncCompanionClaim', 'petStatusRowText', 'summonBarState',
+  'syncCompanionClaim', 'petStatusRowText', 'summonBarState',
   'readSummonDestination', 'setSummonDestination', 'getSummonDestination', 'butlerCommandText',
   'openFreshButlerSession', 'openButlerSession', 'createButlerSession', 'listButlerSessions',
   'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey', 'dismissSummonBar',
@@ -222,22 +222,44 @@ test('registers the "Ask the butler" global shortcut', async () => {
   assert.equal(typeof keybind.data.run, 'function')
 })
 
-test('pane header toggle writes the hot-reload config knob', async () => {
+test('register arms the chip and in-window receiver with no config key', async () => {
   const calls = []
-  const rest = async (requestPath, opts) => {
-    calls.push({ path: requestPath, opts })
-    if (opts && opts.method === 'POST') return { summon: { pet_click_claim: true } }
-    return { summon: { pet_click_claim: false } }
-  }
-  const env = await loadPlugin({ host: defaultHost(), rest, document: makeDocument() })
+  const document = makeDocument()
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async (requestPath, opts) => {
+      calls.push({ path: requestPath, opts })
+      if (requestPath === '/config') return {}
+      if (requestPath === '/summon/claim') {
+        return { ok: true, enabled: true, running: true }
+      }
+      return {}
+    },
+    document
+  })
 
-  assert.equal(await env.api.writePetClickClaim(true), true)
-  const write = calls.find(call => call.path === '/config' && call.opts && call.opts.method === 'POST')
-  assert.ok(write, 'POST /config was issued')
-  assert.equal(write.opts.body.summon.pet_click_claim, true)
-  assert.equal(write.opts.body.pet_click_claim, true)
-  env.api.setPetClickClaim(false)
+  assert.ok(document.listeners.some(entry => entry.type === 'pointerdown'),
+    'register armed the in-window listener without a stored key')
+  const claims = calls.filter(call => call.path === '/summon/claim'
+    && call.opts && call.opts.method === 'POST')
+  assert.ok(claims.length >= 1, 'register synced the companion chip')
+  assert.ok(claims.every(call => call.opts.body.enabled === true),
+    'every register-time claim sync asks for the chip to be on')
+  env.dispose()
 })
+
+test('a config response without the key resolves to on, an explicit false still disarms',
+  async () => {
+    const env = await loadPlugin({
+      host: defaultHost(), rest: async () => ({}), document: makeDocument()
+    })
+
+    assert.equal(env.api.configPetClickClaim(null), true)
+    assert.equal(env.api.configPetClickClaim({}), true)
+    assert.equal(env.api.configPetClickClaim({ summon: {} }), true)
+    assert.equal(env.api.configPetClickClaim({ summon: { pet_click_claim: false } }), false)
+    env.dispose()
+  })
 
 test('summon injects into the oldest existing Butler chat without using the composer', async () => {
   const opened = []
@@ -674,32 +696,6 @@ test('the pet locator accepts the core bare aria-label="pet" spelling', async ()
   assert.equal(events.at(-1).origin, 'pet')
   unsubscribe()
   env.dispose()
-})
-
-test('the pane claim status is honest about armed / no in-window pet', async () => {
-  const rect = { left: 10, top: 10, width: 32, height: 32, right: 42, bottom: 42 }
-  const withCanvas = await loadPlugin({
-    host: defaultHost(),
-    rest: async requestPath => requestPath === '/config'
-      ? { summon: { pet_click_claim: true } }
-      : { ok: true, enabled: true },
-    document: makeDocument({ canvas: { getBoundingClientRect: () => rect } })
-  })
-  assert.equal(withCanvas.api.petClaimStatusText(), 'Armed — click your pet (in-window)')
-  withCanvas.api.setPetClickClaim(false)
-  assert.equal(withCanvas.api.petClaimStatusText(), 'Off — use Cmd+Shift+A')
-  withCanvas.dispose()
-
-  const withoutCanvas = await loadPlugin({
-    host: defaultHost(),
-    rest: async requestPath => requestPath === '/config'
-      ? { summon: { pet_click_claim: true } }
-      : { ok: true, enabled: true },
-    document: makeDocument({ canvas: null })
-  })
-  assert.equal(withoutCanvas.api.petClaimStatusText(),
-    'No in-window pet — use Cmd+Shift+A')
-  withoutCanvas.dispose()
 })
 
 test('unroutable session surfaces the gateway detail and still runs the /butler fallback',
@@ -1153,21 +1149,19 @@ test('session key namespaces follow the gateway default-profile rule', async () 
   env.dispose()
 })
 
-test('the pane status row always names claim and in-app pet, and flashes once', async () => {
+test('the pane status row names the chip and in-app pet, and flashes once', async () => {
   const env = await loadPlugin({
     host: defaultHost(), rest: async () => ({}), document: makeDocument()
   })
 
-  assert.equal(env.api.petStatusRowText({ claim: false, petFound: false }),
-    'claim: off · pet (in-app): not found')
   assert.equal(env.api.petStatusRowText({ claim: true, petFound: false }),
-    'claim: on · pet (in-app): not found')
-  assert.equal(env.api.petStatusRowText({ claim: false, petFound: true }),
-    'claim: off · pet (in-app): found')
+    'chip: on · pet (in-app): not found')
   assert.equal(env.api.petStatusRowText({ claim: true, petFound: true }),
-    'claim: on · pet (in-app): found')
+    'chip: on · pet (in-app): found')
   assert.equal(env.api.petStatusRowText({ claim: true, petFound: true, flash: true }),
-    'claim: on · pet (in-app): found · → bar opened')
+    'chip: on · pet (in-app): found · → bar opened')
+  assert.equal(env.api.petStatusRowText({ claim: false, petFound: false }),
+    'chip: off · pet (in-app): not found', 'only the stored escape hatch can read off')
   env.dispose()
 })
 
@@ -1219,22 +1213,6 @@ test('a click while the claim is off never opens the bar', async () => {
   assert.equal(events.at(-1).origin, 'pet')
 
   unsubscribe()
-  env.dispose()
-})
-
-test('the in-app pet readout re-queries the canvas instead of trusting a stale flag', async () => {
-  let canvas = null
-  const document = makeDocument({ canvas: () => canvas })
-  const env = await loadPlugin({
-    host: defaultHost(),
-    rest: async () => ({ summon: { pet_click_claim: true } }),
-    document
-  })
-
-  assert.equal(env.api.petClaimStatusText(), 'No in-window pet — use Cmd+Shift+A')
-  canvas = { getBoundingClientRect: () => ({ left: 1, top: 1, width: 8, height: 8, right: 9, bottom: 9 }) }
-  assert.equal(env.api.petClaimStatusText(), 'Armed — click your pet (in-window)',
-    'the status query sees a canvas that appeared after register')
   env.dispose()
 })
 
