@@ -165,6 +165,19 @@ one and it must not outlive the work it was spawned for.
   user reads as "not next to my pet". The sprite size travels in the claim op
   (`sprite_w` / `sprite_h` / `pad_bottom`) because the chip's companion is
   spawned petless and cannot know it.
+- The claim chip is a 26x24 hat badge (`🎩`) at the sprite's TOP-RIGHT: the first
+  placement candidate is `x = pet.maxX - 0.3*width`, `y = pet.minY - gap - height`,
+  so it reads as perched on the pet's head. A borderless `NSWindow` cannot become
+  key by default and then never routes clicks into its content view, so the chip
+  is built from `ClaimChipWindow` (overrides `canBecomeKey` true,
+  `canBecomeMain` false) and its view overrides `acceptsFirstResponder`.
+- Never verify the chip's click by writing a `summon_pending` row into
+  `state.json` yourself: `summon_ack` clears the ENGINE's in-memory pending only
+  and does not rewrite the file, so a hand-written row survives forever whether
+  or not the desktop consumed it. The only honest end-to-end test is a real
+  mouse click on the chip (synthetic `CGEventPost` clicks are dropped without an
+  Accessibility grant, and `screencapture` / cua-driver captures fail on this
+  machine for the same reason).
 - Two plugin-hosting Python processes (the gateway and the tool worker) each
   own their own companion: a `butler_capture` call from the tool worker adds a
   second `ButlerOverlay` next to the gateway's claim-chip one. They do not
