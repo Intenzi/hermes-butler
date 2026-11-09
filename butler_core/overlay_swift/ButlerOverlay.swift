@@ -1288,17 +1288,42 @@ private final class ClaimChipView: NSView {
     override func mouseEntered(with event: NSEvent) {
         hovering = true
         NSCursor.pointingHand.set()
+        chipJournal("hover-in")
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         hovering = false
         NSCursor.arrow.set()
+        chipJournal("hover-out")
         needsDisplay = true
     }
 
     override func mouseDown(with event: NSEvent) {
+        chipJournal("click")
         onClick?()
+    }
+
+    /// Bounded event journal (`chip-events.log` in the plugin data dir).
+    ///
+    /// Support needs to know whether a click REACHED the window before anyone
+    /// can blame the summon pipeline: hover-in without click means the window
+    /// swallowed the press, click with no `state.json` row means the companion
+    /// to engine hop is at fault. 200 lines, then it rewrites itself.
+    private func chipJournal(_ event: String) {
+        let dir = (NSHomeDirectory() as NSString)
+            .appendingPathComponent(".hermes/plugin-data/butler")
+        let path = (dir as NSString).appendingPathComponent("chip-events.log")
+        let stamp = String(format: "%.3f", Date().timeIntervalSince1970)
+        var lines = (try? String(contentsOfFile: path, encoding: .utf8))?
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init) ?? []
+        lines.append("\(stamp) \(event)")
+        if lines.count > 200 {
+            lines.removeFirst(lines.count - 200)
+        }
+        let payload = lines.joined(separator: "\n") + "\n"
+        try? payload.write(toFile: path, atomically: true, encoding: .utf8)
     }
 
     override func draw(_ dirtyRect: NSRect) {
