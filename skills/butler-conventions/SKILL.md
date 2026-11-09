@@ -151,6 +151,20 @@ one and it must not outlive the work it was spawned for.
 - Before "the pet animates wrong" becomes code, check the artwork: count
   closed-eye frames per loop in the sheet (terminal-ghost-2 has 2 of 6, i.e.
   two blinks per 1.1 s loop) and confirm the rate with the user first.
+- The desktop half (`desktop/plugin.js`) does NOT reliably hot-reload on this
+  app build. The linked checker compares CONTENT (`sameFile(target, entry)` in
+  `electron/desktop-plugins-root.ts`), so writing the installed copy yourself
+  makes the two equal and no reload ever fires; a copy that differs also did not
+  re-sync within 14 s. Treat a desktop-plugin change as needing an app restart,
+  and confirm the installed copy with `cmp` before telling the user to test.
+- The pop-out claim chip anchors to the pet *sprite*, not the pop-out window:
+  the window is `max(240, frame*scale + pad)` x `max(300, frame*scale + pad)`, so
+  for a normal 192x208 pet at scale 0.33 the window is a 240x300 box around a
+  63x69 sprite laid out bottom-centred with 24 pt of bottom padding. Anchoring to
+  the window puts the chip ~70 pt above and ~90 pt right of the pet, which the
+  user reads as "not next to my pet". The sprite size travels in the claim op
+  (`sprite_w` / `sprite_h` / `pad_bottom`) because the chip's companion is
+  spawned petless and cannot know it.
 - Two plugin-hosting Python processes (the gateway and the tool worker) each
   own their own companion: a `butler_capture` call from the tool worker adds a
   second `ButlerOverlay` next to the gateway's claim-chip one. They do not
