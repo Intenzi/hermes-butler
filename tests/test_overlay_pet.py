@@ -397,6 +397,12 @@ def test_claim_chip_is_a_hat_icon_at_the_pets_top_right() -> None:
     assert "setAccessibilityElement(true)" in chip_view
     assert "setAccessibilityRole(.button)" in chip_view
     assert "NSFont.systemFont(ofSize: 13.0)" in chip_view
+    # Clickability affordance: pointing-hand cursor + a hover highlight, which
+    # must keep working while a background process owns the window.
+    assert "NSCursor.pointingHand.set()" in chip_view
+    assert "addCursorRect(bounds, cursor: .pointingHand)" in chip_view
+    assert ".activeAlways" in chip_view, "hover must not depend on app activation"
+    assert "cursorUpdate(with" in chip_view
 
     size_body = _swift_function_body(source, "private func claimChipSize(",
                                      "private func claimChipFrame(")

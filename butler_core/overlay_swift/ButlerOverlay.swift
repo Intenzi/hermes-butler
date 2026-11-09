@@ -1179,6 +1179,11 @@ private final class ClaimChipView: NSView {
     /// The whole chip is one emoji: small enough to read as a hat on the pet.
     private static let glyph = "🎩"
     private static let glyphFont = NSFont.systemFont(ofSize: 13.0)
+    /// Hover state drives both the pointing-hand cursor and a brighter chip, so
+    /// "this is clickable" survives even when AppKit will not swap the cursor
+    /// for a background (inactive) app's window.
+    private var hovering = false
+    private var hoverTracking: NSTrackingArea?
     var onClick: (() -> Void)?
 
     override init(frame: NSRect) {
@@ -1210,6 +1215,46 @@ private final class ClaimChipView: NSView {
         return true
     }
 
+    /// `.activeAlways` is what makes hover work at all here: this window belongs
+    /// to a background accessory process, so the default (active-app-only)
+    /// tracking would never fire while the user is working in Hermes.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = hoverTracking {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited,
+                                            .cursorUpdate,
+                                            .activeAlways,
+                                            .inVisibleRect],
+                                  owner: self,
+                                  userInfo: nil)
+        addTrackingArea(area)
+        hoverTracking = area
+    }
+
+    /// Cursor rects cover the case where the companion IS the active app.
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.pointingHand.set()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true
+        NSCursor.pointingHand.set()
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        NSCursor.arrow.set()
+        needsDisplay = true
+    }
+
     override func mouseDown(with event: NSEvent) {
         onClick?()
     }
@@ -1221,15 +1266,22 @@ private final class ClaimChipView: NSView {
         let path = NSBezierPath(roundedRect: background,
                                 xRadius: background.height / 2.0,
                                 yRadius: background.height / 2.0)
-        NSColor(red: 22.0 / 255.0,
-                green: 23.0 / 255.0,
-                blue: 26.0 / 255.0,
-                alpha: 0.92).setFill()
+        if hovering {
+            NSColor(red: 38.0 / 255.0,
+                    green: 41.0 / 255.0,
+                    blue: 54.0 / 255.0,
+                    alpha: 0.98).setFill()
+        } else {
+            NSColor(red: 22.0 / 255.0,
+                    green: 23.0 / 255.0,
+                    blue: 26.0 / 255.0,
+                    alpha: 0.92).setFill()
+        }
         path.fill()
         NSColor(red: 122.0 / 255.0,
                 green: 134.0 / 255.0,
                 blue: 255.0 / 255.0,
-                alpha: 0.55).setStroke()
+                alpha: hovering ? 0.95 : 0.55).setStroke()
         path.lineWidth = 1.0
         path.stroke()
 
