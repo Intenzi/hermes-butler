@@ -151,3 +151,33 @@ one and it must not outlive the work it was spawned for.
 - Before "the pet animates wrong" becomes code, check the artwork: count
   closed-eye frames per loop in the sheet (terminal-ghost-2 has 2 of 6, i.e.
   two blinks per 1.1 s loop) and confirm the rate with the user first.
+- Two plugin-hosting Python processes (the gateway and the tool worker) each
+  own their own companion: a `butler_capture` call from the tool worker adds a
+  second `ButlerOverlay` next to the gateway's claim-chip one. They do not
+  fight (rings only come from the guide's process, the chip from the gateway's)
+  but each is a real process; the petless one retires on its idle watchdog, and
+  a proper single-companion server is not built yet — do not assume "one
+  process" when counting overlays.
+
+## 7. The pop-out pet window is titled "Hermes" and lives on CGWindow layer 3
+
+Anything that has to find the user's popped-out pet (the claim chip anchors to
+it) must identify it by **owner pid + shape only**. Measured on this machine
+(`com.nousresearch.hermes`): the pet panel is an AXWindow whose title is the
+literal string `"Hermes"` (not empty), sized 240x300 at (984,160), and in the
+CGWindow list it is an **NSPanel on layer 3**, while the main window is
+1280x803 on layer 0. Two "obvious" heuristics both fail silently:
+
+- `title.isEmpty` — the panel is titled, so every candidate is rejected.
+- `axTopmostLayer0Windows()` — the panel is layer 3, so it is never listed.
+- `kCGWindowName` is empty without Screen Recording, and AX `AXWindows` can
+  return an empty array before the app's a11y tree warms up, so pool AX frames
+  AND an all-layer CGWindow walk by owner pid on every tick instead of treating
+  CG as a fallback.
+
+The failure mode is invisible from the outside: `positionClaimChip()` gets nil,
+calls `hideClaimChip()` every 0.5 s, and the chip window is created and
+destroyed forever — "nothing is around my pet", with the companion healthy and
+no log line anywhere. Verify a chip fix with the CGWindow list, not by looking:
+a live chip is an 84x24 window owned by the `ButlerOverlay` pid, 10 pt clear of
+the pet panel.
