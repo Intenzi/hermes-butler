@@ -7,9 +7,9 @@
  * creates or focuses the "Butler" chat.
  *
  * SDK-first surface (routes, nav, palette, status bar, keybinds, host sessions,
- * composer submit). The one deliberate reach-in is the opt-in pet-click
+ * composer submit). The one deliberate reach-in is the always-on pet-click
  * receiver: it only READS the pet canvas rect and observes pointerdown; it
- * never paints into the canvas and is torn down when the toggle is off.
+ * never paints into the canvas and is torn down with the plugin.
  * Bubble rendering stays on the Python side via ctx.pet.say.
  */
 import {
@@ -73,7 +73,7 @@ let petSayTicks = 0
 let petLastTick = null
 
 // Summon door state. The bar component is the only visible surface; the
-// keybind and the opt-in pet-click listener just publish "open".
+// keybind and the installed-by-default pet-click listener just publish "open".
 let summonOpen = false
 let summonOrigin = 'shortcut'
 // Increments on every pet-origin open; the pane row flashes when it changes.
@@ -81,7 +81,6 @@ let petClickSeq = 0
 const summonListeners = new Set()
 let petClickClaim = false
 let petClickWatcher = null
-let petClickConfigWrites = 0
 let claimConfigTimer = null
 // Module-scope consumer for the companion chip's summon row. The hook inside
 // SummonBar only runs while that component is mounted; the chip click path must
@@ -658,22 +657,14 @@ function petCanvasNode() {
   return null
 }
 
-/** Honest pane status: only claim "armed" when the in-window canvas exists. */
-function petClaimStatusText() {
-  if (!petClickClaim) return 'Off — use Cmd+Shift+A'
-  if (petCanvasSeen || petCanvasNode()) {
-    return 'Armed — click your pet (in-window)'
-  }
-  return 'No in-window pet — use Cmd+Shift+A'
-}
-
 /**
- * The pane's persistent two-field readout. `claim` is the authoritative config
- * poll, `petFound` is the in-app canvas query; `flash` is the brief confirmation
- * after a claimed click opened the bar. It never becomes a multi-line nag.
+ * The pane's persistent two-field readout. The chip is on for an installed
+ * plugin; `petFound` is the in-app canvas query and `flash` is the brief
+ * confirmation after a claimed click opened the bar. It never becomes a
+ * multi-line nag and it has no switch semantics.
  */
-function petStatusRowText({ claim = false, petFound = false, flash = false } = {}) {
-  const row = `claim: ${claim ? 'on' : 'off'} · pet (in-app): ${petFound ? 'found' : 'not found'}`
+function petStatusRowText({ claim = true, petFound = false, flash = false } = {}) {
+  const row = `chip: ${claim ? 'on' : 'off'} · pet (in-app): ${petFound ? 'found' : 'not found'}`
   return flash ? `${row} · → bar opened` : row
 }
 
@@ -716,7 +707,10 @@ function dismissSummonBar() {
 }
 
 function configPetClickClaim(data) {
-  if (!data || typeof data !== 'object') return false
+  // Installed means on. Only an explicit false in the response (the stored
+  // escape hatch) turns the chip off; an older host that omits the key keeps it
+  // on rather than silently hiding the chip.
+  if (!data || typeof data !== 'object') return true
   if (data.summon && typeof data.summon === 'object'
     && typeof data.summon.pet_click_claim === 'boolean') {
     return data.summon.pet_click_claim
@@ -724,26 +718,8 @@ function configPetClickClaim(data) {
   if (typeof data['summon.pet_click_claim'] === 'boolean') {
     return data['summon.pet_click_claim']
   }
-  return data.pet_click_claim === true
-}
-
-async function writePetClickClaim(enabled) {
-  const next = Boolean(enabled)
-  // Apply locally first so the switch cannot lag the listener; revert if the
-  // backend refuses the write.
-  setPetClickClaim(next)
-  if (!rest || typeof rest !== 'function') return false
-  const writeId = ++petClickConfigWrites
-  try {
-    const result = await rest('/config', {
-      method: 'POST',
-      body: { summon: { pet_click_claim: next }, pet_click_claim: next }
-    })
-    return configPetClickClaim(result) === next
-  } catch (err) {
-    if (writeId === petClickConfigWrites) setPetClickClaim(!next)
-    return false
-  }
+  if (typeof data.pet_click_claim === 'boolean') return data.pet_click_claim
+  return true
 }
 
 function startPetClickWatcher() {
@@ -875,13 +851,14 @@ async function syncPetClickClaim() {
   if (!rest || typeof rest !== 'function') return
   try {
     const result = await rest('/config')
+    // Missing/legacy responses resolve to on; only a stored false disarms.
     const enabled = configPetClickClaim(result)
     setPetClickClaim(enabled)
     // Keep the pop-out chip on the same config value, and refresh its process
     // heartbeat so the companion's idle watchdog does not retire it.
     await syncCompanionClaim(enabled)
   } catch (err) {
-    // Backend not mounted yet; the toggle still writes once it is.
+    // Backend not mounted yet; register already armed the chip directly.
   }
 }
 
@@ -899,7 +876,7 @@ function startClaimConfigPolling(ctx) {
   try {
     claimConfigTimer = window.setInterval(tick, CONFIG_REFRESH_MS)
   } catch (err) {
-    // No timer surface: the pane toggle still applies directly.
+    // No timer surface: register already armed the chip directly.
   }
 }
 
@@ -1377,7 +1354,7 @@ function SummonBar() {
   }, [open])
 
   // Follow the pet while the bar is open; otherwise park upper-right. The
-  // same read-only locator the opt-in click listener uses.
+  // same read-only locator the pet-click listener uses.
   useEffect(() => {
     if (!open) return undefined
     let frame = null
@@ -1542,31 +1519,29 @@ function SummonBar() {
   )
 }
 
-function ButlerPetClickToggle() {
+function ButlerChipStatus() {
   const configQuery = useQuery({
     queryKey: ['butler', 'config'],
     queryFn: () => (typeof rest === 'function' ? rest('/config') : Promise.resolve({})),
     refetchInterval: CONFIG_REFRESH_MS,
     refetchOnMount: 'always'
   }) || {}
+  // Installed means on unless the stored escape hatch says false.
   const configured = configPetClickClaim(configQuery.data)
-  const [enabled, setEnabled] = useState(false)
-  const [saving, setSaving] = useState(false)
   // Re-evaluated on a fixed 2 s clock while the pane is mounted, whether or
-  // not the claim is on: "not found" is the honest answer when the pet is
+  // not the chip is on: "not found" is the honest answer when the pet is
   // popped out into its own OS window.
   const [petFound, setPetFound] = useState(() => Boolean(petCanvasNode()))
   const [flash, setFlash] = useState(false)
   const flashTimerRef = useRef(null)
   const lastClickSeqRef = useRef(null)
-  const liveRef = useRef({ claim: false, petFound: false })
+  const liveRef = useRef({ claim: true, petFound: false })
   liveRef.current = { claim: configured, petFound }
 
   useEffect(() => {
     // A null initial query must not disarm the register-time watcher: only a
-    // real config response decides the switch/listener state.
+    // real config response (an explicit false) can turn the chip off.
     if (configQuery.data === null || configQuery.data === undefined) return
-    setEnabled(configured)
     setPetClickClaim(configured)
   }, [configured, configQuery.data])
 
@@ -1603,36 +1578,6 @@ function ButlerPetClickToggle() {
     }
   }, [])
 
-  const onToggle = async (event) => {
-    const next = Boolean(event.target.checked)
-    setEnabled(next)
-    setSaving(true)
-    const saved = await writePetClickClaim(next)
-    setSaving(false)
-    if (saved) {
-      await syncCompanionClaim(next)
-      try {
-        // Pull the authoritative value forward; the row reads the poll, not
-        // the optimistic switch.
-        if (typeof configQuery.refetch === 'function') configQuery.refetch()
-      } catch (err) {
-        // The next 5 s poll still lands the same value.
-      }
-      return
-    }
-    setEnabled(!next)
-    setPetClickClaim(!next)
-    try {
-      host && host.notify && host.notify({
-        kind: 'error',
-        title: 'Butler',
-        message: 'Could not save the pet-click setting. The receiver is off; the shortcut still works.'
-      })
-    } catch (err) {
-      // No toast surface: the reverted switch is the report.
-    }
-  }
-
   const claimedAndFound = configured && petFound
   const rowText = petStatusRowText({ claim: configured, petFound, flash })
   const rowColor = flash ? '#f5c26b' : (claimedAndFound ? '#6fd39a' : '#8a8f98')
@@ -1642,38 +1587,15 @@ function ButlerPetClickToggle() {
     : (claimedAndFound ? 'rgba(111,211,154,.08)' : 'rgba(255,255,255,.03)')
 
   return h('div', {
-    style: { display: 'flex', flexDirection: 'column', gap: 6 }
-  },
-    h('label', {
-      style: {
-        display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
-        fontSize: 12, color: '#c7cbd2', padding: '7px 10px', borderRadius: 9,
-        border: '1px solid rgba(255,255,255,.08)', background: 'rgba(255,255,255,.03)'
-      }
-    },
-      h('input', {
-        type: 'checkbox',
-        checked: enabled,
-        disabled: saving,
-        'aria-label': 'Click the pet to ask the butler',
-        onChange: onToggle,
-        style: { cursor: 'pointer', accentColor: 'var(--ui-accent-local, #9aa3ea)' }
-      }),
-      h('span', { style: { flex: 1 } }, 'Click the pet to ask the butler'),
-      h('span', { style: { fontSize: 10, color: enabled ? '#6fd39a' : '#6f7784' } },
-        saving ? 'saving…' : (enabled ? 'on' : 'off'))
-    ),
-    h('div', {
-      role: 'status',
-      'aria-live': 'polite',
-      style: {
-        alignSelf: 'flex-start', fontSize: 10.5, lineHeight: 1.4,
-        padding: '2px 8px', borderRadius: 99,
-        color: rowColor, border: `1px solid ${rowBorder}`,
-        background: rowBackground
-      }
-    }, rowText)
-  )
+    role: 'status',
+    'aria-live': 'polite',
+    style: {
+      alignSelf: 'flex-start', fontSize: 10.5, lineHeight: 1.4,
+      padding: '2px 8px', borderRadius: 99,
+      color: rowColor, border: `1px solid ${rowBorder}`,
+      background: rowBackground
+    }
+  }, rowText)
 }
 
 // ---------------------------------------------------------------- pet speech
@@ -1820,7 +1742,7 @@ function ButlerApp() {
         }, 'Refresh'))
     ),
 
-    h(ButlerPetClickToggle, {}),
+    h(ButlerChipStatus, {}),
 
     error && h('div', {
       style: { fontSize: 12, color: '#f08080', border: '1px solid rgba(240,128,128,.3)', borderRadius: 10, padding: '9px 12px' }
@@ -1944,8 +1866,9 @@ export default {
       }
     ])
 
-    // pet-click claim is opt-in and hot-reloads from plugin data on every
-    // config poll; disabling it tears the listener + overlay down.
+    // Installing the plugin is the opt-in: arm the in-window listener and the
+    // pop-out chip on register. The config poll still honours an explicit
+    // stored `false` (the manual escape hatch) after a plugin reload.
     try {
       ctx.onDispose(() => {
         stopPetClickWatcher()
@@ -1963,6 +1886,10 @@ export default {
         summonPendingTimer = null
       })
     } catch (err) { }
+    setPetClickClaim(true)
+    syncCompanionClaim(true)
+    // Reconcile with the stored value (including an explicit false) and keep
+    // the companion heartbeat fresh on the periodic tick.
     try { syncPetClickClaim() } catch (err) { }
     startClaimConfigPolling(ctx)
     startSummonPendingPolling(ctx)

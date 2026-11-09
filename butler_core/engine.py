@@ -22,7 +22,7 @@ _OVERLAY = bp_overlay.Overlay()
 DATA_DIR = None
 DEFAULT_POLL = 1.5
 DEFAULT_TIMEOUT = 120.0
-DEFAULT_PET_CLICK_CLAIM = False
+DEFAULT_PET_CLICK_CLAIM = True
 ERROR_STREAK_NOTE = 3  # consecutive poll errors before the note surfaces
 
 # Electron/Chromium apps render their chrome as deeply nested divs. At depth 12
@@ -138,8 +138,10 @@ def _as_bool(value, default=False):
 def pet_click_claim():
     """Whether the desktop may listen for pet clicks to summon the butler.
 
-    Read from plugin data on every call (poll_seconds pattern), so the pane's
-    opt-in toggle hot-reloads without a gateway restart. Default: off.
+    Installing the plugin is the opt-in, so a missing key means on. The key is
+    still read from plugin data on every call (poll_seconds pattern) so an
+    explicit ``false`` — the manual escape hatch — hot-reloads without a
+    gateway restart.
     """
     cfg = _cfg()
     value = cfg.get("summon.pet_click_claim")
@@ -147,6 +149,10 @@ def pet_click_claim():
         summon = cfg.get("summon")
         if isinstance(summon, dict):
             value = summon.get("pet_click_claim")
+    if value is None:
+        return DEFAULT_PET_CLICK_CLAIM
+    # A stored off spelling ("false"/"off"/"no"/"0") disarms; anything
+    # unreadable falls back to the default, so junk cannot hide the chip.
     return _as_bool(value, DEFAULT_PET_CLICK_CLAIM)
 
 

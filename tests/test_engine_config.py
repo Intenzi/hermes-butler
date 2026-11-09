@@ -16,10 +16,21 @@ def _write_config(data_dir: Path, payload: dict) -> None:
     (data_dir / "config.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_pet_click_claim_defaults_false(tmp_path: Path) -> None:
+def test_pet_click_claim_defaults_on_when_the_key_is_absent(tmp_path: Path) -> None:
     engine.init(tmp_path)
 
+    assert engine.pet_click_claim() is True
+
+
+def test_pet_click_claim_explicit_false_is_the_manual_escape_hatch(
+        tmp_path: Path) -> None:
+    engine.init(tmp_path)
+    _write_config(tmp_path, {"summon": {"pet_click_claim": False}})
     assert engine.pet_click_claim() is False
+
+    # Removing the key again means the installed plugin is back on.
+    _write_config(tmp_path, {"summon": {}})
+    assert engine.pet_click_claim() is True
 
 
 def test_pet_click_claim_reads_nested_knob_and_hot_reloads(tmp_path: Path) -> None:
@@ -40,8 +51,9 @@ def test_pet_click_claim_accepts_flat_and_text_spellings(tmp_path: Path) -> None
     _write_config(tmp_path, {"summon": {"pet_click_claim": "off"}})
     assert engine.pet_click_claim() is False
 
+    # Unreadable junk falls back to the installed default, not to off.
     _write_config(tmp_path, {"summon": {"pet_click_claim": "garbage"}})
-    assert engine.pet_click_claim() is False
+    assert engine.pet_click_claim() is True
 
 
 def test_claim_click_sets_summon_pending_and_ack_clears_it(tmp_path: Path) -> None:

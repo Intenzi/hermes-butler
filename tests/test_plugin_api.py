@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -135,11 +136,30 @@ def test_history_ignores_the_legacy_install_dir_fallback(
     assert response.json() == []
 
 
-def test_config_defaults_pet_click_claim_off(client: TestClient) -> None:
+def test_config_defaults_pet_click_claim_on(client: TestClient) -> None:
     response = client.get("/config")
 
     assert response.status_code == 200
-    assert response.json() == {"summon": {"pet_click_claim": False}}
+    assert response.json() == {"summon": {"pet_click_claim": True}}
+
+
+def test_explicit_false_in_config_still_disarms_the_chip(
+        client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "plugin-data" / "butler" / "config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"summon": {"pet_click_claim": False}}), encoding="utf-8")
+
+    assert client.get("/config").json() == {"summon": {"pet_click_claim": False}}
+
+    calls = []
+
+    def fake_sync(enabled):
+        calls.append(enabled)
+        return {"enabled": bool(enabled), "running": False}
+
+    monkeypatch.setattr(plugin_api, "_sync_claim_chip", fake_sync)
+    assert client.post("/summon/claim", json={}).json()["enabled"] is False
+    assert calls == [False]
 
 
 def test_config_write_persists_and_hot_reloads(client: TestClient, tmp_path: Path) -> None:
@@ -433,6 +453,29 @@ def test_summon_claim_endpoint_toggles_the_companion_chip(
         "ok": True, "enabled": False, "running": False
     }
     assert calls == [True, False]
+
+
+def test_summon_claim_defaults_to_armed_and_runs_the_engine_arm_path(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No key anywhere means on: /summon/claim{} must reach set_claim_chip(True)."""
+    armed: list[bool] = []
+
+    def fake_set_claim_chip(enabled):
+        armed.append(enabled)
+        return {"enabled": bool(enabled), "running": True}
+
+    monkeypatch.setattr(engine, "set_claim_chip", fake_set_claim_chip)
+    monkeypatch.setattr(plugin_api, "_CLAIM_SYNCING", False)
+
+    response = client.post("/summon/claim", json={})
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is True
+    # Arming runs off the request thread; wait for that short-lived worker.
+    deadline = time.time() + 2.0
+    while (not armed or plugin_api._CLAIM_SYNCING) and time.time() < deadline:
+        time.sleep(0.01)
+    assert armed == [True]
 
 
 def test_summon_ack_consumes_only_the_named_pending_row(

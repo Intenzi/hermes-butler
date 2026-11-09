@@ -31,24 +31,29 @@ def test_plugin_registers_the_ask_the_butler_keybind() -> None:
     assert "butler.summon" in source
 
 
-def test_plugin_registers_a_fixed_summon_bar_and_pet_click_toggle() -> None:
+def test_plugin_registers_a_fixed_summon_bar_without_a_pet_claim_toggle() -> None:
     source = PLUGIN_JS.read_text(encoding="utf-8")
 
     assert "Ask the butler for a guide…" in source
     assert "TITLEBAR_AREAS" in source
     assert "SummonBar" in source
-    assert "Click the pet to ask the butler" in source
+    # Installing the plugin is the opt-in: no checkbox/switch may render.
+    assert "type: 'checkbox'" not in source
+    assert "Click the pet to ask the butler" not in source
+    assert "writePetClickClaim" not in source
     assert "pet_click_claim" in source
     assert "canvas[aria-label$=\" pet\"]" in source
     assert "canvas[aria-label=\"pet\"]" in source
 
 
-def test_plugin_has_an_honest_in_window_claim_status_and_popout_bridge() -> None:
+def test_plugin_has_an_honest_chip_status_row_and_popout_bridge() -> None:
     source = PLUGIN_JS.read_text(encoding="utf-8")
 
-    assert "Armed — click your pet (in-window)" in source
-    assert "No in-window pet — use Cmd+Shift+A" in source
-    assert "petClaimStatusText" in source
+    assert "chip: ${claim ? 'on' : 'off'} · pet (in-app):" in source
+    assert "petStatusRowText" in source
+    assert "→ bar opened" in source
+    assert "syncCompanionClaim(true)" in source
+    assert "setPetClickClaim(true)" in source
     assert "/summon/claim" in source
     assert "summon_pending" in source
     assert "/summon/ack" in source
