@@ -124,3 +124,20 @@ def test_set_claim_chip_forwards_the_live_sprite_to_the_companion(
 
     assert fake.calls == [("start", False), ("claim_chip", True)]
     assert fake.sprites[-1] == (63, 69)
+
+
+def test_nested_claim_key_wins_over_the_flat_spelling(tmp_path: Path) -> None:
+    """Engine and dashboard must agree on precedence when both keys exist."""
+    from dashboard import plugin_api
+
+    engine.init(tmp_path)
+    _write_config(tmp_path, {
+        "summon": {"pet_click_claim": True},
+        "summon.pet_click_claim": False,
+    })
+
+    assert engine.pet_click_claim() is True
+    assert plugin_api._pet_click_claim({
+        "summon": {"pet_click_claim": True},
+        "summon.pet_click_claim": False,
+    }) is True

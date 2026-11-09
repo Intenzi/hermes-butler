@@ -144,11 +144,14 @@ def pet_click_claim():
     gateway restart.
     """
     cfg = _cfg()
-    value = cfg.get("summon.pet_click_claim")
+    # Nested first, then the flat dotted spelling — the same precedence the
+    # dashboard API uses. They used to disagree, which only mattered once both
+    # keys were present with different values; with the default now ON a
+    # disagreement would hide or show the chip inconsistently between processes.
+    summon = cfg.get("summon")
+    value = summon.get("pet_click_claim") if isinstance(summon, dict) else None
     if value is None:
-        summon = cfg.get("summon")
-        if isinstance(summon, dict):
-            value = summon.get("pet_click_claim")
+        value = cfg.get("summon.pet_click_claim")
     if value is None:
         return DEFAULT_PET_CLICK_CLAIM
     # A stored off spelling ("false"/"off"/"no"/"0") disarms; anything
