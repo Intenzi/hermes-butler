@@ -204,9 +204,18 @@ def _normalize_steps(args_steps):
     return steps
 
 
-def _write_state():
+def _write_state(clear_summon=False):
+    """Publish the shared snapshot. Never raises.
+
+    Two processes host this engine: the agent runtime (guides) and the plugin
+    API that owns the companion (the summon row from a chip click). Each owns
+    part of ``state.json``, so a write merges the other owner's block instead of
+    dropping it — otherwise a click silently erases a running guide, and a guide
+    poll erases a click the desktop has not consumed yet.
+    """
     if not DATA_DIR:
         return
+    path = os.path.join(str(DATA_DIR), "state.json")
     snap = {}
     if _summon_pending is not None:
         snap["summon_pending"] = dict(_summon_pending)
@@ -216,7 +225,20 @@ def _write_state():
             "overlay": _session.get("overlay", "unavailable"),
             "generated_at": time.time(),
         })
-    path = os.path.join(str(DATA_DIR), "state.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        if isinstance(existing, dict):
+            if _session is None and "guide" in existing:
+                snap["guide"] = existing["guide"]
+                for key in ("overlay", "generated_at"):
+                    if key in existing:
+                        snap[key] = existing[key]
+            if not clear_summon and _summon_pending is None \
+                    and "summon_pending" in existing:
+                snap["summon_pending"] = existing["summon_pending"]
+    except Exception:
+        pass
     tmp = path + ".tmp"
     try:
         with open(tmp, "w") as f:
@@ -252,7 +274,9 @@ def consume_summon_pending(pending_id=None):
     if pending_id and _summon_pending.get("id") != pending_id:
         return False
     _summon_pending = None
-    _write_state()
+    # Explicit clear: the merge in _write_state must not resurrect the row we
+    # just consumed.
+    _write_state(clear_summon=True)
     return True
 
 

@@ -161,12 +161,27 @@ def _load_overlay_module():
 
 
 def _engine_module():
-    """Load the plugin's engine (claim-chip + summon-pending owner)."""
+    """Load the plugin's engine (claim-chip + summon-pending owner).
+
+    This process serves ``/summon/claim`` and therefore OWNS the companion that
+    reports chip clicks, but ``register()`` — which normally calls
+    ``engine.init()`` — runs in the agent runtime process. Without an init here
+    the chip arms fine and every click is dropped on the floor: no data dir, no
+    ``on_event`` handler. Initialise it on first use; ``init`` is idempotent.
+    """
     root = Path(__file__).resolve().parents[1]
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     from butler_core import engine as bp_engine
 
+    if getattr(bp_engine, "DATA_DIR", None) is None:
+        try:
+            from butler_core import paths as bp_paths
+
+            bp_engine.init(bp_paths.plugin_data_dir("butler"))
+            logger.info("butler engine initialised in the plugin API process")
+        except Exception:
+            logger.exception("butler engine init failed in the plugin API process")
     return bp_engine
 
 

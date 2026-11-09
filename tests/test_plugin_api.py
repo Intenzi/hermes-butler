@@ -496,3 +496,25 @@ def test_summon_ack_consumes_only_the_named_pending_row(
         "ok": True, "cleared": False
     }
     assert consumed == ["abc123", "other"]
+
+
+def test_engine_module_initialises_the_process_that_owns_the_chip(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plugin API process owns the companion, so it needs engine.init().
+
+    register() runs in the agent runtime; without an init here the chip arms
+    fine and every claim_click is dropped (no data dir, no on_event handler).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(engine, "DATA_DIR", None)
+    monkeypatch.setattr(engine, "_OVERLAY", engine.bp_overlay.Overlay())
+
+    loaded = plugin_api._engine_module()
+
+    assert loaded is engine
+    assert engine.DATA_DIR is not None
+    assert callable(engine._OVERLAY.on_event)
+    # Idempotent: a second call must not clobber an existing init.
+    first = engine.DATA_DIR
+    plugin_api._engine_module()
+    assert engine.DATA_DIR == first
