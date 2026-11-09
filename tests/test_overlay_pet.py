@@ -244,6 +244,53 @@ def test_companion_source_has_the_popout_claim_chip_contract() -> None:
     assert "!frame.intersects(pet)" in source
 
 
+def _swift_function_body(source: str, start_marker: str, end_marker: str) -> str:
+    start = source.find(start_marker)
+    assert start != -1, f"missing Swift marker: {start_marker}"
+    end = source.find(end_marker, start + len(start_marker))
+    assert end != -1, f"missing Swift marker: {end_marker}"
+    return source[start:end]
+
+
+def test_pet_anchor_is_pid_and_shape_based_not_title_or_layer() -> None:
+    """The pop-out pet's AX title is "Hermes" and its panel is on layer 3.
+
+    An empty-title gate or a layer-0 CGWindow filter both make the claim chip
+    invisible, so this pins identification by owner pid + shape only.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    # A CGWindow fallback that does not require AX exists at all.
+    assert "cgWindowFrameList" in source
+    assert "if title.isEmpty, isPetShaped(" not in source
+
+    pet_body = _swift_function_body(
+        source,
+        "private func hermesPetWindowFrame(",
+        "private func claimChipSize(",
+    )
+    assert "title.isEmpty" not in pet_body
+    assert "axTopmostLayer0Windows" not in pet_body
+    assert "let pid = hermesPid()" in pet_body
+    assert "lastPetFrame" in pet_body
+    # Both sources must feed the union, not just exist as helpers.
+    assert "axWindowFrameList(pid: pid)" in pet_body
+    assert "cgWindowFrameList(pid: pid)" in pet_body
+    # Sticky anchoring breaks near ties by area and drops stale anchors.
+    assert "anchorSlack" in pet_body
+    assert "lastPetFrame = nil" in pet_body
+
+    cg_body = _swift_function_body(
+        source,
+        "private func cgWindowFrameList(",
+        "private func axTopmostLayer0Windows(",
+    )
+    assert "kCGWindowOwnerPID" in cg_body
+    assert "kCGWindowLayer" not in cg_body
+    assert "layer == 0" not in cg_body
+    assert "window[kCGWindowName" not in cg_body
+
+
 def test_start_sends_no_pet_op_when_no_pets(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "pets").mkdir()

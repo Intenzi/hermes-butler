@@ -501,6 +501,29 @@ private func windowBounds(_ window: [String: Any]) -> CGRect? {
     return CGRect(x: x, y: y, width: width, height: height)
 }
 
+/// CGWindow bounds for every on-screen window owned by *pid*, across all
+/// window layers. The pet pop-out is an NSPanel that lives on layer 3, so the
+/// layer-0 filter in `axTopmostLayer0Windows()` can never see it. Owner pid is
+/// the only identity used: the window name is empty without Screen Recording
+/// permission, and owner-name matching is fragile. Pooled with the AX frames
+/// every tick rather than tried only after AX fails.
+private func cgWindowFrameList(pid: pid_t) -> [CGRect] {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+    var out: [CGRect] = []
+    for window in info {
+        guard let rawPid = intValue(window[kCGWindowOwnerPID as String]),
+              rawPid > 0, pid_t(rawPid) == pid,
+              let bounds = windowBounds(window) else {
+            continue
+        }
+        out.append(bounds)
+    }
+    return out
+}
+
 private func axTopmostLayer0Windows() -> [AXRunningWindow] {
     let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
@@ -1487,6 +1510,10 @@ private final class OverlayController {
     private var claimChipTimer: Timer?
     private var claimChipEnabled = false
     private let claimChipGap: CGFloat = 10.0
+    /// Last pet-panel frame the chip anchored to. The pet's send-message
+    /// bubble is nearby, so preferring the previous origin keeps the chip from
+    /// hopping between the two when both are on screen.
+    private var lastPetFrame: CGRect?
     private var stdinThread: Thread?
     private var activeRing: RingSpec?
     private var observerTokens: [(NotificationCenter, NSObjectProtocol)] = []
@@ -1856,12 +1883,19 @@ private final class OverlayController {
         positionClaimChip()
     }
 
-    /// Find the core Hermes pet pop-out. With Accessibility the AX window
-    /// frame is authoritative; otherwise the same layer-0 CGWindow enumeration
-    /// capture() uses supplies the bounds. The pet panel is a small, near-square
-    /// Hermes window with no title; the main window and HUD carry titles and/or
-    /// are much larger.
+    /// Find the core Hermes pet pop-out. Identification is owner pid + shape
+    /// only, never title and never window layer: the pet panel's AX title is
+    /// "Hermes" (non-empty) and it is an NSPanel on CGWindow layer 3, so both
+    /// an empty-title gate and a layer-0 filter miss it. AX frames and the
+    /// all-layer CGWindow frames are independent sources pooled every tick;
+    /// the CG source matters because AX can return nothing before its tree
+    /// warms up. The main window (1280x803) is excluded by the 480 pt cap.
     private func hermesPetWindowFrame(primaryHeight: CGFloat) -> CGRect? {
+        guard let pid = hermesPid() else {
+            lastPetFrame = nil
+            return nil
+        }
+
         func isPetShaped(_ bounds: CGRect) -> Bool {
             guard bounds.width >= 60.0, bounds.height >= 60.0,
                   bounds.width <= 480.0, bounds.height <= 480.0 else {
@@ -1871,32 +1905,63 @@ private final class OverlayController {
             return aspect >= 0.6 && aspect <= 1.67
         }
 
-        if let pid = hermesPid(), AXIsProcessTrusted() {
-            for window in axWindowFrameList(pid: pid) {
-                let title = (window.title ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if title.isEmpty, isPetShaped(window.frame),
-                   boxIntersectsAnyScreen(window.frame, primaryHeight: primaryHeight) {
-                    return window.frame
-                }
+        func isNearIdentical(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+            return abs(lhs.minX - rhs.minX) <= 2.0
+                && abs(lhs.minY - rhs.minY) <= 2.0
+                && abs(lhs.maxX - rhs.maxX) <= 2.0
+                && abs(lhs.maxY - rhs.maxY) <= 2.0
+        }
+
+        // Source A: AX frames for the pet's owner pid. Titles are ignored on
+        // purpose — the pop-out panel is titled "Hermes".
+        var raw: [CGRect] = []
+        if AXIsProcessTrusted() {
+            raw.append(contentsOf: axWindowFrameList(pid: pid).map { $0.frame })
+        }
+        // Source B: CGWindow bounds across every layer (the panel is layer 3).
+        // Pooled unconditionally: AX can return an empty tree before it warms
+        // up, and the CG path does not depend on AX at all.
+        raw.append(contentsOf: cgWindowFrameList(pid: pid))
+
+        // Union both sources, collapsing frames that are identical to within
+        // 2 pt on every edge (the same panel seen through AX and CGWindow).
+        var merged: [CGRect] = []
+        for frame in raw where !merged.contains(where: { isNearIdentical($0, frame) }) {
+            merged.append(frame)
+        }
+        // Keep pet-shaped, on-screen candidates only. This excludes the main
+        // 1280x803 window (too large) and the 248x19 strip (too short).
+        let candidates = merged.filter {
+            isPetShaped($0) && boxIntersectsAnyScreen($0, primaryHeight: primaryHeight)
+        }
+        guard !candidates.isEmpty else {
+            lastPetFrame = nil
+            return nil
+        }
+
+        // Stick with the previous anchor when a candidate is still near it.
+        // Several pet-shaped windows can sit close together (the panel and its
+        // send-message bubble both pass the shape test when on screen), so
+        // break ties by area: the panel is the bigger window.
+        if let last = lastPetFrame {
+            let anchorSlack: CGFloat = 40.0
+            let nearby = candidates.filter {
+                abs($0.minX - last.minX) <= anchorSlack
+                    && abs($0.minY - last.minY) <= anchorSlack
+            }
+            if let anchored = nearby.max(by: { $0.width * $0.height < $1.width * $1.height }) {
+                lastPetFrame = anchored
+                return anchored
             }
         }
 
-        let bundlePid = hermesPid()
-        for window in axTopmostLayer0Windows() {
-            let isHermes = (bundlePid != nil && window.pid == bundlePid)
-                || window.name.lowercased().contains("hermes")
-            guard isHermes, let bounds = window.bounds else {
-                continue
-            }
-            let title = (window.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard title.isEmpty, isPetShaped(bounds),
-                  boxIntersectsAnyScreen(bounds, primaryHeight: primaryHeight) else {
-                continue
-            }
-            return bounds
+        // Otherwise the pet panel (240x300) is the largest pet-shaped window;
+        // the bubble (84x77) loses.
+        let largest = candidates.max {
+            $0.width * $0.height < $1.width * $1.height
         }
-        return nil
+        lastPetFrame = largest
+        return largest
     }
 
     private func claimChipSize() -> CGSize {
