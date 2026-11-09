@@ -376,6 +376,74 @@ def test_claim_chip_anchors_the_chip_to_the_sprite_not_the_window() -> None:
     assert "claimChipAnchor(window: petWindow" in position
 
 
+def test_claim_chip_is_a_hat_icon_at_the_pets_top_right() -> None:
+    """The chip is a 26x24 hat badge perched on the sprite's top-right corner.
+
+    Text made it a wide pill beside the pet; the pinned candidate order keeps
+    the hat above the sprite (``pet.minY - gap``) ahead of everything else.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    chip_view = _swift_function_body(source,
+                                     "private final class ClaimChipView: NSView {",
+                                     "// MARK: - Pet sprite sheet")
+    assert "\U0001f3a9" in chip_view, "the chip draws the hat emoji"
+    # The glyph is the whole label; the wording survives only as the AX label.
+    without_label = chip_view.split('setAccessibilityLabel("Ask butler")')
+    assert len(without_label) == 2, "the AX label keeps the wording exactly once"
+    assert "Ask butler" not in "".join(without_label)
+    assert "setAccessibilityElement(true)" in chip_view
+    assert "setAccessibilityRole(.button)" in chip_view
+    assert "NSFont.systemFont(ofSize: 13.0)" in chip_view
+
+    size_body = _swift_function_body(source, "private func claimChipSize(",
+                                     "private func claimChipFrame(")
+    assert "CGSize(width: 26.0, height: 24.0)" in size_body
+    assert "Ask butler" not in size_body
+    assert "max(84.0" not in size_body
+
+    frame_body = _swift_function_body(source, "private func claimChipFrame(",
+                                      "private func positionClaimChip(")
+    assert "pet.maxX - size.width * 0.3" in frame_body
+    top_right = frame_body.find("pet.minY - gap - size.height")
+    right = frame_body.find("pet.maxX + gap")
+    below = frame_body.find("pet.maxY + gap")
+    assert top_right != -1 and right != -1 and below != -1
+    # "Starts with top-right" means ahead of BOTH the right and the below
+    # candidates; comparing minY against maxY alone also held for the old order.
+    assert top_right < right, "top-right must precede the right placement"
+    assert top_right < below, "top-right must precede the below placement"
+    # Keep the clamping + no-overlap guard that makes fallbacks skip.
+    assert "!frame.intersects(pet)" in frame_body
+    assert "return nil" in frame_body
+
+
+def test_claim_chip_window_can_become_key_so_clicks_land() -> None:
+    """A borderless NSWindow is not key, so its view never sees mouseDown."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    window_body = _swift_function_body(source,
+                                       "private final class ClaimChipWindow: NSWindow {",
+                                       "private final class ClaimChipView: NSView {")
+    assert "override var canBecomeKey: Bool" in window_body
+    assert "return true" in window_body
+    assert "override var canBecomeMain: Bool" in window_body
+    assert "return false" in window_body
+
+    chip_view = _swift_function_body(source,
+                                     "private final class ClaimChipView: NSView {",
+                                     "// MARK: - Pet sprite sheet")
+    assert "override var acceptsFirstResponder: Bool" in chip_view
+    assert "return true" in chip_view
+
+    position = _swift_function_body(source, "private func positionClaimChip(",
+                                    "private func hideClaimChip(")
+    assert "ClaimChipWindow(contentRect: appKitFrame" in position
+    assert "NSWindow(contentRect: appKitFrame" not in position
+    assert "styleMask: [.borderless]" in position
+    assert "ignoresMouseEvents = false" in position
+
+
 def test_pet_anchor_is_pid_and_shape_based_not_title_or_layer() -> None:
     """The pop-out pet's AX title is "Hermes" and its panel is on layer 3.
 

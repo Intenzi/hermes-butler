@@ -1158,20 +1158,37 @@ private final class ChipView: NSView {
 
 // MARK: - Pop-out pet claim chip
 
-/// A separate, clickable mini window that sits NEXT TO the core Hermes pet
-/// pop-out. It never overlaps the pet's sprite bounds, so the pet keeps its
-/// own drag/pop-in gestures; this chip is the plugin-owned summon door.
+/// A borderless window cannot become key by default, and a window that cannot
+/// become key never routes clicks into its content view. This subclass only
+/// relaxes key status; it stays non-main so it never steals app activation.
+private final class ClaimChipWindow: NSWindow {
+    override var canBecomeKey: Bool {
+        return true
+    }
+
+    override var canBecomeMain: Bool {
+        return false
+    }
+}
+
+/// A separate, clickable mini window that sits at the TOP-RIGHT of the core
+/// Hermes pet pop-out. It never overlaps the pet's sprite bounds, so the pet
+/// keeps its own drag/pop-in gestures; this chip is the plugin-owned summon
+/// door, drawn as a tiny hat badge rather than a wide text pill.
 private final class ClaimChipView: NSView {
-    private let text: String
-    private let font: NSFont
+    /// The whole chip is one emoji: small enough to read as a hat on the pet.
+    private static let glyph = "🎩"
+    private static let glyphFont = NSFont.systemFont(ofSize: 13.0)
     var onClick: (() -> Void)?
 
-    init(frame: NSRect, text: String, font: NSFont) {
-        self.text = text
-        self.font = font
+    override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
+        // An icon-only view needs a spoken name or it reads as a blank box.
+        setAccessibilityElement(true)
+        setAccessibilityLabel("Ask butler")
+        setAccessibilityRole(.button)
     }
 
     @available(*, unavailable)
@@ -1180,6 +1197,12 @@ private final class ClaimChipView: NSView {
     }
 
     override var isFlipped: Bool {
+        return true
+    }
+
+    /// Borderless chip windows are not key by default; without first-responder
+    /// status AppKit never routes mouseDown to this view.
+    override var acceptsFirstResponder: Bool {
         return true
     }
 
@@ -1210,19 +1233,18 @@ private final class ClaimChipView: NSView {
         path.lineWidth = 1.0
         path.stroke()
 
-        let style = NSMutableParagraphStyle()
-        style.alignment = .center
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.white,
-            .paragraphStyle: style
+            .font: ClaimChipView.glyphFont,
+            .foregroundColor: NSColor.white
         ]
-        let textHeight = (text as NSString).size(withAttributes: attributes).height
-        let textRect = NSRect(x: 8.0,
-                              y: (bounds.height - textHeight) / 2.0,
-                              width: max(0.0, bounds.width - 16.0),
-                              height: textHeight)
-        (text as NSString).draw(in: textRect, withAttributes: attributes)
+        let glyphSize = (ClaimChipView.glyph as NSString)
+            .size(withAttributes: attributes)
+        let glyphRect = NSRect(x: (bounds.width - glyphSize.width) / 2.0,
+                               y: (bounds.height - glyphSize.height) / 2.0,
+                               width: glyphSize.width,
+                               height: glyphSize.height)
+        (ClaimChipView.glyph as NSString).draw(in: glyphRect,
+                                              withAttributes: attributes)
     }
 }
 
@@ -2035,9 +2057,8 @@ private final class OverlayController {
     }
 
     private func claimChipSize() -> CGSize {
-        let font = NSFont.systemFont(ofSize: 11.0, weight: .semibold)
-        let textBounds = ("Ask butler" as NSString).size(withAttributes: [.font: font])
-        return CGSize(width: max(84.0, ceil(textBounds.width) + 24.0), height: 24.0)
+        // Icon chip: fixed size. No text measurement, so it can never widen.
+        return CGSize(width: 26.0, height: 24.0)
     }
 
     private func claimChipFrame(nextTo pet: CGRect,
@@ -2049,12 +2070,17 @@ private final class OverlayController {
         let visible = quartzRect(fromAppKit: screen.visibleFrame,
                                  primaryHeight: primaryHeight)
         let gap = claimChipGap
+        // Top-right first: a hat perched on the pet's head. The 0.3 overlap of
+        // the sprite's own width tucks it toward the crown instead of floating
+        // a full gap away; the intersect guard still rejects any clamped
+        // candidate that lands on the sprite.
         let candidates = [
+            CGRect(x: pet.maxX - size.width * 0.3,
+                   y: pet.minY - gap - size.height,
+                   width: size.width, height: size.height),
             CGRect(x: pet.maxX + gap, y: pet.midY - size.height / 2.0,
                    width: size.width, height: size.height),
             CGRect(x: pet.minX - gap - size.width, y: pet.midY - size.height / 2.0,
-                   width: size.width, height: size.height),
-            CGRect(x: pet.midX - size.width / 2.0, y: pet.minY - gap - size.height,
                    width: size.width, height: size.height),
             CGRect(x: pet.midX - size.width / 2.0, y: pet.maxY + gap,
                    width: size.width, height: size.height),
@@ -2107,11 +2133,10 @@ private final class OverlayController {
             return
         }
 
-        let font = NSFont.systemFont(ofSize: 11.0, weight: .semibold)
-        let window = NSWindow(contentRect: appKitFrame,
-                              styleMask: [.borderless],
-                              backing: .buffered,
-                              defer: false)
+        let window = ClaimChipWindow(contentRect: appKitFrame,
+                                     styleMask: [.borderless],
+                                     backing: .buffered,
+                                     defer: false)
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
@@ -2126,9 +2151,8 @@ private final class OverlayController {
         window.isReleasedWhenClosed = false
         window.acceptsMouseMovedEvents = false
 
-        let view = ClaimChipView(frame: NSRect(origin: .zero, size: appKitFrame.size),
-                                 text: "Ask butler",
-                                 font: font)
+        let view = ClaimChipView(frame: NSRect(origin: .zero,
+                                               size: appKitFrame.size))
         view.autoresizingMask = [.width, .height]
         view.onClick = { [weak self] in
             self?.writeClaimClick()
