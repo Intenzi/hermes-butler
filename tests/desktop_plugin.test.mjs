@@ -261,7 +261,7 @@ test('a config response without the key resolves to on, an explicit false still 
     env.dispose()
   })
 
-test('summon injects into the oldest existing Butler chat without using the composer', async () => {
+test('summon injects into the most recent existing Butler chat without using the composer', async () => {
   const opened = []
   const submitted = []
   const injected = []
@@ -1321,5 +1321,44 @@ test('a failed ack still opens the bar and never throws', async () => {
   assert.equal(events.at(-1).open, true, 'the bar opens even when the ack fails')
 
   unsubscribe()
+  env.dispose()
+})
+
+test('summon targets the NEWEST Butler chat when several share the title', async () => {
+  const injected = []
+  const opened = []
+  const host = defaultHost({
+    request: async (method) => {
+      if (method === 'session.list') {
+        return [
+          { id: 'old-chat', title: 'Butler', created_at: 10 },
+          { id: 'new-chat', title: 'Butler', created_at: 900 },
+          { id: 'mid-chat', title: 'Butler', created_at: 500 },
+          { id: 'other', title: 'Butler (previous)', created_at: 999 }
+        ]
+      }
+      if (method === 'session.activate') return { ok: true }
+      throw new Error(`unexpected request ${method}`)
+    },
+    openSession: async (id) => { opened.push(id); return true },
+    composer: { submit: () => false }
+  })
+  const env = await loadPlugin({
+    host,
+    rest: async (requestPath, opts) => {
+      if (requestPath === '/summon/send') {
+        injected.push(opts.body.session_id)
+        return { ok: true, session: opts.body.session_id }
+      }
+      return {}
+    },
+    document: makeDocument()
+  })
+
+  const result = await env.api.summonButler('open settings')
+
+  assert.equal(result.ok, true)
+  assert.deepEqual(injected, ['new-chat'], 'the newest exact Butler chat wins')
+  assert.deepEqual(opened, ['new-chat'])
   env.dispose()
 })

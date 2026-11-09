@@ -273,9 +273,16 @@ function exactButlerTitle(row) {
   return title === BUTLER_TITLE ? row : null
 }
 
-function oldestSession(rows) {
+/**
+ * The most recent chat still titled exactly "Butler".
+ *
+ * Several can exist: an older build, a failed rename, or a user who renamed one
+ * back. The chat people mean by "the Butler chat" is the newest one, so it wins
+ * over the oldest — a fixed target drifts further from their work every day.
+ */
+function mostRecentSession(rows) {
   const matching = asArray(rows).map(exactButlerTitle).filter(Boolean)
-  matching.sort((a, b) => sessionStartedAt(a) - sessionStartedAt(b))
+  matching.sort((a, b) => sessionStartedAt(b) - sessionStartedAt(a))
   return matching[0] || null
 }
 
@@ -566,18 +573,20 @@ function notifySummonSuccess(result) {
   }
 }
 
-/** Create the one "Butler" chat, or focus the oldest matching one. */
+/** Create the one "Butler" chat, or focus the most recent matching one. */
 async function openButlerSession() {
   if (launcherBusy) return launcherState(false, 'busy')
   launcherBusy = true
   launcherTargetId = null
   launcherTargetAliases = []
   try {
-    const existing = oldestSession(await listButlerSessions())
+    const existing = mostRecentSession(await listButlerSessions())
     if (existing) {
-      // The default destination is the oldest exact Butler chat: focus THAT
-      // chat. If focusing fails, surface the reason instead of quietly minting
-      // a different session behind the user's back.
+      // The default destination is the MOST RECENT exact Butler chat: focus
+      // that one, so "Butler chat" follows the user's latest work instead of a
+      // chat chosen the day the plugin was installed. If focusing fails,
+      // surface the reason instead of quietly minting a different session
+      // behind the user's back.
       const focused = await focusSession(existing)
       if (!focused.ok) notifyLauncherFailure()
       return focused
@@ -944,7 +953,7 @@ function startSummonPendingPolling(ctx) {
  * text is seated as a draft and the caller gets the exact failure reason.
  */
 async function refreshSummonTarget(fallback) {
-  const row = oldestSession(await listButlerSessions())
+  const row = mostRecentSession(await listButlerSessions())
   if (!row) return null
   const ids = rowTargetIds(row)
   const target = sessionTargetId(row) || asText(fallback) || ids[0]
@@ -1235,7 +1244,7 @@ async function summonButler(text, options = {}) {
   // The gateway could not host the turn. Preserve the grounded chip ladder:
   // composer.submit('/butler <text>') reaches the slash handler, which reports
   // honestly instead of opening a full conversation. A fresh send must never
-  // re-derive the oldest Butler chat during this fallback.
+  // re-derive the most recent Butler chat during this fallback.
   const fallback = await sendSummonText(target, butlerCommandText(message), {
     ...options,
     refresh: options.refresh !== undefined ? options.refresh : destination !== SUMMON_NEW
