@@ -221,6 +221,31 @@ def resolve_pet_op():
     }
 
 
+def journal_click(event):
+    """Append one line to the shared chip/click journal (bounded, best-effort).
+
+    The companion writes the same file, so a click can be traced hop by hop:
+    ``click`` (view) → ``emit`` (stdout) → ``pipe-claim`` (reader thread) →
+    ``engine-pending`` (engine callback). Never raises: diagnosis must not be
+    able to break the pipe.
+    """
+    try:
+        base = os.path.join(hermes_home(), "plugin-data", "butler")
+        path = os.path.join(base, "chip-events.log")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = [ln for ln in handle.read().splitlines() if ln.strip()]
+        except OSError:
+            lines = []
+        lines.append("%.3f %s" % (time.time(), event))
+        if len(lines) > 200:
+            lines = lines[-200:]
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def resolve_pet_sprite():
     """On-screen sprite size (w, h) in points, or None when no pet is installed.
 
@@ -375,6 +400,7 @@ class Overlay:
             return
 
         def _read():
+            journal_click("reader-start pid=%s" % getattr(proc, "pid", "?"))
             while True:
                 try:
                     raw = stdout.readline()
@@ -406,6 +432,8 @@ class Overlay:
             return
         if message.get("op") in ("claim_click", "launcher_click"):
             callback = self.on_event
+            journal_click("pipe-%s cb=%s" % (
+                message.get("op"), "set" if callable(callback) else "none"))
             if callable(callback):
                 try:
                     callback(message)
