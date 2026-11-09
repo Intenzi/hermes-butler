@@ -1,69 +1,80 @@
 # butler
 
-A Follow-mode guide plugin for Hermes Agent on macOS. In Follow mode, the agent
-plans and edits with the user's eyes on it; butler extends that partnership to
-the whole Mac screen. The agent plans a guide, and the butler walks the user
-through it step by step: a ring around the real UI control on screen, a
-one-line bubble explaining the current move, live progress as steps complete.
-Each step is not assumed but verified — butler re-reads the macOS Accessibility
-layer to confirm the click actually landed. On-device Apple Vision OCR is the
-fallback when Accessibility comes back empty, e.g. gated content in Chromium
-tabs where the AX tree is unavailable.
+Butler is a Follow-mode guide plugin for Hermes Agent on macOS: the agent plans
+a short guide and the butler walks the real screen, step by step, with a ring
+around the control, a one-line bubble, and live progress. Every step is
+verified from the macOS Accessibility layer before the guide advances, so a
+click that did not land stalls the guide instead of being counted. It is
+species-free — it works with any petdex pet — and macOS-only in v0.2.
 
-Butler is species-free: it uses whatever pet plugin the user has installed from
-petdex. The rings, chips, and walk-trail are drawn by butler's own
-click-through Swift companion process, so the overlay works with any pet.
+## Quick start
 
-## Install and first run
+```
+hermes plugins install file:///path/to/butler-plugin      # or the catalog/Git URL
+hermes butler doctor --ask                                # grants + real diagnostics
+hermes gateway restart                                    # the plugin loads at gateway start
+```
 
-Install through the normal `hermes plugins` flow. Then run:
+Then quit and reopen the Hermes desktop app. The desktop half
+(`desktop/plugin.js`) is copied into `desktop-plugins/butler/` when the app
+starts; a running app keeps the copy it started with.
 
-    hermes butler doctor --ask
+`hermes butler doctor --ask` raises the real macOS permission dialogs —
+Accessibility is prompted by the plugin itself via
+`AXIsProcessTrustedWithOptions`, Screen Recording via
+`CGRequestScreenCaptureAccess` — and deep-links the two System Settings panes.
+The CLI prints a JSON report; `--ask` is the only form that also raises the
+dialogs.
 
-That raises the real macOS permission dialogs — accessibility is prompted by
-the plugin itself via `AXIsProcessTrustedWithOptions`, screen recording via
-`CGRequestScreenCaptureAccess` — and deep-links the two System Settings panes
-so the grant is one toggle away. The Accessibility grant is **Butler companion
-- the butler plugin's bundled helper**. Because the butler reads the screen
-through its own small helper, macOS asks once and remembers across updates.
-The final checkbox and one app restart stay manual, because macOS TCC requires
-it; the doctor tells you when it is your turn and tells you when you are clear.
+These three commands work today and print JSON:
+
+```
+hermes butler doctor [--ask]
+hermes butler capture [app]     # optional app-name substring
+hermes butler status
+```
+
+## Grants
+
+| Grant | Subject | Without it |
+|---|---|---|
+| Accessibility | `Butler companion - the butler plugin's bundled helper` | No capture, no guide, no overlay: every step reports `capture_failed` |
+| Screen Recording | the Hermes host process | AX still works; the on-device OCR fallback (Chromium/gated pages) is unavailable |
+
+Accessibility is what makes the rings and the step verification work: the
+companion reads element labels and boxes through it. macOS requires the final
+checkbox and one app restart by hand; the doctor tells you when it is your turn
+and when you are clear.
+
+## Two doors
+
+There are two ways to summon the butler, and both open the same **Ask the
+butler** bar.
+
+- **The pet.** Installing the plugin is the opt-in; there is no separate
+  switch. Clicking the pet inside the Hermes window opens the bar. When the pet
+  is popped out into its own OS window, the bundled companion draws a 26x24 hat
+  badge at the pet's upper right; the badge follows the pet live from AX window
+  notifications (`AXWindowMoved` / `AXWindowResized`) instead of polling.
+- **⌘⇧A.** "Ask the butler" (rebindable in Settings → Keybinds) opens a
+  floating bar anywhere in the desktop. Enter sends, Escape or blur dismisses.
+  Focus stays on the text input; the destination buttons are Tab-reachable
+  after it.
+
+The **Butler chat** destination is the most recent chat titled exactly
+`Butler`; **New session** mints a fresh Butler-titled chat. The choice is kept
+in the desktop's localStorage across openings, and the success toast names it.
 
 ## Usage
 
 ### Ask the butler
 
-Summon the dedicated **Butler** chat from anywhere in the desktop and hand it a
-text request. The bar posts the request to the plugin's gateway route, which
-injects a real agent turn into the chosen chat. The agent plans a short guide and
-starts it immediately; if the request is too vague, it asks exactly one
-clarifying question as a normal chat reply, and you answer it right there. Typing
-a plain message in any chat without the slash is still ordinary conversation.
-
-- **Keyboard shortcut** — "Ask the butler" (default ⌘⇧A, rebindable in
-  Settings → Keybinds). Opens the floating bar; Enter sends, Escape or blur
-  dismisses. Focus stays on the text input; the destination buttons are
-  Tab-reachable after it.
-- **Destination** — a segmented choice in the bar: **Butler chat** (the existing
-  chat, default) or **New session** (always creates a fresh Butler-titled chat,
-  never reuses the oldest). The choice is kept in the desktop's localStorage
-  across openings; the success toast names it.
-- **Click the pet** — on for every installed plugin; installing is the opt-in.
-  There is no switch. The stored config key `summon.pet_click_claim` in
-  `plugin-data/butler/config.json` remains as a manual escape hatch: set it to
-  `false` to disarm (the next config sync applies it, including after a reload).
-  The engine, dashboard, and desktop watcher all read that
-  same file fresh, so the change hot-reloads without a gateway restart. The
-  `/butler` pane shows an honest readout — **chip: on · pet (in-app): found** or
-  **not found** — and flashes **→ bar opened** after a claimed click. When the
-  pet is popped out into its own OS window, the bundled
-  companion draws a small **Ask butler** chip next to it; clicking that chip
-  opens the same bar and destination picker as the shortcut. The chip is found
-  as a small, near-square, title-less on-screen Hermes window; if a future
-  Hermes build names or shapes that panel differently, the chip stays hidden
-  and the shortcut remains the fallback.
-- **Existing surfaces** — the status-bar chip, sidebar page, and palette are
-  unchanged.
+Summon the bar and hand it a text request. The bar posts the request to the
+plugin's gateway route, which injects a real agent turn into the chosen chat.
+The agent plans a short guide and starts it immediately; if the request is too
+vague, it asks exactly one clarifying question as a normal chat reply, and you
+answer it right there. Typing a plain message in any chat without the slash is
+still ordinary conversation.
 
 On send the chat is focused (or created if it does not exist yet), and the
 butler's companion pet double appears by the bar before waving off. With no
@@ -72,12 +83,22 @@ the gateway cannot inject the turn (gateway injection is not allowed or
 unavailable), the bar falls back to posting `/butler <request>` and says plainly
 that the chat could not host the full conversation.
 
+The `/butler` pane in the sidebar shows an honest readout — **chip: on · pet
+(in-app): found** or **not found** — and flashes **→ bar opened** after a
+claimed click. The stored config key `summon.pet_click_claim` in
+`plugin-data/butler/config.json` remains a manual escape hatch: set it to
+`false` to disarm the pet click and the hat badge. The engine, dashboard, and
+desktop watcher read that file fresh, so the change hot-reloads without a
+gateway restart.
+
+If a future Hermes build names or shapes the pop-out panel differently, the hat
+badge stays hidden and the shortcut remains the fallback.
+
 Agent-side tools and commands:
 
 - `/butler <request>` — inject the request into the current chat as a real agent
   turn and return a one-line acknowledgement; the agent's guide plan (or its one
   clarifying question) then appears as a normal chat reply
-
 - `butler_guide_start` — start a guide from a JSON plan of steps
 - `butler_guide_status` — poll the live state of a running guide
 - `butler_capture` — one foreground Accessibility read (element text and boxes)
@@ -85,9 +106,36 @@ Agent-side tools and commands:
 
 CLI equivalents from a terminal:
 
-    hermes butler capture
-    hermes butler status
-    hermes butler doctor [--ask]
+```
+hermes butler capture
+hermes butler status
+hermes butler doctor [--ask]
+```
+
+## What is verified, and how
+
+Each step's arrival is read back from the OS before the guide advances: an
+Accessibility read of the foreground app, then — when the AX tree looks thin —
+one re-walk to depth 24 for Electron/Chromium content, then on-device OCR when
+the Screen Recording grant is present. The poll runs every 1.5 s per step and a
+step times out at 120 s. A guide that cannot verify a step stalls and says so;
+it does not advance on assumption.
+
+## Performance
+
+- The overlay companion idles at 0.0% CPU while the pet is still (measured with
+  `ps` on a live companion).
+- Hat-badge placement is event-driven, not polled: AX `AXWindowMoved` events are
+  coalesced to one placement per 40 ms. A probe logged 86 events in one drag,
+  about 17 ms apart.
+- With the AX observer live, a 3 s reconciliation tick covers what
+  notifications miss (attach-set healing, windows created while the observer
+  was not running). Without the observer the same code falls back to a 0.5 s
+  poll so the badge is never left unpositioned.
+- There is no frame-rate loop in the companion. The only continuous drawing it
+  does is the pet double while a guide is running.
+- The desktop-side click target follows the pet canvas on the renderer's
+  animation frame, but only writes style when the canvas rect actually changes.
 
 ## Skills
 
@@ -124,8 +172,8 @@ Plain statements about what this plugin does when it runs.
    `swiftc`. It is local source, not a fetched binary.
 2. Overlay rendering runs in a spawned local companion process, driven by a
    JSON-over-stdin protocol. The same shared process serves guides, captures,
-   the summon double, and the pop-out claim chip; it exits when idle or
-   when the host closes its pipe.
+   the summon double, and the pop-out hat badge; it exits when idle (a roughly
+   10 min watchdog) or when the host closes its pipe.
 3. The plugin reads the foreground app via the Accessibility framework and,
    where needed, Apple Vision OCR. It reads element text and geometry boxes
    only. No screenshots are stored or transmitted. Element text goes to the
@@ -142,40 +190,66 @@ Plain statements about what this plugin does when it runs.
 7. Butler never writes to other tools' secrets, workspace files, or system
    state, and never types or clicks for the user. It is guide-only by design.
 8. The pet-click receiver is on for every installed plugin: installing is the
-   opt-in. It is a narrow reach-in into the Hermes desktop
-   window, not into any app or the screen. It reads the position
-   and size of the petdex pet canvas (`canvas[aria-label$=" pet"]`, plus the
-   core's bare `canvas[aria-label="pet"]` spelling), places a transparent fixed
-   overlay over it that follows the canvas each frame, and installs
-   document-level capture-phase `pointerdown` listeners to notice a click on
-   that canvas. The pop-out chip rides the same single companion subject and
-   is a separate mini window placed outside the pet's sprite bounds. It never
-   paints into the canvas, never edits Hermes core files, and never types or
-   clicks. The stored `summon.pet_click_claim: false` config key remains a
-   manual escape hatch; the next config sync removes the overlay, listeners, and
-   chip. If a Hermes desktop update
-   changes the canvas markup or the pop-out window shape, the matching surface
-   quietly goes dark (no crash, no console spam) until the selector is
-   re-glued. This receiver needs no Accessibility, Screen Recording, or other
-   TCC grant beyond the companion that already exists for capture.
+   opt-in. It is a narrow reach-in into the Hermes desktop window, not into any
+   app or the screen. It reads the position and size of the petdex pet canvas
+   (`canvas[aria-label$=" pet"]`, plus the core's bare `canvas[aria-label="pet"]`
+   spelling), places a transparent fixed overlay over it that follows the
+   canvas on the renderer's animation frame (writing style only when the rect
+   changes), and installs document-level capture-phase `pointerdown` listeners
+   to notice a click on that canvas. The pop-out hat badge rides the same
+   single companion subject: it is a separate mini window, anchored to the
+   sprite rather than the mostly-empty 240x300 pet panel, and placed at the
+   sprite's upper right when there is room. It never paints into the canvas,
+   never edits Hermes core files, and never types or clicks. The stored
+   `summon.pet_click_claim: false` config key remains a manual escape hatch; the
+   next config sync removes the overlay, listeners, and badge. If a Hermes
+   desktop update changes the canvas markup or the pop-out window shape, the
+   matching surface quietly goes dark (no crash, no console spam) until the
+   selector is re-glued. This receiver needs no Accessibility, Screen
+   Recording, or other TCC grant beyond the companion that already exists for
+   capture.
 
 ## Platform
 
-macOS 13 or later in v0.1. Windows and Linux are not yet supported: capture and
+macOS 13 or later in v0.2. Windows and Linux are not yet supported: capture and
 overlay are swappable modules, so the guide logic carries over when those
 platforms land. Requires Hermes >= 0.22.5.
 
-## Test it locally
+## Uninstall
 
-1. `hermes butler doctor --ask` — grants the two TCC panes; the final checkbox
-   and app restart are manual.
-2. `hermes butler capture` — should print element text and boxes for the
-   current foreground app.
-3. Type `/butler open System Settings` in any chat; the injector acknowledges in
-   chat, then the agent starts the guide (rings, bubbles, progress) rather than
-   printing a plan.
-4. Open the Butler pane from the sidebar: check its status summary, and turn on
-   the pet-click switch if you want clicking the pet to open the bar.
+`hermes plugins disable butler` (or `hermes plugins remove butler`) stops the
+ring and the hat badge; the companion exits on its idle watchdog. Runtime writes
+stay inside `plugin-data/butler/` and `desktop-plugins/butler/`, so those two
+directories are the whole runtime footprint.
 
-Desktop-half tests run with `npm test` (Node's built-in test runner); the
-Python side runs with `python -m pytest`.
+## Limitations
+
+- macOS only.
+- Guides are capped at six steps per plan; a longer task becomes a first guide
+  plus a follow-up.
+- A plan made blind — a native app, a login-gated page — can still be wrong.
+  The guide then stalls and says so rather than guessing.
+- Multi-display placement is implemented but has not been exercised on a
+  multi-monitor setup.
+- OCR requires the Screen Recording grant; without it, gated content that AX
+  cannot see stays unverifiable.
+
+## Screenshots
+
+**The pet hat badge.** The 26x24 badge at the pet's upper right.
+
+![The pet hat badge beside the popped-out pet](docs/img/hat.png)
+
+**A running guide.** A ring on the real control and the one-line bubble.
+
+![A guide ringing a control](docs/img/ring.png)
+
+**The sidebar checklist.** Live step progress in the `/butler` pane.
+
+![The sidebar checklist](docs/img/panel.png)
+
+## Tests
+
+- Python: `python -m pytest -q` — 104 tests.
+- Desktop half: `npm test` — 38 tests (Node's built-in test runner,
+  `tests/desktop_plugin.test.mjs`).

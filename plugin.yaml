@@ -3,8 +3,8 @@ version: 0.2.0
 description: >
   Butler — a Follow-mode guide for Hermes: the agent plans, the butler walks
   your screen step by step (ring on the real control, one-line bubbles, live
-  progress), verifying each step from the macOS Accessibility layer. macOS in
-  v1; capture and overlay are swappable modules for later platforms.
+  progress), verifying each step from the macOS Accessibility layer. macOS only
+  in v0.2; capture and overlay are swappable modules for later platforms.
 requires_hermes: ">=0.22.5"
 api: plugin_api.py
 provides_tools:
