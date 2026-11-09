@@ -1290,6 +1290,110 @@ test('the module poll opens the bar and acks once per unseen pending id', async 
   env.dispose()
 })
 
+test('a text pending row sends to the newest Butler chat and never opens the bar',
+  async () => {
+    const statePayload = {
+      summon_pending: { id: 'pending-text', text: 'turn off wifi', origin: 'chip' }
+    }
+    const calls = []
+    const notifications = []
+    const rest = async (requestPath, opts) => {
+      calls.push({ path: requestPath, opts })
+      if (requestPath === '/state') return statePayload
+      if (requestPath === '/summon/send') return { ok: true, session: opts.body.session_id }
+      if (requestPath === '/summon/ack') return { ok: true, cleared: true }
+      return {}
+    }
+    const host = defaultHost({
+      request: async method => {
+        if (method === 'session.list') {
+          return [
+            { id: 'old-chat', title: 'Butler', created_at: 10 },
+            { id: 'new-chat', title: 'Butler', created_at: 900 },
+            { id: 'other', title: 'Not Butler', created_at: 999 }
+          ]
+        }
+        throw new Error(`unexpected request ${method}`)
+      },
+      notify: payload => notifications.push(payload)
+    })
+    const env = await loadPlugin({ host, rest, document: makeDocument() })
+    const events = []
+    const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
+    const seqBefore = events.at(-1).petClickSeq
+
+    assert.equal(await env.api.pollSummonPending(), true)
+
+    const sends = calls.filter(call => call.path === '/summon/send')
+    assert.equal(sends.length, 1)
+    assert.equal(sends[0].opts.method, 'POST')
+    assert.equal(sends[0].opts.body.text, 'turn off wifi')
+    assert.equal(sends[0].opts.body.session_id, 'new-chat')
+    const acks = calls.filter(call => call.path === '/summon/ack')
+    assert.deepEqual(acks.map(call => call.opts.body.id), ['pending-text'])
+    assert.equal(events.at(-1).open, false, 'a text row never opens the bar')
+    assert.equal(events.at(-1).petClickSeq, seqBefore)
+    assert.equal(notifications.length, 1)
+    assert.equal(notifications[0].kind, 'success')
+    assert.equal(notifications[0].message, 'Sent to Butler')
+
+    unsubscribe()
+    env.dispose()
+  })
+
+test('a text-less pending row still opens the bar and posts no send', async () => {
+  const calls = []
+  const rest = async (requestPath, opts) => {
+    calls.push({ path: requestPath, opts })
+    if (requestPath === '/state') return { summon_pending: { id: 'pending-legacy' } }
+    if (requestPath === '/summon/ack') return { ok: true, cleared: true }
+    return {}
+  }
+  const env = await loadPlugin({ host: defaultHost(), rest, document: makeDocument() })
+  const events = []
+  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  assert.equal(events.at(-1).open, true)
+  assert.equal(calls.filter(call => call.path === '/summon/send').length, 0)
+  assert.deepEqual(calls.filter(call => call.path === '/summon/ack')
+    .map(call => call.opts.body.id), ['pending-legacy'])
+
+  unsubscribe()
+  env.dispose()
+})
+
+test('a failed in-place send still acks the row and notifies the reason', async () => {
+  const calls = []
+  const notifications = []
+  const rest = async (requestPath, opts) => {
+    calls.push({ path: requestPath, opts })
+    if (requestPath === '/state') {
+      return { summon_pending: { id: 'pending-fail', text: 'hi' } }
+    }
+    if (requestPath === '/summon/send') throw new Error('gateway down')
+    if (requestPath === '/summon/ack') return { ok: true }
+    return {}
+  }
+  const host = defaultHost({
+    request: async method => (method === 'session.list'
+      ? [{ id: 'chat-1', title: 'Butler', created_at: 1 }]
+      : []),
+    notify: payload => notifications.push(payload)
+  })
+  const env = await loadPlugin({ host, rest, document: makeDocument() })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  assert.deepEqual(calls.filter(call => call.path === '/summon/ack')
+    .map(call => call.opts.body.id), ['pending-fail'])
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].kind, 'error')
+  assert.match(notifications[0].message, /gateway down/)
+  env.dispose()
+})
+
 test('a failing /state never throws out of the module poll', async () => {
   const env = await loadPlugin({
     host: defaultHost(),

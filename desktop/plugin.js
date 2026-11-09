@@ -889,13 +889,99 @@ function startClaimConfigPolling(ctx) {
   }
 }
 
+/** The Butler chat id an in-place chip send should target. Never focuses a window. */
+async function resolveChipSendTarget() {
+  try {
+    const existing = mostRecentSession(await listButlerSessions())
+    const existingId = sessionTargetId(existing)
+    if (existingId) return existingId
+    if (!host || typeof host.request !== 'function') return null
+    const created = await host.request('session.create', {})
+    const id = asText(created && (created.session_id || created.stored_session_id || created.id))
+    if (!id) return null
+    // Titles are labels; the id routes the send. A failed/refused rename never
+    // blocks the send.
+    try {
+      await renameButlerTitle(id, BUTLER_TITLE)
+    } catch (err) {
+      // Rename is cosmetic.
+    }
+    return id
+  } catch (err) {
+    // Creation/routing failed: report no_session rather than a half-send.
+    return null
+  }
+}
+
+function notifyChipSendSuccess() {
+  try {
+    host && host.notify && host.notify({
+      kind: 'success',
+      title: 'Butler',
+      message: 'Sent to Butler'
+    })
+  } catch (err) {
+    // A missing toast surface must not break the send.
+  }
+}
+
+function notifyChipSendFailure(result) {
+  const reason = asText(result && result.reason) || 'send_failed'
+  const label = SUMMON_REASON_LABELS[reason] || reason
+  let message = `Could not send to Butler: ${label}`
+  if (label !== reason) message += ` (${reason})`
+  const detail = asText(result && result.detail) || summonErrorText(result && result.error)
+  if (detail && detail !== label && detail !== reason) message += ` — ${detail}`
+  try {
+    host && host.notify && host.notify({ kind: 'error', title: 'Butler', message })
+  } catch (err) {
+    // A missing toast surface must not break the poll.
+  }
+}
+
+async function sendPendingSummonText(text) {
+  const target = await resolveChipSendTarget()
+  if (!target) return { ok: false, reason: 'no_session' }
+  try {
+    const response = await rest('/summon/send', {
+      method: 'POST',
+      body: { text, session_id: target }
+    })
+    if (response && response.ok === true) {
+      return { ok: true, session_id: target }
+    }
+    return {
+      ok: false,
+      reason: asText(response && response.reason) || 'send_failed',
+      detail: asText(response && response.detail),
+      error: response && response.error
+    }
+  } catch (err) {
+    return { ok: false, reason: 'send_failed', error: err }
+  }
+}
+
+function ackSummonPending(pendingId) {
+  // Fire and forget: a failed ack never stops the poll and the row is already
+  // deduped, so the same action cannot run twice for this id.
+  try {
+    const ack = rest('/summon/ack', { method: 'POST', body: { id: pendingId } })
+    if (ack && typeof ack.catch === 'function') ack.catch(() => {})
+  } catch (err) {
+    // Swallow: the next /state tick still reports the row unconsumed.
+  }
+}
+
 /**
- * Consume one companion-chip summon row from /state.
+ * Consume one companion summon row from /state.
  *
- * The engine writes `summon_pending` when the pop-out chip is clicked; the
- * desktop's side of that contract is opening the bar and acking the row. This
- * runs at module scope because the SummonBar hook is unmounted on hosts that
- * never painted the titlebar slot (the live failure: the row sat for 12 s).
+ * A row WITH text is the local ask field: the text is posted straight to the
+ * Butler chat and the row acked — the bar never opens and Hermes is never
+ * raised. A row WITHOUT text is the legacy chip/marker click, which keeps
+ * opening the bar exactly as before.
+ *
+ * This runs at module scope because the SummonBar hook is unmounted on hosts
+ * that never painted the titlebar slot (the live failure: the row sat for 12 s).
  * Returns true only for an id this module has not consumed yet.
  */
 function pollSummonPending() {
@@ -907,20 +993,31 @@ function pollSummonPending() {
       const pendingId = asText(pending && pending.id)
       if (!pendingId || pendingId === lastPendingId) return false
       lastPendingId = pendingId
-      try {
-        openSummonBar('pet')
-      } catch (err) {
-        // The click still must not keep the row alive.
+      const text = asText(pending && pending.text)
+      if (!text) {
+        try {
+          openSummonBar('pet')
+        } catch (err) {
+          // The click still must not keep the row alive.
+        }
+        ackSummonPending(pendingId)
+        return true
       }
-      // Fire and forget: a failed ack never stops the poll and the row is
-      // already deduped, so the bar cannot open twice for this id.
-      try {
-        const ack = rest('/summon/ack', { method: 'POST', body: { id: pendingId } })
-        if (ack && typeof ack.catch === 'function') ack.catch(() => {})
-      } catch (err) {
-        // Swallow: the next /state tick still reports the row unconsumed.
-      }
-      return true
+      // Send in place. A failed send still acks: the text was typed once, and
+      // retrying silently is worse than telling the user exactly why it failed.
+      return sendPendingSummonText(text)
+        .then(result => {
+          if (result && result.ok) {
+            notifyChipSendSuccess()
+          } else {
+            notifyChipSendFailure(result)
+          }
+        })
+        .catch(err => notifyChipSendFailure({ reason: 'send_failed', error: err }))
+        .then(() => {
+          ackSummonPending(pendingId)
+          return true
+        })
     })
     .catch(() => false)
 }
@@ -1331,9 +1428,14 @@ function SummonBar() {
   }) || {}
   const pending = pendingQuery.data && pendingQuery.data.summon_pending
   const pendingId = asText(pending && pending.id)
+  const pendingText = asText(pending && pending.text)
   const seenPendingRef = useRef(null)
   useEffect(() => {
     if (!pendingId || seenPendingRef.current === pendingId) return
+    // A text row is the in-place ask field. The module poll sends it and acks;
+    // opening the bar (or acking here) would both violate "no bar" and race the
+    // send away.
+    if (pendingText) return
     seenPendingRef.current = pendingId
     openSummonBar('pet')
     if (typeof rest !== 'function') return
@@ -1343,7 +1445,7 @@ function SummonBar() {
     } catch (err) {
       // The row stays unconsumed; a later poll retries the ack.
     }
-  }, [pendingId])
+  }, [pendingId, pendingText])
 
   useEffect(() => subscribeSummonBar(state => {
     setOpen(state.open)

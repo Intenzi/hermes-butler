@@ -23,7 +23,10 @@
 //
 //  Event lines the renderer writes to stdout (never a request response):
 //    {"op":"launcher_click"}
-//    {"op":"claim_click"}
+//    {"op":"summon_text","text":"...","id":"a1b2c3d4"}
+//
+//  The legacy {"op":"claim_click"} (text-less) event is no longer emitted by
+//  this renderer; the engine still accepts it for older companion binaries.
 //
 //  Coordinates in "box" are global Accessibility (Quartz) screen coordinates:
 //  origin at the top-left of the primary display, y increasing downward.
@@ -1370,6 +1373,117 @@ private final class ClaimChipView: NSView {
     }
 }
 
+// MARK: - In-place ask field
+
+/// Borderless window for the local ask field. It must become KEY so the editor
+/// receives keystrokes, but never MAIN: the companion is an accessory process
+/// and this is a transient panel, not a document window.
+private final class SummonFieldWindow: NSWindow, NSWindowDelegate {
+    /// Called when the panel loses key focus (click elsewhere, another app, or
+    /// a Space switch). The controller closes the field without emitting.
+    var onResignKey: (() -> Void)?
+
+    override var canBecomeKey: Bool {
+        return true
+    }
+
+    override var canBecomeMain: Bool {
+        return false
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        onResignKey?()
+    }
+}
+
+/// The typing box that appears beside the pet. Same dark fill and indigo border
+/// as the claim chip, one single-line `NSTextField`, Enter/Return to send and
+/// Escape to cancel.
+private final class SummonFieldView: NSView, NSTextFieldDelegate {
+    static let fieldWidth: CGFloat = 280.0
+    static let fieldHeight: CGFloat = 34.0
+    private static let inset: CGFloat = 12.0
+    private static let textHeight: CGFloat = 22.0
+
+    let field = NSTextField(frame: .zero)
+    var onSubmit: ((String) -> Void)?
+    var onCancel: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+
+        // The surrounding view paints the dark pill; the field itself stays
+        // chromeless so the two never draw two different backgrounds.
+        field.placeholderString = "Ask the butler…"
+        field.font = NSFont.systemFont(ofSize: 13.0)
+        field.isBordered = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.textColor = NSColor.white
+        field.usesSingleLineMode = true
+        field.lineBreakMode = .byClipping
+        field.cell?.wraps = false
+        field.cell?.isScrollable = true
+        field.delegate = self
+        field.setAccessibilityLabel("Ask the butler")
+        addSubview(field)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override var acceptsFirstResponder: Bool {
+        return true
+    }
+
+    override func layout() {
+        super.layout()
+        field.frame = NSRect(x: SummonFieldView.inset,
+                             y: (bounds.height - SummonFieldView.textHeight) / 2.0,
+                             width: max(0.0, bounds.width - SummonFieldView.inset * 2.0),
+                             height: SummonFieldView.textHeight)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let background = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: background, xRadius: 8.0, yRadius: 8.0)
+        NSColor(red: 22.0 / 255.0,
+                green: 23.0 / 255.0,
+                blue: 26.0 / 255.0,
+                alpha: 0.98).setFill()
+        path.fill()
+        NSColor(red: 122.0 / 255.0,
+                green: 134.0 / 255.0,
+                blue: 255.0 / 255.0,
+                alpha: 0.75).setStroke()
+        path.lineWidth = 1.0
+        path.stroke()
+    }
+
+    /// Return/Enter sends, Escape cancels. `doCommandBy` is the only place a
+    /// single-line field reports those keys before they beep or end editing.
+    func control(_ control: NSControl,
+                 textView: NSTextView,
+                 doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:))
+            || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
+            onSubmit?(field.stringValue)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            onCancel?()
+            return true
+        }
+        return false
+    }
+}
+
 // MARK: - Pet sprite sheet
 
 /// Decoded spritesheet plus the slicing metadata the real pet manifests do not
@@ -1714,6 +1828,16 @@ private final class OverlayController {
     private var claimChipSpriteSize: CGSize?
     private var claimChipPadBottom: CGFloat = ClaimChipSpec.defaultPadBottom
     private let claimChipGap: CGFloat = 10.0
+    /// The local ask field. It takes key focus itself and never activates
+    /// Hermes: the whole point of this door is that the request is typed and
+    /// sent next to the pet, with the user's current app restored afterwards.
+    private var summonFieldWindow: SummonFieldWindow?
+    private var summonFieldView: SummonFieldView?
+    private var summonFieldOpen = false
+    /// The app that was frontmost when the field opened (before the companion
+    /// activated itself), re-activated once the field closes.
+    private var summonFieldReturnApp: NSRunningApplication?
+    private let summonFieldGap: CGFloat = 8.0
     // AX notifications replace the 0.5 s reposition poll while the chip is
     // armed: the Hermes pop-out posts ~17 ms AXWindowMoved events during a
     // drag (a probe logged 86 in one drag, each with live AXPosition/AXSize).
@@ -2532,7 +2656,7 @@ private final class OverlayController {
                                                size: appKitFrame.size))
         view.autoresizingMask = [.width, .height]
         view.onClick = { [weak self] in
-            self?.writeClaimClick()
+            self?.claimChipClicked()
         }
         window.contentView = view
         claimChipWindow = window
@@ -2553,25 +2677,215 @@ private final class OverlayController {
         // seconds. It is stopped only when the chip is disarmed or we shut down.
     }
 
-    private func writeClaimClick() {
+    /// The chip is the local door: it opens (or closes) the in-place ask field
+    /// and never raises Hermes. The request is typed and sent right here.
+    private func claimChipClicked() {
         guard claimChipEnabled else {
-            chipJournal("emit-skipped:disabled")
+            chipJournal("click-skipped:disabled")
             return
         }
-        // The chip can be clicked while another app is in front, and the bar it
-        // opens lives inside Hermes — so raise Hermes first or the click looks
-        // dead. Same for the global hot key below.
-        activateHermes()
-        emitSummon(reason: "chip")
+        toggleSummonField()
     }
 
-    /// One summon event on stdout. The engine turns `claim_click` into the
-    /// pending row the desktop consumes, so the hot key reuses that path rather
-    /// than inventing a second protocol.
-    private func emitSummon(reason: String) {
-        let payload = "{\"op\":\"claim_click\"}\n"
-        FileHandle.standardOutput.write(Data(payload.utf8))
-        chipJournal("emit:reason=" + reason)
+    // MARK: In-place ask field
+
+    private func toggleSummonField() {
+        if summonFieldOpen {
+            closeSummonField(journal: "ask-cancel")
+        } else {
+            openSummonField()
+        }
+    }
+
+    /// A 280x34 box: centred on the chip and 8 pt above it when the chip is
+    /// visible, otherwise centred under the pet's sprite box. Clamped fully on
+    /// screen exactly like `claimChipFrame`.
+    private func summonFieldFrame(primaryHeight: CGFloat) -> CGRect? {
+        let size = CGSize(width: SummonFieldView.fieldWidth,
+                          height: SummonFieldView.fieldHeight)
+        let anchor: CGRect
+        let below: Bool
+        if let chip = claimChipWindow, chip.isVisible {
+            anchor = quartzRect(fromAppKit: chip.frame,
+                                primaryHeight: primaryHeight)
+            below = false
+        } else if let petWindow = hermesPetWindowFrame(primaryHeight: primaryHeight) {
+            anchor = claimChipAnchor(window: petWindow,
+                                     spriteSize: claimChipSpriteSize,
+                                     padBottom: claimChipPadBottom)
+            below = true
+        } else {
+            return nil
+        }
+        guard let screen = screenContaining(anchor,
+                                            primaryHeight: primaryHeight) else {
+            return nil
+        }
+        let visible = quartzRect(fromAppKit: screen.visibleFrame,
+                                 primaryHeight: primaryHeight)
+        let gap = summonFieldGap
+        var frame = CGRect(x: anchor.midX - size.width / 2.0,
+                           y: below ? anchor.maxY + gap
+                                    : anchor.minY - gap - size.height,
+                           width: size.width,
+                           height: size.height)
+        frame.origin.x = min(max(frame.origin.x, visible.minX + 4.0),
+                             visible.maxX - frame.width - 4.0)
+        frame.origin.y = min(max(frame.origin.y, visible.minY + 4.0),
+                             visible.maxY - frame.height - 4.0)
+        return frame
+    }
+
+    private func openSummonField() {
+        guard !isShuttingDown, !summonFieldOpen else {
+            return
+        }
+        guard let primaryHeight = primaryScreenHeight(),
+              let frame = summonFieldFrame(primaryHeight: primaryHeight) else {
+            chipJournal("ask-open-failed")
+            return
+        }
+        let appKitFrame = appKitRect(fromQuartz: frame,
+                                     primaryHeight: primaryHeight)
+        // Captured BEFORE we activate: this is the app the user was working in
+        // and the one that gets focus back when the field closes.
+        summonFieldReturnApp = NSWorkspace.shared.frontmostApplication
+
+        let window = SummonFieldWindow(contentRect: appKitFrame,
+                                       styleMask: [.borderless],
+                                       backing: .buffered,
+                                       defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.level = .statusBar
+        window.collectionBehavior = [.canJoinAllSpaces,
+                                     .stationary,
+                                     .fullScreenAuxiliary,
+                                     .ignoresCycle]
+        window.ignoresMouseEvents = false
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
+        window.isReleasedWhenClosed = false
+        window.acceptsMouseMovedEvents = false
+        window.delegate = window
+        window.onResignKey = { [weak self] in
+            self?.summonFieldResignedKey()
+        }
+
+        let view = SummonFieldView(frame: NSRect(origin: .zero,
+                                                 size: appKitFrame.size))
+        view.autoresizingMask = [.width, .height]
+        view.onSubmit = { [weak self] text in
+            self?.submitSummonText(text)
+        }
+        view.onCancel = { [weak self] in
+            self?.cancelSummonField()
+        }
+        window.contentView = view
+
+        summonFieldWindow = window
+        summonFieldView = view
+        summonFieldOpen = true
+        window.orderFrontRegardless()
+        // Our own panel takes key focus. This is deliberately NOT the Hermes
+        // window: the companion becomes the active app just long enough to
+        // type, then the previous app is restored.
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKey()
+        window.makeFirstResponder(view.field)
+        chipJournal("ask-open")
+    }
+
+    private func closeSummonField(journal event: String?,
+                                  restoreFocus: Bool = true) {
+        guard summonFieldOpen || summonFieldWindow != nil else {
+            return
+        }
+        summonFieldOpen = false
+        let returnApp = summonFieldReturnApp
+        summonFieldReturnApp = nil
+        if let window = summonFieldWindow {
+            // Detach first: orderOut/close resigns key, and the resign handler
+            // must not re-enter this close.
+            window.onResignKey = nil
+            window.delegate = nil
+            window.orderOut(nil)
+            window.close()
+        }
+        summonFieldWindow = nil
+        summonFieldView = nil
+        if let event = event {
+            chipJournal(event)
+        }
+        // Only an explicit close (submit/Esc/toggle) hands focus back. When the
+        // field resigned because the user moved to another app, that app must
+        // keep focus — restoring here would steal it, the very coercion this
+        // door removes.
+        if restoreFocus && !isShuttingDown {
+            restoreFrontmostApp(returnApp)
+        }
+    }
+
+    private func submitSummonText(_ raw: String) {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Empty text is a cancel, not an empty request on the wire.
+        guard !text.isEmpty else {
+            closeSummonField(journal: "ask-cancel")
+            return
+        }
+        let payload: [String: Any] = [
+            "op": "summon_text",
+            "text": text,
+            "id": String(format: "%08x", arc4random())
+        ]
+        // Build the line with JSONSerialization: a quote or newline in the
+        // request must never break the stdout protocol.
+        guard let data = try? JSONSerialization.data(withJSONObject: payload,
+                                                     options: []),
+              let line = String(data: data, encoding: .utf8) else {
+            chipJournal("ask-submit-failed")
+            closeSummonField(journal: nil)
+            return
+        }
+        FileHandle.standardOutput.write(Data((line + "\n").utf8))
+        chipJournal("ask-submit:\(text.count)chars")
+        closeSummonField(journal: nil)
+    }
+
+    private func cancelSummonField() {
+        guard summonFieldOpen else {
+            return
+        }
+        closeSummonField(journal: "ask-cancel")
+    }
+
+    private func summonFieldResignedKey() {
+        guard summonFieldOpen else {
+            return
+        }
+        // Clicking the chip moves key to its window before mouseDown runs; let
+        // the chip's own toggle close the field instead of closing here and
+        // immediately re-opening it.
+        if let chip = claimChipWindow, NSApp.keyWindow === chip {
+            return
+        }
+        closeSummonField(journal: "ask-cancel", restoreFocus: false)
+    }
+
+    /// Hand focus back to the app the user was in before the field opened.
+    /// Never re-activates the companion itself.
+    private func restoreFrontmostApp(_ app: NSRunningApplication?) {
+        guard let app = app,
+              !app.isTerminated,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+            return
+        }
+        if #available(macOS 14.0, *) {
+            app.activate()
+        } else {
+            app.activate(options: [.activateIgnoringOtherApps])
+        }
     }
 
     // MARK: System-wide summon hot key
@@ -2637,6 +2951,11 @@ private final class OverlayController {
         guard !isShuttingDown else {
             return
         }
+        // A second press while the field is open closes it without emitting.
+        if summonFieldOpen {
+            closeSummonField(journal: "ask-cancel")
+            return
+        }
         if let pid = hermesPid(),
            let app = NSRunningApplication(processIdentifier: pid),
            app.isActive {
@@ -2644,21 +2963,7 @@ private final class OverlayController {
             return
         }
         chipJournal("hotkey-fired")
-        activateHermes()
-        emitSummon(reason: "hotkey")
-    }
-
-    /// Bring the Hermes window forward so the bar it opens is actually visible.
-    private func activateHermes() {
-        guard let pid = hermesPid(),
-              let app = NSRunningApplication(processIdentifier: pid) else {
-            return
-        }
-        if #available(macOS 14.0, *) {
-            app.activate()
-        } else {
-            app.activate(options: [.activateIgnoringOtherApps])
-        }
+        openSummonField()
     }
 
     // MARK: Pet double
@@ -3271,6 +3576,7 @@ private final class OverlayController {
         claimChipTimerInterval = 0.0
         stopPetObservation()
         removeSummonHotKey()
+        closeSummonField(journal: nil, restoreFocus: false)
         hideClaimChip()
         petTimer?.invalidate()
         petTimer = nil

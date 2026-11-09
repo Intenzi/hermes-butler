@@ -19,6 +19,7 @@ Protocol: one JSON line per op on stdin -
 The companion writes one event line on clickable mini-windows:
   {"op":"launcher_click"}
   {"op":"claim_click"}
+  {"op":"summon_text","text":"...","id":"a1b2c3d4"}
 """
 import json
 import os
@@ -430,7 +431,7 @@ class Overlay:
     def _handle_message(self, message):
         if not isinstance(message, dict):
             return
-        if message.get("op") in ("claim_click", "launcher_click"):
+        if message.get("op") in ("claim_click", "launcher_click", "summon_text"):
             callback = self.on_event
             journal_click("pipe-%s cb=%s" % (
                 message.get("op"), "set" if callable(callback) else "none"))

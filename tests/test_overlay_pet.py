@@ -293,6 +293,16 @@ def test_claim_click_event_reaches_the_engine_callback() -> None:
     assert seen == [{"op": "claim_click"}]
 
 
+def test_summon_text_event_reaches_the_engine_callback() -> None:
+    controller = overlay.Overlay()
+    seen = []
+    controller.on_event = seen.append
+
+    controller._handle_message({"op": "summon_text", "text": "hi", "id": "abc"})
+
+    assert seen == [{"op": "summon_text", "text": "hi", "id": "abc"}]
+
+
 def test_reader_dispatches_click_events_and_queues_ax_responses() -> None:
     read_fd, write_fd = os.pipe()
     proc = _FakeProc()
@@ -632,7 +642,7 @@ def test_claim_chip_is_driven_by_hermes_ax_notifications() -> None:
     assert "kAXWindowResizedNotification" in attach
 
     hide = _swift_function_body(source, "private func hideClaimChip()",
-                                "private func writeClaimClick()")
+                                "private func claimChipClicked()")
     # Hiding must NOT rebuild the observer: the slow tick hides the chip
     # whenever the pop-out is closed or on another Space, and tearing the
     # observer down there would recreate it every few seconds.
@@ -738,13 +748,12 @@ def test_claim_chip_window_still_short_circuits_on_an_unchanged_frame() -> None:
     assert "applyClaimChipFrame(petWindow: petWindow" in position
 
 
-def test_summon_works_outside_hermes() -> None:
+def test_summon_works_outside_hermes_without_raising_the_window() -> None:
     """⌘⇧A and the chip must work when Hermes is behind another app.
 
-    The desktop keybind only fires while Hermes is frontmost, and the bar it
-    opens lives inside Hermes — so the companion owns a Carbon global hot key
-    and raises the app before emitting the same `claim_click` the chip sends
-    (no second protocol, no gateway change).
+    The desktop keybind only fires while Hermes is frontmost, so the companion
+    owns a Carbon global hot key. It opens the local ask field and takes key
+    focus itself; the Hermes window is never activated.
     """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
@@ -755,21 +764,90 @@ def test_summon_works_outside_hermes() -> None:
     assert "UnregisterEventHotKey" in source
     assert "installSummonHotKey()" in source
     assert "removeSummonHotKey()" in source
+    # The 034e922 activation door is gone for good.
+    assert "activateHermes()" not in source
 
     hot = _swift_function_body(source, "private func summonHotKeyFired()",
-                               "private func activateHermes()")
-    # Frontmost Hermes keeps its own keybind; the global path steps aside.
+                               "// MARK: Pet double")
+    # Frontmost Hermes keeps its own keybind; elsewhere the hot key toggles the
+    # local field and a second press closes it.
     assert "app.isActive" in hot
-    assert "activateHermes()" in hot
-    assert 'emitSummon(reason: "hotkey")' in hot
+    assert "summonFieldOpen" in hot
+    assert "openSummonField()" in hot
+    assert "closeSummonField(journal: \"ask-cancel\")" in hot
+    assert "activate" not in hot
 
-    emit = _swift_function_body(source, "private func emitSummon(",
-                                "// MARK: System-wide summon hot key")
-    # Same wire op as the chip: the engine already maps it to the summon row.
-    assert "claim_click" in emit
-    assert "op" in emit
+    click = _swift_function_body(source, "private func claimChipClicked()",
+                                 "// MARK: In-place ask field")
+    assert "toggleSummonField()" in click
+    assert "emitSummon" not in click
 
-    click = _swift_function_body(source, "private func writeClaimClick()",
-                                 "/// One summon event on stdout")
-    assert "activateHermes()" in click
-    assert 'emitSummon(reason: "chip")' in click
+
+def test_summon_field_is_a_local_in_place_text_entry() -> None:
+    """Clicking the hat / pressing ⌘⇧A types next to the pet, never in Hermes."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert "private final class SummonFieldWindow: NSWindow" in source
+    assert "private final class SummonFieldView: NSView" in source
+    assert "NSTextField" in source
+    assert "Ask the butler…" in source
+    assert "NSFont.systemFont(ofSize: 13.0)" in source
+    assert "JSONSerialization.data(withJSONObject: payload" in source
+    assert '"op": "summon_text"' in source
+    assert "windowDidResignKey" in source
+    assert "insertNewline" in source, "Enter/Return submits"
+    assert "insertNewlineIgnoringFieldEditor" in source
+    assert "cancelOperation" in source, "Escape cancels"
+    assert "trimmingCharacters(in: .whitespacesAndNewlines)" in source
+    assert "NSWorkspace.shared.frontmostApplication" in source
+    # Journal the new hop end to end.
+    assert '"ask-open"' in source
+    assert '"ask-submit:' in source
+    assert '"ask-cancel"' in source
+
+    window = _swift_function_body(
+        source,
+        "private final class SummonFieldWindow: NSWindow",
+        "private final class SummonFieldView")
+    assert "override var canBecomeKey: Bool" in window
+    assert "return true" in window
+    assert "override var canBecomeMain: Bool" in window
+    assert "return false" in window
+
+    view = _swift_function_body(source,
+                                "private final class SummonFieldView: NSView",
+                                "// MARK: - Pet sprite sheet")
+    assert "static let fieldWidth: CGFloat = 280.0" in view
+    assert "static let fieldHeight: CGFloat = 34.0" in view
+    assert "isBordered = false" in view
+    assert "placeholderString = \"Ask the butler…\"" in view
+
+    frame = _swift_function_body(source, "private func summonFieldFrame(",
+                                 "private func openSummonField()")
+    # Centred on the chip, or under the sprite without one; 8 pt gap, clamped.
+    assert "anchor.midX - size.width / 2.0" in frame
+    assert "anchor.maxY + gap" in frame
+    assert "anchor.minY - gap - size.height" in frame
+    assert "visible.minX + 4.0" in frame
+    assert "visible.maxX - frame.width - 4.0" in frame
+    assert "summonFieldGap" in frame
+
+    opened = _swift_function_body(source, "private func openSummonField()",
+                                  "private func closeSummonField(")
+    assert ".borderless" in opened
+    assert ".statusBar" in opened
+    assert "canJoinAllSpaces" in opened
+    assert "isMovable = false" in opened
+    assert "NSApp.activate(ignoringOtherApps: true)" in opened
+    assert "window.makeKey()" in opened
+    assert "makeFirstResponder(view.field)" in opened
+
+    submit = _swift_function_body(source, "private func submitSummonText(",
+                                  "private func cancelSummonField(")
+    assert "JSONSerialization.data(withJSONObject: payload" in submit
+    assert '"summon_text"' in submit
+    assert "closeSummonField(journal: nil)" in submit
+    assert '"ask-submit:' in submit
+    # Empty text closes without emitting.
+    assert "closeSummonField(journal: \"ask-cancel\")" in submit
+    assert "FileHandle.standardOutput.write" in submit

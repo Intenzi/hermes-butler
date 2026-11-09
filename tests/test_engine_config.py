@@ -76,6 +76,33 @@ def test_claim_click_sets_summon_pending_and_ack_clears_it(tmp_path: Path) -> No
     assert "summon_pending" not in snap
 
 
+def test_summon_text_sets_a_text_pending_row_for_the_desktop(
+        tmp_path: Path) -> None:
+    engine.init(tmp_path)
+    engine._summon_pending = None
+
+    engine._on_overlay_event({"op": "summon_text", "text": "hi", "id": "abc"})
+
+    pending = engine.summon_pending()
+    assert pending["origin"] == "chip"
+    assert pending["id"] == "abc"
+    assert pending["text"] == "hi"
+    assert pending["at"]
+    snap = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert snap["summon_pending"] == pending
+
+
+def test_summon_text_without_text_writes_no_row(tmp_path: Path) -> None:
+    engine.init(tmp_path)
+    engine._summon_pending = None
+
+    engine._on_overlay_event({"op": "summon_text", "id": "abc"})
+    assert engine.summon_pending() is None
+    engine._on_overlay_event({"op": "summon_text", "text": "   ", "id": "abc"})
+    assert engine.summon_pending() is None
+    assert not (tmp_path / "state.json").exists()
+
+
 class _FakeOverlay:
     def __init__(self):
         self.running = False

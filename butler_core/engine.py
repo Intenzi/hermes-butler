@@ -252,9 +252,35 @@ def _write_state(clear_summon=False):
 
 
 def _on_overlay_event(event):
-    """A companion mini-window was clicked: queue a summon for the desktop."""
+    """A companion window event: queue the matching summon for the desktop.
+
+    Two doors share this row. ``summon_text`` carries text typed in the local
+    ask field, so the desktop posts it straight to the Butler chat and never
+    opens its bar. The legacy ``claim_click`` (older companion binaries) stays
+    text-less and keeps the old "open the bar" behaviour.
+    """
     global _summon_pending
-    if not isinstance(event, dict) or event.get("op") != "claim_click":
+    if not isinstance(event, dict):
+        return
+    op = event.get("op")
+    if op == "summon_text":
+        text = event.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return
+        pending_id = event.get("id")
+        if not isinstance(pending_id, str) or not pending_id.strip():
+            pending_id = uuid.uuid4().hex[:8]
+        _summon_pending = {
+            "origin": "chip",
+            "id": pending_id.strip(),
+            "text": text,
+            "at": time.time(),
+        }
+        # Hop-level breadcrumb for support: companion → engine → desktop.
+        bp_overlay.journal_click("engine-pending:text")
+        _write_state()
+        return
+    if op != "claim_click":
         return
     _summon_pending = {
         "origin": "pet",
