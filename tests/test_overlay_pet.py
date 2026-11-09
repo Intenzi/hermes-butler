@@ -736,3 +736,40 @@ def test_claim_chip_window_still_short_circuits_on_an_unchanged_frame() -> None:
                                     "private func applyClaimChipFrame(")
     assert "let petWindow = hermesPetWindowFrame(" in position
     assert "applyClaimChipFrame(petWindow: petWindow" in position
+
+
+def test_summon_works_outside_hermes() -> None:
+    """⌘⇧A and the chip must work when Hermes is behind another app.
+
+    The desktop keybind only fires while Hermes is frontmost, and the bar it
+    opens lives inside Hermes — so the companion owns a Carbon global hot key
+    and raises the app before emitting the same `claim_click` the chip sends
+    (no second protocol, no gateway change).
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert "import Carbon.HIToolbox" in source
+    assert "RegisterEventHotKey" in source
+    assert "kEventHotKeyPressed" in source
+    assert "kVK_ANSI_A" in source
+    assert "UnregisterEventHotKey" in source
+    assert "installSummonHotKey()" in source
+    assert "removeSummonHotKey()" in source
+
+    hot = _swift_function_body(source, "private func summonHotKeyFired()",
+                               "private func activateHermes()")
+    # Frontmost Hermes keeps its own keybind; the global path steps aside.
+    assert "app.isActive" in hot
+    assert "activateHermes()" in hot
+    assert 'emitSummon(reason: "hotkey")' in hot
+
+    emit = _swift_function_body(source, "private func emitSummon(",
+                                "// MARK: System-wide summon hot key")
+    # Same wire op as the chip: the engine already maps it to the summon row.
+    assert "claim_click" in emit
+    assert "op" in emit
+
+    click = _swift_function_body(source, "private func writeClaimClick()",
+                                 "/// One summon event on stdout")
+    assert "activateHermes()" in click
+    assert 'emitSummon(reason: "chip")' in click

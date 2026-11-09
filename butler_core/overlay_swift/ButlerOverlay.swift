@@ -34,6 +34,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Carbon.HIToolbox
 
 // MARK: - Logging
 
@@ -1782,6 +1783,11 @@ private final class OverlayController {
     private let watchdogInterval: TimeInterval = 60.0
     private let watchdogIdleLimit: TimeInterval = 600.0
     private var pendingExitGeneration = 0
+    /// System-wide ⌘⇧A. The desktop keybind only fires while Hermes is
+    /// frontmost, so the companion owns the global one; Carbon hot keys need no
+    /// extra TCC grant.
+    private var summonHotKeyRef: EventHotKeyRef?
+    private var summonHotKeyHandler: EventHandlerRef?
     private var watchdogTimer: Timer?
     private var lastOpUptime: TimeInterval = 0.0
 
@@ -1800,6 +1806,7 @@ private final class OverlayController {
         }
         lastOpUptime = ProcessInfo.processInfo.systemUptime
         observeEnvironment()
+        installSummonHotKey()
         startWatchdog()
         let thread = Thread { [weak self] in
             self?.readStdin()
@@ -2551,9 +2558,107 @@ private final class OverlayController {
             chipJournal("emit-skipped:disabled")
             return
         }
+        // The chip can be clicked while another app is in front, and the bar it
+        // opens lives inside Hermes — so raise Hermes first or the click looks
+        // dead. Same for the global hot key below.
+        activateHermes()
+        emitSummon(reason: "chip")
+    }
+
+    /// One summon event on stdout. The engine turns `claim_click` into the
+    /// pending row the desktop consumes, so the hot key reuses that path rather
+    /// than inventing a second protocol.
+    private func emitSummon(reason: String) {
         let payload = "{\"op\":\"claim_click\"}\n"
         FileHandle.standardOutput.write(Data(payload.utf8))
-        chipJournal("emit")
+        chipJournal("emit:reason=" + reason)
+    }
+
+    // MARK: System-wide summon hot key
+
+    /// Register ⌘⇧A with Carbon so it works from any app. The desktop keybind
+    /// stays as the in-app path; when Hermes is already frontmost this handler
+    /// steps aside so the two never double-open the bar.
+    private func installSummonHotKey() {
+        guard summonHotKeyRef == nil else {
+            return
+        }
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                      eventKind: UInt32(kEventHotKeyPressed))
+        let handler: EventHandlerUPP = { _, _, userData in
+            guard let userData = userData else {
+                return noErr
+            }
+            Unmanaged<OverlayController>
+                .fromOpaque(userData)
+                .takeUnretainedValue()
+                .summonHotKeyFired()
+            return noErr
+        }
+        let installed = InstallEventHandler(GetApplicationEventTarget(),
+                                            handler,
+                                            1,
+                                            &eventType,
+                                            Unmanaged.passUnretained(self).toOpaque(),
+                                            &summonHotKeyHandler)
+        guard installed == noErr else {
+            chipJournal("hotkey-handler-failed:\(installed)")
+            return
+        }
+        let hotKeyID = EventHotKeyID(signature: OSType(0x42544C52), id: 1)  // 'BTLR'
+        let status = RegisterEventHotKey(UInt32(kVK_ANSI_A),
+                                         UInt32(cmdKey | shiftKey),
+                                         hotKeyID,
+                                         GetApplicationEventTarget(),
+                                         0,
+                                         &summonHotKeyRef)
+        if status != noErr {
+            // Another app owns ⌘⇧A: stay quiet, the in-app keybind and the chip
+            // still work.
+            summonHotKeyRef = nil
+            chipJournal("hotkey-register-failed:\(status)")
+            return
+        }
+        chipJournal("hotkey-installed")
+    }
+
+    private func removeSummonHotKey() {
+        if let ref = summonHotKeyRef {
+            UnregisterEventHotKey(ref)
+        }
+        summonHotKeyRef = nil
+        if let handler = summonHotKeyHandler {
+            RemoveEventHandler(handler)
+        }
+        summonHotKeyHandler = nil
+    }
+
+    private func summonHotKeyFired() {
+        guard !isShuttingDown else {
+            return
+        }
+        if let pid = hermesPid(),
+           let app = NSRunningApplication(processIdentifier: pid),
+           app.isActive {
+            // Hermes owns the keyboard: its own keybind opens the bar.
+            return
+        }
+        chipJournal("hotkey-fired")
+        activateHermes()
+        emitSummon(reason: "hotkey")
+    }
+
+    /// Bring the Hermes window forward so the bar it opens is actually visible.
+    private func activateHermes() {
+        guard let pid = hermesPid(),
+              let app = NSRunningApplication(processIdentifier: pid) else {
+            return
+        }
+        if #available(macOS 14.0, *) {
+            app.activate()
+        } else {
+            app.activate(options: [.activateIgnoringOtherApps])
+        }
     }
 
     // MARK: Pet double
@@ -3165,6 +3270,7 @@ private final class OverlayController {
         claimChipTimer = nil
         claimChipTimerInterval = 0.0
         stopPetObservation()
+        removeSummonHotKey()
         hideClaimChip()
         petTimer?.invalidate()
         petTimer = nil
