@@ -584,3 +584,155 @@ def test_summon_double_spawns_pet_then_farewells(
         "pet_enabled": True,
     }
     assert {"op": "done"} in ops
+
+
+def test_claim_chip_is_driven_by_hermes_ax_notifications() -> None:
+    """The chip follows the pop-out from AX move events, not a 0.5 s poll.
+
+    The probe logged 86 ``AXWindowMoved`` events in one drag (~17 ms apart),
+    each carrying the live ``AXPosition``/``AXSize``, so the observer must
+    exist on both the app element (window lifecycle) and every window element
+    (move/resize/destroyed), rooted on the main run loop.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert "AXObserverCreate" in source
+    assert "kAXWindowMovedNotification" in source
+    assert "kAXWindowResizedNotification" in source
+    assert "kAXWindowCreatedNotification" in source
+    assert "kAXFocusedWindowChangedNotification" in source
+    assert "kAXMainWindowChangedNotification" in source
+    assert "kAXUIElementDestroyedNotification" in source
+    assert "AXObserverGetRunLoopSource" in source
+    assert "CFRunLoopAddSource" in source
+
+    start = _swift_function_body(source, "private func startPetObservation()",
+                                 "private func attachPetWindowObservers()")
+    assert "guard let pid = hermesPid()" in start
+    assert "observerUnavailable = true" in start
+    assert "AXObserverCreate(pid" in start
+    assert "DispatchQueue.main.async" in source
+
+    # Re-attach on window lifecycle events, and tear down with the chip.
+    assert ("private var observedPetWindows = Set<Int>()" in source)
+    assert ("private var observerUnavailable = false" in source)
+    assert ("private var petObserver: AXObserver?" in source)
+
+    attach = _swift_function_body(source, "private func attachPetWindowObservers()",
+                                  "private func stopPetObservation()")
+    # The refcon is how the C trampoline finds the controller back.
+    assert "Unmanaged.passUnretained(self).toOpaque()" in attach
+    assert ("Unmanaged<OverlayController>\n        .fromOpaque(refcon)"
+            in source)
+    assert "AXUIElementCreateApplication(pid)" in attach
+    assert "Int(CFHash(window))" in attach
+    assert "observedPetWindows.insert(key)" in attach
+    assert "kAXWindowCreatedNotification" in attach
+    assert "kAXWindowMovedNotification" in attach
+    assert "kAXWindowResizedNotification" in attach
+
+    hide = _swift_function_body(source, "private func hideClaimChip()",
+                                "private func writeClaimClick()")
+    # Hiding must NOT rebuild the observer: the slow tick hides the chip
+    # whenever the pop-out is closed or on another Space, and tearing the
+    # observer down there would recreate it every few seconds.
+    assert "stopPetObservation()" not in hide
+    assert "startPetObservation()" not in hide
+
+    stop = _swift_function_body(source, "private func stopPetObservation()",
+                                "private func updateClaimChipTimer()")
+    assert "CFRunLoopRemoveSource" in stop
+    assert "petObserver = nil" in stop
+    assert "observedPetWindows.removeAll()" in stop
+    assert "observerUnavailable = false" in stop
+
+    disarm = _swift_function_body(
+        source,
+        "private func setClaimChip(_ spec: ClaimChipSpec)",
+        "// MARK: Pet AX observation",
+    )
+    assert "stopPetObservation()" in disarm
+    assert "startPetObservation()" in disarm
+
+    shutdown = _swift_function_body(source, "func shutdown() {",
+                                    "// MARK: - Application delegate")
+    assert "stopPetObservation()" in shutdown
+
+
+def test_claim_chip_repositions_from_the_notified_element() -> None:
+    """The move/resize hot path reads the frame off the event's element.
+
+    A 60 Hz drag must not re-run ``CGWindowListCopyWindowInfo`` (0.73 ms) or
+    re-walk ``AXWindows`` (0.16 ms); only the two attributes on the element the
+    notification named.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    hot = _swift_function_body(source, "private func processPetAXNotification(",
+                               "private func scheduleEventDrivenReposition(")
+    assert "axWindowFrame(of: element)" in hot
+    assert "kAXWindowMovedNotification" in hot
+    assert "kAXWindowResizedNotification" in hot
+    assert "isPetShapedFrame(frame)" in hot
+    assert "attachPetWindowObservers()" in hot
+    assert "positionClaimChip()" in hot
+    # The hot path never re-enumerates windows.
+    assert "cgWindowFrameList" not in hot
+    assert "hermesPetWindowFrame" not in hot
+    assert "axWindowFrameList" not in hot
+
+    reader = _swift_function_body(source, "private func axWindowFrame(of element:",
+                                  "private func isPetShapedFrame(")
+    assert "AXPosition" in reader
+    assert "AXSize" in reader
+    assert "cgWindowFrameList" not in reader
+
+    # Main-window resizes must be dropped by the same 60...480 / 0.6...1.67
+    # pet-shape filter the polled anchor uses.
+    shape = _swift_function_body(source, "private func isPetShapedFrame(",
+                                 "private func hermesPid()")
+    assert "bounds.width >= 60.0" in shape
+    assert "bounds.width <= 480.0" in shape
+    assert "aspect >= 0.6 && aspect <= 1.67" in shape
+
+
+def test_claim_chip_throttles_events_and_reconciles_slowly() -> None:
+    """40 ms coalescing on the hot path; 3.0 s tick with a live observer.
+
+    Without an observer the legacy 0.5 s poll must stay in charge, so the chip
+    can never be left unpositioned.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    coalescer = _swift_function_body(source,
+                                     "private func scheduleEventDrivenReposition(",
+                                     "/// Find the core Hermes pet pop-out.")
+    assert "0.040" in coalescer, "the 40 ms coalescing interval"
+    assert "asyncAfter" in coalescer, "a trailing update still runs"
+    assert "pendingRepositionWork" in coalescer
+    assert "pendingPetFrame" in coalescer
+
+    timer = _swift_function_body(source, "private func updateClaimChipTimer()",
+                                 "/// Entry point from the C callback.")
+    assert "petObserver != nil && !observerUnavailable" in timer
+    assert "interval = 3.0" in timer
+    assert "interval = 0.5" in timer
+    assert "claimChipTimerInterval == interval" in timer
+    # Both cadences are conditional on a live observer, never a bare 0.5 s.
+    assert "0.5, repeats: true" not in source, (
+        "the unconditional 0.5 s poll must be gone")
+
+
+def test_claim_chip_window_still_short_circuits_on_an_unchanged_frame() -> None:
+    """The event-driven path keeps the no-op guard the poll had: no re-set."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    apply_body = _swift_function_body(source, "private func applyClaimChipFrame(",
+                                      "private func hideClaimChip(")
+    assert "if window.frame != appKitFrame" in apply_body
+    assert "window.setFrame(appKitFrame, display: true)" in apply_body
+
+    position = _swift_function_body(source, "private func positionClaimChip(",
+                                    "private func applyClaimChipFrame(")
+    assert "let petWindow = hermesPetWindowFrame(" in position
+    assert "applyClaimChipFrame(petWindow: petWindow" in position

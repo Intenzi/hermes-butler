@@ -471,6 +471,48 @@ private func axWindowFrameList(pid: pid_t) -> [(title: String?, frame: CGRect)] 
     return out
 }
 
+/// Every top-level window element of the app, as AXUIElement handles. The
+/// observer attaches per-window notifications to these; unlike
+/// `axWindowFrameList` it keeps elements, not frames.
+private func axWindowElements(of root: AXUIElement) -> [AXUIElement] {
+    guard let rawWindows = copyAXAttribute(root, "AXWindows") as? [Any] else {
+        return []
+    }
+    return rawWindows.compactMap { axElement(from: $0) }
+}
+
+/// AX frame of one window element, read straight off it. This is the
+/// notification hot path during a drag: two attribute reads, no AXWindows
+/// enumeration and no `CGWindowListCopyWindowInfo` call.
+private func axWindowFrame(of element: AXUIElement) -> CGRect? {
+    guard let point = axPointOrSize(copyAXAttribute(element, "AXPosition"),
+                                    kind: "point"),
+          let size = axPointOrSize(copyAXAttribute(element, "AXSize"),
+                                   kind: "size"),
+          point.count == 2, size.count == 2 else {
+        return nil
+    }
+    let width = CGFloat(size[0])
+    let height = CGFloat(size[1])
+    guard width > 0.0, height > 0.0 else {
+        return nil
+    }
+    return CGRect(x: CGFloat(point[0]), y: CGFloat(point[1]),
+                  width: width, height: height)
+}
+
+/// The pop-out pet panel is 240x300 and its send-message bubble is smaller;
+/// both pass this filter. The main window (1280x803) and the 248x19 strip do
+/// not. Shared by the polled anchor and the per-notification fast path.
+private func isPetShapedFrame(_ bounds: CGRect) -> Bool {
+    guard bounds.width >= 60.0, bounds.height >= 60.0,
+          bounds.width <= 480.0, bounds.height <= 480.0 else {
+        return false
+    }
+    let aspect = bounds.width / max(bounds.height, 1.0)
+    return aspect >= 0.6 && aspect <= 1.67
+}
+
 private func hermesPid() -> pid_t? {
     if let app = NSRunningApplication
         .runningApplications(withBundleIdentifier: "com.nousresearch.hermes")
@@ -1615,18 +1657,51 @@ private final class NameplateView: NSView {
 
 // MARK: - Overlay controller
 
+/// C trampoline for the Hermes AX observer. The controller is handed over as
+/// the refcon on every `AXObserverAddNotification`, so no global lookup and no
+/// capture is needed. The callback itself stays trivial: the element is only
+/// valid for the duration of the call, so the work hops to the main queue.
+private let petAXObserverCallback: AXObserverCallback = { _, element, notification, refcon in
+    guard let refcon = refcon else {
+        return
+    }
+    let controller = Unmanaged<OverlayController>
+        .fromOpaque(refcon)
+        .takeUnretainedValue()
+    controller.petAXNotificationFired(notification as String, element: element)
+}
+
 private final class OverlayController {
     private var ringWindows: [NSWindow] = []
     private var chipWindow: NSWindow?
     private var claimChipWindow: NSWindow?
     private var claimChipView: ClaimChipView?
     private var claimChipTimer: Timer?
+    /// Cadence of the live `claimChipTimer` (3.0 s with an AX observer, 0.5 s
+    /// without), so a cadence change rebuilds it and a steady state does not.
+    private var claimChipTimerInterval: TimeInterval = 0.0
     private var claimChipEnabled = false
     /// Sprite size and bottom padding reported by the producer; nil means the
     /// producer predates the sprite anchor and the window frame stays the box.
     private var claimChipSpriteSize: CGSize?
     private var claimChipPadBottom: CGFloat = ClaimChipSpec.defaultPadBottom
     private let claimChipGap: CGFloat = 10.0
+    // AX notifications replace the 0.5 s reposition poll while the chip is
+    // armed: the Hermes pop-out posts ~17 ms AXWindowMoved events during a
+    // drag (a probe logged 86 in one drag, each with live AXPosition/AXSize).
+    private var petObserver: AXObserver?
+    /// CFHash of every window element the observer is attached to, so a
+    /// re-attach after AXWindowCreated does not duplicate notifications.
+    private var observedPetWindows = Set<Int>()
+    private var observedPetPid: pid_t?
+    /// The AX observer could not be created (no Hermes pid, TCC denial, OS
+    /// error). The legacy 0.5 s poll then stays in charge so the chip is never
+    /// left unpositioned.
+    private var observerUnavailable = false
+    /// Last event-driven placement, and the frame waiting behind it.
+    private var repositionCoalescer: Date?
+    private var pendingPetFrame: CGRect?
+    private var pendingRepositionWork = false
     /// Last pet-panel frame the chip anchored to. The pet's send-message
     /// bubble is nearby, so preferring the previous origin keeps the chip from
     /// hopping between the two when both are on screen.
@@ -1705,6 +1780,15 @@ private final class OverlayController {
         thread.name = "butler-overlay-stdin"
         stdinThread = thread
         thread.start()
+
+        // Claim re-assert path: a companion that was already armed (capture
+        // spawn, restart, a producer that set the chip before the run loop was
+        // running) must pick the observer back up and place the chip once.
+        if claimChipEnabled {
+            startPetObservation()
+            updateClaimChipTimer()
+            positionClaimChip()
+        }
     }
 
     private func readStdin() {
@@ -1994,17 +2078,216 @@ private final class OverlayController {
         if !spec.enabled {
             claimChipTimer?.invalidate()
             claimChipTimer = nil
+            claimChipTimerInterval = 0.0
+            stopPetObservation()
             hideClaimChip()
             return
         }
-        if claimChipTimer == nil {
-            let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-                self?.positionClaimChip()
-            }
-            RunLoop.main.add(timer, forMode: .common)
-            claimChipTimer = timer
-        }
+        // Event-driven first: the observer turns the pop-out's AX move stream
+        // into chip placement, and the timer becomes a slow reconciler. If the
+        // observer cannot be created the 0.5 s poll stays in charge.
+        startPetObservation()
+        updateClaimChipTimer()
         positionClaimChip()
+    }
+
+    // MARK: Pet AX observation
+
+    /// Observe the Hermes app while the chip is armed.
+    ///
+    /// The app element carries window lifecycle notifications (a pop-out can
+    /// appear after we start, so AXWindowCreated must re-attach), and every
+    /// window element carries move/resize/destroyed. All of them are added
+    /// with the controller as the refcon so the C callback can find us back.
+    private func startPetObservation() {
+        guard claimChipEnabled, !isShuttingDown, petObserver == nil else {
+            return
+        }
+        // AXObserver sources must sit on the main run loop: AppKit windows and
+        // the chip are main-thread objects. The command path is already main,
+        // but never assume it.
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.startPetObservation()
+            }
+            return
+        }
+        guard let pid = hermesPid() else {
+            observerUnavailable = true
+            updateClaimChipTimer()
+            return
+        }
+        var observer: AXObserver?
+        let created = AXObserverCreate(pid, petAXObserverCallback, &observer)
+        guard created == .success, let observer = observer else {
+            // No observer: the 0.5 s poll stays in charge. Never leave the
+            // chip unpositioned because AX refused a notification source.
+            observerUnavailable = true
+            updateClaimChipTimer()
+            return
+        }
+        petObserver = observer
+        observedPetPid = pid
+        observedPetWindows.removeAll()
+        observerUnavailable = false
+        attachPetWindowObservers()
+        CFRunLoopAddSource(CFRunLoopGetCurrent(),
+                           AXObserverGetRunLoopSource(observer),
+                           .commonModes)
+        updateClaimChipTimer()
+    }
+
+    /// Attach per-window notifications to the app's current windows. Safe to
+    /// call repeatedly: the CFHash set keeps AXWindowCreated re-attaches from
+    /// doubling up on a window we already observe.
+    private func attachPetWindowObservers() {
+        guard let observer = petObserver, let pid = observedPetPid else {
+            return
+        }
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        let root = AXUIElementCreateApplication(pid)
+        for name in [kAXWindowCreatedNotification,
+                     kAXFocusedWindowChangedNotification,
+                     kAXMainWindowChangedNotification] {
+            _ = AXObserverAddNotification(observer, root, name as CFString, refcon)
+        }
+        for window in axWindowElements(of: root) {
+            let key = Int(CFHash(window))
+            guard !observedPetWindows.contains(key) else {
+                continue
+            }
+            var registered = false
+            for name in [kAXWindowMovedNotification,
+                         kAXWindowResizedNotification,
+                         kAXUIElementDestroyedNotification] {
+                let error = AXObserverAddNotification(observer,
+                                                      window,
+                                                      name as CFString,
+                                                      refcon)
+                if error == .success || error == .notificationAlreadyRegistered {
+                    registered = true
+                }
+            }
+            if registered {
+                observedPetWindows.insert(key)
+            }
+        }
+    }
+
+    private func stopPetObservation() {
+        if let observer = petObserver {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(),
+                                  AXObserverGetRunLoopSource(observer),
+                                  .commonModes)
+        }
+        petObserver = nil
+        observedPetWindows.removeAll()
+        observedPetPid = nil
+        observerUnavailable = false
+        pendingRepositionWork = false
+        pendingPetFrame = nil
+        repositionCoalescer = nil
+    }
+
+    /// Timer cadence: the observer makes the tick a slow reconciler (3.0 s);
+    /// without it the legacy 0.5 s poll stays in charge.
+    private func updateClaimChipTimer() {
+        guard claimChipEnabled, !isShuttingDown else {
+            return
+        }
+        // Observer live: reconcile slowly (3.0 s). Observer unavailable: the
+        // legacy 0.5 s poll stays in charge so the chip is never unpositioned.
+        let interval: TimeInterval
+        if petObserver != nil && !observerUnavailable {
+            interval = 3.0
+        } else {
+            interval = 0.5
+        }
+        if claimChipTimer != nil, claimChipTimerInterval == interval {
+            return
+        }
+        claimChipTimer?.invalidate()
+        claimChipTimer = nil
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            self?.positionClaimChip()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        claimChipTimer = timer
+        claimChipTimerInterval = interval
+    }
+
+    /// Entry point from the C callback. The element is only valid for the
+    /// duration of the notification call, so the work is dispatched onto the
+    /// main queue (never assume the observer source's thread is main).
+    fileprivate func petAXNotificationFired(_ name: String, element: AXUIElement) {
+        DispatchQueue.main.async { [weak self] in
+            self?.processPetAXNotification(name, element: element)
+        }
+    }
+
+    private func processPetAXNotification(_ name: String, element: AXUIElement) {
+        guard claimChipEnabled, !isShuttingDown else {
+            return
+        }
+        switch name {
+        case kAXWindowMovedNotification, kAXWindowResizedNotification:
+            // Hot path: one element, two attribute reads. The main window's
+            // moves are dropped by the pet-shape filter, so dragging Hermes
+            // around never moves the chip.
+            guard let frame = axWindowFrame(of: element),
+                  isPetShapedFrame(frame) else {
+                return
+            }
+            lastPetFrame = frame
+            scheduleEventDrivenReposition(frame)
+        case kAXWindowCreatedNotification,
+             kAXFocusedWindowChangedNotification,
+             kAXMainWindowChangedNotification:
+            // A window appeared (or focus moved to one we do not observe yet):
+            // re-attach, then place the chip once from the normal poll path.
+            attachPetWindowObservers()
+            positionClaimChip()
+        case kAXUIElementDestroyedNotification:
+            // The observed element is gone; its CFHash may be reused, so start
+            // the attach set over and reconcile from the normal path.
+            observedPetWindows.removeAll()
+            attachPetWindowObservers()
+            positionClaimChip()
+        default:
+            break
+        }
+    }
+
+    /// Throttle event-driven placements to one per 40 ms while move events
+    /// stream in (a 60 Hz drag would otherwise run placement 60x/s). The
+    /// newest frame wins, and the deferred block still runs after the last
+    /// event so the chip lands where the pet was released.
+    private func scheduleEventDrivenReposition(_ pet: CGRect) {
+        pendingPetFrame = pet
+        if pendingRepositionWork {
+            return
+        }
+        pendingRepositionWork = true
+        let coalesce: TimeInterval = 0.040
+        let elapsed = Date().timeIntervalSince(repositionCoalescer ?? .distantPast)
+        let delay = max(0.0, coalesce - elapsed)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self else {
+                return
+            }
+            self.pendingRepositionWork = false
+            guard let frame = self.pendingPetFrame else {
+                return
+            }
+            self.pendingPetFrame = nil
+            guard self.claimChipEnabled, !self.isShuttingDown,
+                  let primaryHeight = primaryScreenHeight() else {
+                return
+            }
+            self.repositionCoalescer = Date()
+            self.applyClaimChipFrame(petWindow: frame,
+                                     primaryHeight: primaryHeight)
+        }
     }
 
     /// Find the core Hermes pet pop-out. Identification is owner pid + shape
@@ -2018,15 +2301,6 @@ private final class OverlayController {
         guard let pid = hermesPid() else {
             lastPetFrame = nil
             return nil
-        }
-
-        func isPetShaped(_ bounds: CGRect) -> Bool {
-            guard bounds.width >= 60.0, bounds.height >= 60.0,
-                  bounds.width <= 480.0, bounds.height <= 480.0 else {
-                return false
-            }
-            let aspect = bounds.width / max(bounds.height, 1.0)
-            return aspect >= 0.6 && aspect <= 1.67
         }
 
         func isNearIdentical(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
@@ -2056,7 +2330,7 @@ private final class OverlayController {
         // Keep pet-shaped, on-screen candidates only. This excludes the main
         // 1280x803 window (too large) and the 248x19 strip (too short).
         let candidates = merged.filter {
-            isPetShaped($0) && boxIntersectsAnyScreen($0, primaryHeight: primaryHeight)
+            isPetShapedFrame($0) && boxIntersectsAnyScreen($0, primaryHeight: primaryHeight)
         }
         guard !candidates.isEmpty else {
             lastPetFrame = nil
@@ -2153,17 +2427,33 @@ private final class OverlayController {
     }
 
     private func positionClaimChip() {
+        // The slow reconciliation tick also heals the attach set: a window
+        // created while the observer was not running, or an element that went
+        // stale across sleep/wake, gets observed again. No-op when the
+        // observer is unavailable, so the fallback poll stays pure.
+        attachPetWindowObservers()
         guard claimChipEnabled, !isShuttingDown,
               let primaryHeight = primaryScreenHeight() else {
             hideClaimChip()
             return
         }
-        let size = claimChipSize()
         guard let petWindow = hermesPetWindowFrame(primaryHeight: primaryHeight) else {
             // Unknown/renamed pet window: stay hidden rather than guess.
             hideClaimChip()
             return
         }
+        applyClaimChipFrame(petWindow: petWindow, primaryHeight: primaryHeight)
+    }
+
+    /// Place (or move) the chip from a known pet-panel frame. `positionClaimChip`
+    /// feeds it the polled anchor; the AX move/resize path feeds it the frame
+    /// straight off the observed element, so a drag costs no enumeration.
+    private func applyClaimChipFrame(petWindow: CGRect, primaryHeight: CGFloat) {
+        guard claimChipEnabled, !isShuttingDown else {
+            hideClaimChip()
+            return
+        }
+        let size = claimChipSize()
         // Anchor to the SPRITE inside the pop-out window, not to the window:
         // the 240x300 window is mostly padding around a ~63x69 sprite, so a
         // window-frame anchor lands the chip far away from the pet.
@@ -2223,6 +2513,10 @@ private final class OverlayController {
         }
         claimChipWindow = nil
         claimChipView = nil
+        // The observer deliberately outlives a hidden chip: hiding happens on
+        // every slow tick while the pop-out is closed or on another Space, and
+        // tearing the AX observer down there would rebuild it every few
+        // seconds. It is stopped only when the chip is disarmed or we shut down.
     }
 
     private func writeClaimClick() {
@@ -2840,6 +3134,8 @@ private final class OverlayController {
         claimChipEnabled = false
         claimChipTimer?.invalidate()
         claimChipTimer = nil
+        claimChipTimerInterval = 0.0
+        stopPetObservation()
         hideClaimChip()
         petTimer?.invalidate()
         petTimer = nil
