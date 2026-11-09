@@ -518,3 +518,21 @@ def test_engine_module_initialises_the_process_that_owns_the_chip(
     first = engine.DATA_DIR
     plugin_api._engine_module()
     assert engine.DATA_DIR == first
+
+
+def test_cli_handler_prints_because_the_host_ignores_returned_strings() -> None:
+    """`hermes butler doctor` printed nothing on a fresh install.
+
+    The host calls ``args.func(args)`` and only honours an INT return code; a
+    handler that returns its payload is silently discarded. Pin that the CLI
+    handler prints and returns None.
+    """
+    source = (ROOT / "__init__.py").read_text(encoding="utf-8")
+    start = source.find("def butler_cli_command(")
+    end = source.find("def cli_butler(", start)
+    assert start != -1 and end != -1
+    body = source[start:end]
+
+    assert "print(" in body, "the payload must be printed, not returned"
+    assert "return _json.dumps(" not in body, "a returned string is discarded"
+    assert "return None" in body

@@ -178,18 +178,30 @@ def butler_cli_setup(parser):
 
 
 def butler_cli_command(args, **kwargs):
-    """Runtime handler for `hermes butler <sub>`."""
+    """Runtime handler for `hermes butler <sub>`.
+
+    The host calls ``args.func(args)`` and only honours an INT return code — it
+    never prints a returned string. A handler that returns its payload therefore
+    looks like a command that silently does nothing (first-run ``hermes butler
+    doctor`` did exactly that). Print here and return None.
+    """
     import json as _json
-    cmd = (getattr(args, "butler_cmd", "") or "").split()
-    sub = cmd[0] if cmd else ""
-    rest = cmd[1:]
+
+    def emit(payload):
+        print(_json.dumps(payload, ensure_ascii=False, indent=2))
+
+    sub = (getattr(args, "butler_cmd", "") or "").strip()
     if sub == "doctor":
-        return _json.dumps(bp_doctor.report(ask=bool(getattr(args, "ask", False))), ensure_ascii=False)
+        emit(bp_doctor.report(ask=bool(getattr(args, "ask", False))))
+        return None
     if sub == "capture":
-        return _json.dumps(bp_capture.capture(target=(rest[0] if rest else None)), ensure_ascii=False)
+        emit(bp_capture.capture(target=(getattr(args, "target", None) or None)))
+        return None
     if sub == "status":
-        return _json.dumps(bp_engine.guide_status(), ensure_ascii=False)
-    return "unknown butler command: %s" % sub
+        emit(bp_engine.guide_status())
+        return None
+    print("usage: hermes butler doctor [--ask] | capture [app] | status")
+    return 2
 
 
 def cli_butler(args: str, **kwargs):
