@@ -1200,6 +1200,29 @@ private final class ChipView: NSView {
 
 // MARK: - Pop-out pet claim chip
 
+/// Bounded event journal (`chip-events.log` in the plugin data dir).
+///
+/// Support needs to know how far a click got before anyone blames the summon
+/// pipeline: `hover-in` without `click` means the window swallowed the press,
+/// `click` without `emit` means the controller path is broken, `emit` with no
+/// `state.json` row means the companion → engine hop is at fault.
+/// 200 lines, then it rewrites itself.
+private func chipJournal(_ event: String) {
+    let dir = (NSHomeDirectory() as NSString)
+        .appendingPathComponent(".hermes/plugin-data/butler")
+    let path = (dir as NSString).appendingPathComponent("chip-events.log")
+    let stamp = String(format: "%.3f", Date().timeIntervalSince1970)
+    var lines = (try? String(contentsOfFile: path, encoding: .utf8))?
+        .split(separator: "\n", omittingEmptySubsequences: true)
+        .map(String.init) ?? []
+    lines.append("\(stamp) \(event)")
+    if lines.count > 200 {
+        lines.removeFirst(lines.count - 200)
+    }
+    let payload = lines.joined(separator: "\n") + "\n"
+    try? payload.write(toFile: path, atomically: true, encoding: .utf8)
+}
+
 /// A borderless window cannot become key by default, and a window that cannot
 /// become key never routes clicks into its content view. This subclass only
 /// relaxes key status; it stays non-main so it never steals app activation.
@@ -1304,27 +1327,6 @@ private final class ClaimChipView: NSView {
         onClick?()
     }
 
-    /// Bounded event journal (`chip-events.log` in the plugin data dir).
-    ///
-    /// Support needs to know whether a click REACHED the window before anyone
-    /// can blame the summon pipeline: hover-in without click means the window
-    /// swallowed the press, click with no `state.json` row means the companion
-    /// to engine hop is at fault. 200 lines, then it rewrites itself.
-    private func chipJournal(_ event: String) {
-        let dir = (NSHomeDirectory() as NSString)
-            .appendingPathComponent(".hermes/plugin-data/butler")
-        let path = (dir as NSString).appendingPathComponent("chip-events.log")
-        let stamp = String(format: "%.3f", Date().timeIntervalSince1970)
-        var lines = (try? String(contentsOfFile: path, encoding: .utf8))?
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map(String.init) ?? []
-        lines.append("\(stamp) \(event)")
-        if lines.count > 200 {
-            lines.removeFirst(lines.count - 200)
-        }
-        let payload = lines.joined(separator: "\n") + "\n"
-        try? payload.write(toFile: path, atomically: true, encoding: .utf8)
-    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -2546,10 +2548,12 @@ private final class OverlayController {
 
     private func writeClaimClick() {
         guard claimChipEnabled else {
+            chipJournal("emit-skipped:disabled")
             return
         }
         let payload = "{\"op\":\"claim_click\"}\n"
         FileHandle.standardOutput.write(Data(payload.utf8))
+        chipJournal("emit")
     }
 
     // MARK: Pet double
