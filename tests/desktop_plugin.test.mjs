@@ -23,7 +23,8 @@ const INTERNALS = [
   'petClaimStatusText', 'syncCompanionClaim', 'petStatusRowText', 'summonBarState',
   'readSummonDestination', 'setSummonDestination', 'getSummonDestination', 'butlerCommandText',
   'openFreshButlerSession', 'openButlerSession', 'createButlerSession', 'listButlerSessions',
-  'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey', 'dismissSummonBar'
+  'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey', 'dismissSummonBar',
+  'startSummonPendingPolling', 'pollSummonPending'
 ]
 
 function makeDocument({
@@ -1258,4 +1259,89 @@ test('destination choice persists across plugin loads in localStorage', async ()
   second.api.setSummonDestination('existing')
   assert.equal(storage.values.get('butler.summon.destination'), 'existing')
   second.dispose()
+})
+
+test('register arms the module summon-pending timer next to the config poll', async () => {
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument()
+  })
+
+  const timerPeriods = env.intervals.map(entry => entry.ms)
+  assert.ok(timerPeriods.includes(5000), 'the config poll is still armed')
+  assert.ok(timerPeriods.includes(1500), 'the summon-pending poll is armed at REFRESH_MS')
+  env.dispose()
+})
+
+test('the module poll opens the bar and acks once per unseen pending id', async () => {
+  let statePayload = { summon_pending: { id: 'pending-1' } }
+  const calls = []
+  const rest = async (requestPath, opts) => {
+    calls.push({ path: requestPath, opts })
+    if (requestPath === '/state') return statePayload
+    if (requestPath === '/summon/ack') return { ok: true, cleared: true }
+    return {}
+  }
+  const env = await loadPlugin({ host: defaultHost(), rest, document: makeDocument() })
+  const events = []
+  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
+  const seqBefore = events.at(-1).petClickSeq
+
+  assert.equal(await env.api.pollSummonPending(), true)
+  assert.equal(events.at(-1).open, true, 'the chip click opens the same bar')
+  assert.equal(events.at(-1).origin, 'pet')
+  assert.equal(events.at(-1).petClickSeq, seqBefore + 1, 'a chip summon flashes once')
+  let acks = calls.filter(call => call.path === '/summon/ack')
+  assert.equal(acks.length, 1)
+  assert.equal(acks[0].opts.method, 'POST')
+  assert.equal(acks[0].opts.body.id, 'pending-1')
+
+  // The row can survive one poll interval before the ack lands: dedupe by id
+  // must not reopen the bar and must not send a second ack.
+  assert.equal(await env.api.pollSummonPending(), false)
+  assert.equal(events.at(-1).petClickSeq, seqBefore + 1)
+  assert.equal(calls.filter(call => call.path === '/summon/ack').length, 1)
+
+  // A second click is a new id and is consumed again.
+  statePayload = { summon_pending: { id: 'pending-2' } }
+  assert.equal(await env.api.pollSummonPending(), true)
+  assert.equal(events.at(-1).petClickSeq, seqBefore + 2)
+  acks = calls.filter(call => call.path === '/summon/ack')
+  assert.deepEqual(acks.map(call => call.opts.body.id), ['pending-1', 'pending-2'])
+
+  unsubscribe()
+  env.dispose()
+})
+
+test('a failing /state never throws out of the module poll', async () => {
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async requestPath => {
+      if (requestPath === '/state') throw new Error('backend down')
+      return {}
+    },
+    document: makeDocument()
+  })
+
+  assert.equal(await env.api.pollSummonPending(), false)
+  env.dispose()
+})
+
+test('a failed ack still opens the bar and never throws', async () => {
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async requestPath => {
+      if (requestPath === '/state') return { summon_pending: { id: 'pending-x' } }
+      if (requestPath === '/summon/ack') throw new Error('ack down')
+      return {}
+    },
+    document: makeDocument()
+  })
+  const events = []
+  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
+
+  assert.equal(await env.api.pollSummonPending(), true)
+  assert.equal(events.at(-1).open, true, 'the bar opens even when the ack fails')
+
+  unsubscribe()
+  env.dispose()
 })

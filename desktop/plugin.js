@@ -83,6 +83,12 @@ let petClickClaim = false
 let petClickWatcher = null
 let petClickConfigWrites = 0
 let claimConfigTimer = null
+// Module-scope consumer for the companion chip's summon row. The hook inside
+// SummonBar only runs while that component is mounted; the chip click path must
+// not depend on that, so the pending watcher lives here and the hook is only a
+// fallback. lastPendingId dedupes a row that survives one poll before the ack.
+let summonPendingTimer = null
+let lastPendingId = null
 // Has the in-window core pet canvas ever been found while the receiver was on?
 // The pane chip uses this to say "armed" only when there is something to click.
 let petCanvasSeen = false
@@ -894,6 +900,60 @@ function startClaimConfigPolling(ctx) {
     claimConfigTimer = window.setInterval(tick, CONFIG_REFRESH_MS)
   } catch (err) {
     // No timer surface: the pane toggle still applies directly.
+  }
+}
+
+/**
+ * Consume one companion-chip summon row from /state.
+ *
+ * The engine writes `summon_pending` when the pop-out chip is clicked; the
+ * desktop's side of that contract is opening the bar and acking the row. This
+ * runs at module scope because the SummonBar hook is unmounted on hosts that
+ * never painted the titlebar slot (the live failure: the row sat for 12 s).
+ * Returns true only for an id this module has not consumed yet.
+ */
+function pollSummonPending() {
+  if (typeof rest !== 'function') return Promise.resolve(false)
+  return Promise.resolve()
+    .then(() => rest('/state'))
+    .then(data => {
+      const pending = data && data.summon_pending
+      const pendingId = asText(pending && pending.id)
+      if (!pendingId || pendingId === lastPendingId) return false
+      lastPendingId = pendingId
+      try {
+        openSummonBar('pet')
+      } catch (err) {
+        // The click still must not keep the row alive.
+      }
+      // Fire and forget: a failed ack never stops the poll and the row is
+      // already deduped, so the bar cannot open twice for this id.
+      try {
+        const ack = rest('/summon/ack', { method: 'POST', body: { id: pendingId } })
+        if (ack && typeof ack.catch === 'function') ack.catch(() => {})
+      } catch (err) {
+        // Swallow: the next /state tick still reports the row unconsumed.
+      }
+      return true
+    })
+    .catch(() => false)
+}
+
+/** Watch the summon row even when the SummonBar hook never mounts. */
+function startSummonPendingPolling(ctx) {
+  const tick = () => { pollSummonPending().catch(() => {}) }
+  try {
+    if (ctx && typeof ctx.setInterval === 'function') {
+      ctx.setInterval(tick, REFRESH_MS)
+      return
+    }
+  } catch (err) {
+    // Fall through to the window timer below.
+  }
+  try {
+    summonPendingTimer = window.setInterval(tick, REFRESH_MS)
+  } catch (err) {
+    // No timer surface: the in-window listener and the shortcut still work.
   }
 }
 
@@ -1897,9 +1957,14 @@ export default {
           if (claimConfigTimer !== null) window.clearInterval(claimConfigTimer)
         } catch (err) { }
         claimConfigTimer = null
+        try {
+          if (summonPendingTimer !== null) window.clearInterval(summonPendingTimer)
+        } catch (err) { }
+        summonPendingTimer = null
       })
     } catch (err) { }
     try { syncPetClickClaim() } catch (err) { }
     startClaimConfigPolling(ctx)
+    startSummonPendingPolling(ctx)
   }
 }

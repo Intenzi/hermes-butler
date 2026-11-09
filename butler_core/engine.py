@@ -265,7 +265,9 @@ def set_claim_chip(enabled):
     ok, detail = _OVERLAY.start(show_pet=False)
     if not ok:
         return {"enabled": True, "running": False, "detail": str(detail)}
-    _OVERLAY.claim_chip(True)
+    # Tell the petless companion the live sprite size; without it the chip can
+    # only anchor to the (mostly empty) pop-out window frame.
+    _OVERLAY.claim_chip(True, sprite=bp_overlay.resolve_pet_sprite())
     return {"enabled": True, "running": True, "detail": str(detail)}
 
 

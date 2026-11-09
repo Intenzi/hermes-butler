@@ -200,6 +200,89 @@ def test_claim_chip_op_is_sent_when_armed() -> None:
     ]
 
 
+def test_claim_chip_op_carries_the_sprite_anchor_when_known() -> None:
+    """The companion must be told the sprite so the chip lands next to the pet.
+
+    ``claim_chip(True)`` stays byte-identical to the pre-sprite wire format so
+    an older companion (or a petless install) keeps working.
+    """
+    proc = _FakeProc()
+    controller = overlay.Overlay()
+    controller.proc = proc
+
+    controller.claim_chip(True, sprite=(63.36, 68.64))
+    controller.claim_chip(True)
+
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    assert [json.loads(line) for line in lines] == [
+        {"op": "claim_chip", "enabled": True,
+         "sprite_w": 63, "sprite_h": 69, "pad_bottom": 24},
+        {"op": "claim_chip", "enabled": True},
+    ]
+
+
+def test_claim_chip_malformed_sprite_falls_back_to_the_window_op() -> None:
+    proc = _FakeProc()
+    controller = overlay.Overlay()
+    controller.proc = proc
+
+    controller.claim_chip(True, sprite="not-a-size")
+
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    assert [json.loads(line) for line in lines] == [
+        {"op": "claim_chip", "enabled": True},
+    ]
+
+
+def test_resolve_pet_sprite_scales_the_192x208_frame(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _make_pet(tmp_path, "robotocat")
+    _write_config(tmp_path, "display:\n  pet:\n    slug: robotocat\n    scale: 0.5\n")
+
+    assert overlay.resolve_pet_sprite() == (96.0, 104.0)
+
+
+def test_resolve_pet_sprite_uses_the_default_scale(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _make_pet(tmp_path, "robotocat")
+
+    sprite = overlay.resolve_pet_sprite()
+
+    # 192x208 * default 0.33 rounds to the anchored 63x69 sprite box.
+    assert overlay._rounded_sprite(sprite) == (63, 69)
+
+
+def test_resolve_pet_sprite_is_none_without_a_pet(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "pets").mkdir()
+
+    assert overlay.resolve_pet_sprite() is None
+
+
+def test_start_reasserts_the_chip_with_the_sprite(tmp_path: Path, monkeypatch) -> None:
+    """A companion first spawned petless (capture) must get the sprite on re-arm."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _make_pet(tmp_path, "robotocat")
+    _write_config(tmp_path, "display:\n  pet:\n    slug: robotocat\n    scale: 0.5\n")
+
+    proc = _FakeProc()
+    controller = overlay.Overlay()
+    controller.proc = proc
+    controller._claim_chip_enabled = True
+
+    ok, _detail = controller.start(show_pet=False)
+
+    assert ok is True
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    assert [json.loads(line) for line in lines] == [{
+        "op": "claim_chip",
+        "enabled": True,
+        "sprite_w": 96,
+        "sprite_h": 104,
+        "pad_bottom": 24,
+    }]
+
+
 def test_claim_click_event_reaches_the_engine_callback() -> None:
     controller = overlay.Overlay()
     seen = []
@@ -250,6 +333,47 @@ def _swift_function_body(source: str, start_marker: str, end_marker: str) -> str
     end = source.find(end_marker, start + len(start_marker))
     assert end != -1, f"missing Swift marker: {end_marker}"
     return source[start:end]
+
+
+def test_claim_chip_anchors_the_chip_to_the_sprite_not_the_window() -> None:
+    """The pop-out window is 240x300 around a ~63x69 sprite: anchor the sprite.
+
+    The companion is spawned petless, so the op must carry the sprite size and
+    the sprite's 24 pt bottom padding; without them the chip is pinned to the
+    empty window frame (the live defect: chip at 1081,365 while the pet is not
+    near that point).
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    decoder = _swift_function_body(source, 'case "claim_chip":', 'case "launcher":')
+    assert '"sprite_w"' in decoder
+    assert '"sprite_h"' in decoder
+    assert '"pad_bottom"' in decoder
+    # Malformed geometry degrades to the window anchor, never drops the op.
+    assert "logMalformedOnce" in decoder
+    assert "return .claimChip(" in decoder
+    assert "static let defaultPadBottom: CGFloat = 24" in source
+
+    anchor = _swift_function_body(source, "private func claimChipAnchor(",
+                                  "private func claimChipSize(")
+    assert "window.minX + (window.width - spriteSize.width) / 2.0" in anchor
+    assert "window.maxY - padBottom - spriteSize.height" in anchor
+    assert "spriteSize.width > 0.0, spriteSize.height > 0.0" in anchor
+    assert "return window" in anchor, "no sprite size must keep the window frame"
+
+    # Half a pair is unusable: one dimension alone must not centre the anchor.
+    setter = _swift_function_body(
+        source,
+        "private func setClaimChip(_ spec: ClaimChipSpec)",
+        "/// Find the core Hermes pet pop-out.",
+    )
+    assert "if let width = spec.spriteW, let height = spec.spriteH" in setter
+    assert "claimChipSpriteSize = nil" in setter
+
+    position = _swift_function_body(source, "private func positionClaimChip(",
+                                    "private func hideClaimChip(")
+    assert "let petWindow = hermesPetWindowFrame(" in position
+    assert "claimChipAnchor(window: petWindow" in position
 
 
 def test_pet_anchor_is_pid_and_shape_based_not_title_or_layer() -> None:

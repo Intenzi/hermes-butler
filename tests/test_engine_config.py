@@ -68,6 +68,7 @@ class _FakeOverlay:
     def __init__(self):
         self.running = False
         self.calls = []
+        self.sprites = []
         self.on_event = None
 
     def start(self, show_pet=True):
@@ -75,8 +76,9 @@ class _FakeOverlay:
         self.running = True
         return True, "spawned"
 
-    def claim_chip(self, enabled):
+    def claim_chip(self, enabled, sprite=None):
         self.calls.append(("claim_chip", enabled))
+        self.sprites.append(sprite)
 
     def is_running(self):
         return self.running
@@ -97,3 +99,16 @@ def test_set_claim_chip_starts_a_petless_companion_and_toggles_the_chip(
     result = engine.set_claim_chip(False)
     assert result["enabled"] is False
     assert fake.calls[-1] == ("claim_chip", False)
+
+
+def test_set_claim_chip_forwards_the_live_sprite_to_the_companion(
+        tmp_path: Path, monkeypatch) -> None:
+    fake = _FakeOverlay()
+    monkeypatch.setattr(engine, "_OVERLAY", fake)
+    monkeypatch.setattr(engine.bp_overlay, "resolve_pet_sprite", lambda: (63, 69))
+    engine.init(tmp_path)
+
+    engine.set_claim_chip(True)
+
+    assert fake.calls == [("start", False), ("claim_chip", True)]
+    assert fake.sprites[-1] == (63, 69)

@@ -13,7 +13,7 @@
 //    {"op":"ring","box":[x,y,w,h],"label":"...","say":"...","step":n,"total":m}
 //    {"op":"chip","step":n}
 //    {"op":"pet","frames_dir":"...","scale":0.33,"pet_enabled":true}
-//    {"op":"claim_chip","enabled":true}
+//    {"op":"claim_chip","enabled":true,"sprite_w":63,"sprite_h":69,"pad_bottom":24}
 //    {"op":"launcher"}
 //    {"op":"done"}
 //    {"op":"axtrusted","prompt":true}
@@ -693,6 +693,15 @@ private struct PetSpec {
 
 private struct ClaimChipSpec {
     let enabled: Bool
+    /// On-screen sprite size the pet pop-out draws, in points. nil (an old
+    /// producer, or a malformed field) keeps the window-frame anchor.
+    let spriteW: CGFloat?
+    let spriteH: CGFloat?
+    let padBottom: CGFloat
+
+    /// Mirrors PET_PADDING_BOTTOM in app/pet-overlay/pet-overlay-app.tsx: the
+    /// sprite sits 24 pt above the bottom edge of the pop-out window.
+    static let defaultPadBottom: CGFloat = 24.0
 }
 
 private enum OverlayCommand {
@@ -830,7 +839,37 @@ private func parseCommand(line: String) -> OverlayCommand? {
             }
             enabled = parsedEnabled
         }
-        return .claimChip(ClaimChipSpec(enabled: enabled))
+        // The sprite anchor fields are advisory: an old producer omits them and
+        // a hostile/broken one gets the window-frame fallback. Neither may drop
+        // the op, or the pet would lose its only summon door.
+        var spriteW: CGFloat?
+        if let rawSpriteW = object["sprite_w"], !(rawSpriteW is NSNull) {
+            if let parsed = numberValue(rawSpriteW), parsed > 0.0, parsed <= 10_000.0 {
+                spriteW = CGFloat(parsed)
+            } else {
+                logMalformedOnce(line: line, reason: "claim_chip has an invalid sprite_w")
+            }
+        }
+        var spriteH: CGFloat?
+        if let rawSpriteH = object["sprite_h"], !(rawSpriteH is NSNull) {
+            if let parsed = numberValue(rawSpriteH), parsed > 0.0, parsed <= 10_000.0 {
+                spriteH = CGFloat(parsed)
+            } else {
+                logMalformedOnce(line: line, reason: "claim_chip has an invalid sprite_h")
+            }
+        }
+        var padBottom = ClaimChipSpec.defaultPadBottom
+        if let rawPadBottom = object["pad_bottom"], !(rawPadBottom is NSNull) {
+            if let parsed = numberValue(rawPadBottom), parsed >= 0.0, parsed <= 10_000.0 {
+                padBottom = CGFloat(parsed)
+            } else {
+                logMalformedOnce(line: line, reason: "claim_chip has an invalid pad_bottom")
+            }
+        }
+        return .claimChip(ClaimChipSpec(enabled: enabled,
+                                        spriteW: spriteW,
+                                        spriteH: spriteH,
+                                        padBottom: padBottom))
 
     case "launcher":
         return .launcher
@@ -1509,6 +1548,10 @@ private final class OverlayController {
     private var claimChipView: ClaimChipView?
     private var claimChipTimer: Timer?
     private var claimChipEnabled = false
+    /// Sprite size and bottom padding reported by the producer; nil means the
+    /// producer predates the sprite anchor and the window frame stays the box.
+    private var claimChipSpriteSize: CGSize?
+    private var claimChipPadBottom: CGFloat = ClaimChipSpec.defaultPadBottom
     private let claimChipGap: CGFloat = 10.0
     /// Last pet-panel frame the chip anchored to. The pet's send-message
     /// bubble is nearby, so preferring the previous origin keeps the chip from
@@ -1628,7 +1671,7 @@ private final class OverlayController {
             showPet(spec)
         case .claimChip(let spec):
             cancelPendingExit()
-            setClaimChip(spec.enabled)
+            setClaimChip(spec)
         case .launcher:
             cancelPendingExit()
             showLauncher()
@@ -1862,12 +1905,19 @@ private final class OverlayController {
 
     // MARK: Pop-out pet claim chip
 
-    private func setClaimChip(_ enabled: Bool) {
+    private func setClaimChip(_ spec: ClaimChipSpec) {
         guard !isShuttingDown else {
             return
         }
-        claimChipEnabled = enabled
-        if !enabled {
+        claimChipEnabled = spec.enabled
+        // Only a complete pair is usable: one dimension cannot centre the anchor.
+        if let width = spec.spriteW, let height = spec.spriteH {
+            claimChipSpriteSize = CGSize(width: width, height: height)
+        } else {
+            claimChipSpriteSize = nil
+        }
+        claimChipPadBottom = spec.padBottom
+        if !spec.enabled {
             claimChipTimer?.invalidate()
             claimChipTimer = nil
             hideClaimChip()
@@ -1964,6 +2014,26 @@ private final class OverlayController {
         return largest
     }
 
+    /// The sprite's box inside the pet pop-out window.
+    ///
+    /// pet-overlay-app.tsx lays the sprite out bottom-centred ("flex-end" plus
+    /// PET_PADDING_BOTTOM), so inside a window of size W x H the sprite occupies
+    /// x = minX + (W - spriteW) / 2, y = maxY - padBottom - spriteH. A producer
+    /// that does not report the sprite size (older plugin, malformed fields)
+    /// keeps the whole window as the anchor - today's behaviour.
+    private func claimChipAnchor(window: CGRect,
+                                 spriteSize: CGSize?,
+                                 padBottom: CGFloat) -> CGRect {
+        guard let spriteSize = spriteSize,
+              spriteSize.width > 0.0, spriteSize.height > 0.0 else {
+            return window
+        }
+        return CGRect(x: window.minX + (window.width - spriteSize.width) / 2.0,
+                      y: window.maxY - padBottom - spriteSize.height,
+                      width: spriteSize.width,
+                      height: spriteSize.height)
+    }
+
     private func claimChipSize() -> CGSize {
         let font = NSFont.systemFont(ofSize: 11.0, weight: .semibold)
         let textBounds = ("Ask butler" as NSString).size(withAttributes: [.font: font])
@@ -2010,10 +2080,19 @@ private final class OverlayController {
             return
         }
         let size = claimChipSize()
-        guard let pet = hermesPetWindowFrame(primaryHeight: primaryHeight),
-              let frame = claimChipFrame(nextTo: pet, size: size,
-                                         primaryHeight: primaryHeight) else {
+        guard let petWindow = hermesPetWindowFrame(primaryHeight: primaryHeight) else {
             // Unknown/renamed pet window: stay hidden rather than guess.
+            hideClaimChip()
+            return
+        }
+        // Anchor to the SPRITE inside the pop-out window, not to the window:
+        // the 240x300 window is mostly padding around a ~63x69 sprite, so a
+        // window-frame anchor lands the chip far away from the pet.
+        let pet = claimChipAnchor(window: petWindow,
+                                  spriteSize: claimChipSpriteSize,
+                                  padBottom: claimChipPadBottom)
+        guard let frame = claimChipFrame(nextTo: pet, size: size,
+                                         primaryHeight: primaryHeight) else {
             hideClaimChip()
             return
         }

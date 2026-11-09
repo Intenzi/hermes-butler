@@ -10,6 +10,7 @@ Protocol: one JSON line per op on stdin -
   {"op":"chip","step":3}
   {"op":"pet","frames_dir":"...","scale":0.33,"pet_enabled":true}
   {"op":"claim_chip","enabled":true}
+  {"op":"claim_chip","enabled":true,"sprite_w":63,"sprite_h":69,"pad_bottom":24}
   {"op":"launcher"}
   {"op":"done"}
   {"op":"idle"}
@@ -31,6 +32,13 @@ import time
 DEFAULT_PET_SCALE = 0.33
 MIN_PET_SCALE = 0.2
 MAX_PET_SCALE = 1.0
+# petdex frames are 192x208 (store/pet-overlay.ts and pet-sprite.tsx defaults);
+# the app draws them at frame * display.pet.scale.
+PET_FRAME_WIDTH = 192.0
+PET_FRAME_HEIGHT = 208.0
+# PET_PADDING_BOTTOM in app/pet-overlay/pet-overlay-app.tsx: the sprite is laid
+# out bottom-centred this many points above the pop-out window's bottom edge.
+CLAIM_CHIP_PAD_BOTTOM = 24
 
 
 def binary_path():
@@ -213,6 +221,34 @@ def resolve_pet_op():
     }
 
 
+def resolve_pet_sprite():
+    """On-screen sprite size (w, h) in points, or None when no pet is installed.
+
+    Mirrors what the desktop app draws: a 192x208 frame scaled by the resolved
+    ``display.pet.scale`` (default 0.33). The claim chip feeds this to the
+    companion so it can anchor next to the sprite, not the empty window.
+    """
+    if resolve_frames_dir() is None:
+        return None
+    scale = _resolved_scale(read_display_pet())
+    return (PET_FRAME_WIDTH * scale, PET_FRAME_HEIGHT * scale)
+
+
+def _rounded_sprite(sprite):
+    """Round a ``(w, h)`` sprite tuple to whole points, or None if unusable."""
+    if sprite is None:
+        return None
+    try:
+        width, height = sprite
+        width = int(round(float(width)))
+        height = int(round(float(height)))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
 _SHARED_OVERLAY = None
 
 
@@ -267,7 +303,9 @@ class Overlay:
                 if show_pet:
                     self._send_pet_op()
                 if self._claim_chip_enabled:
-                    self.claim_chip(True)
+                    # Re-assert with the sprite so a companion that came up
+                    # petless (capture) still anchors the chip to the pet.
+                    self.claim_chip(True, sprite=resolve_pet_sprite())
                 return True, "already running pid %d" % self.proc.pid
             self.proc = None
             self._stdout_buf = b""
@@ -291,7 +329,9 @@ class Overlay:
                 if show_pet:
                     self._send_pet_op()
                 if self._claim_chip_enabled:
-                    self.claim_chip(True)
+                    # Re-assert with the sprite so a companion that came up
+                    # petless (capture) still anchors the chip to the pet.
+                    self.claim_chip(True, sprite=resolve_pet_sprite())
                 return True, "spawned pid %d" % self.proc.pid
             except Exception as exc:  # noqa: BLE001
                 self.proc = None
@@ -306,10 +346,22 @@ class Overlay:
         except Exception:  # noqa: BLE001
             pass
 
-    def claim_chip(self, enabled):
-        """Show/hide the companion's pop-out pet click chip (idempotent)."""
+    def claim_chip(self, enabled, sprite=None):
+        """Show/hide the companion's pop-out pet click chip (idempotent).
+
+        ``sprite`` is the on-screen ``(w, h)`` of the pet sprite, in points.
+        Including it lets the companion anchor the chip to the sprite inside the
+        mostly-empty pop-out window. ``None`` (no pet, or an old caller) sends
+        the legacy two-key op unchanged.
+        """
         self._claim_chip_enabled = bool(enabled)
-        self._send({"op": "claim_chip", "enabled": self._claim_chip_enabled})
+        op = {"op": "claim_chip", "enabled": self._claim_chip_enabled}
+        rounded = _rounded_sprite(sprite)
+        if rounded is not None:
+            op["sprite_w"] = rounded[0]
+            op["sprite_h"] = rounded[1]
+            op["pad_bottom"] = CLAIM_CHIP_PAD_BOTTOM
+        self._send(op)
 
     def _start_reader(self):
         """Read unsolicited events (mini-window clicks) off the companion pipe.
