@@ -191,6 +191,17 @@ one and it must not outlive the work it was spawned for.
   mouse click on the chip (synthetic `CGEventPost` clicks are dropped without an
   Accessibility grant, and `screencapture` / cua-driver captures fail on this
   machine for the same reason).
+- The companion is owned by whichever process serves `/summon/claim` — the
+  **plugin API process**, not the agent runtime that runs `register()`. If that
+  process never calls `engine.init()`, the chip arms fine and EVERY click is
+  dropped silently: no data dir, `_OVERLAY.on_event is None`, and `_write_state`
+  no-ops. `dashboard/plugin_api._engine_module()` must initialise the engine on
+  first use, and `_write_state` must merge the other owner's block (guide vs
+  `summon_pending`) instead of overwriting the shared `state.json`.
+- A click is traceable hop by hop through `chip-events.log` in the plugin data
+  dir: `click` (view) → `emit` (stdout) → `pipe-claim cb=set|none` (reader
+  thread) → `engine-pending` (engine callback). Empty `state.json` after `emit`
+  means the click died in Python, not in the window.
 - Two plugin-hosting Python processes (the gateway and the tool worker) each
   own their own companion: a `butler_capture` call from the tool worker adds a
   second `ButlerOverlay` next to the gateway's claim-chip one. They do not
