@@ -60,6 +60,27 @@ before advancing.
   on sidebar rows and menu cells - prefer `window` there too).
 - Status `capture_failed`: the OS read itself failed (missing grant). Fix the
   grant (doctor --ask) and restart; do NOT rewrite the plan.
+## Pitfalls that waste a whole guide
+
+- **Never verify a pane that lives in the same window as this chat.** The
+  desktop transcript renders every label the agent has written (bubbles, tool
+  text, live thinking) as AXStaticText rows with 1px-high boxes, so an
+  `expect: {"visible": "..."}` fires the instant the needle is on screen and
+  the guide races past steps the user never clicked. Rings stay correct
+  (best_match prefers real boxes and button roles); only the EXPECT half is
+  fooled. For Hermes' own Settings inside the Hermes window, hand the path to
+  the user in chat instead of starting a guide.
+- **Settings inside the Hermes desktop app is a route in the main window, not
+  a separate window and not a pane title.** Window title stays "Hermes", so
+  `expect: {"window": ...}` can never fire. Grounded labels: `Open settings`
+  (gear, top right, AXButton), then nav rows `Appearance` and `Notifications`
+  (AXButton, each with an `Expand: <name>` chevron). Sub-pages such as
+  `Desktop alerts` and `Sounds` only exist after the parent expands.
+- `osascript` on this machine lacks an Accessibility grant: System Events
+  cannot click controls for you and `screencapture` fails (no Screen
+  Recording grant), while computer_use reports a 0x0 window for the Electron
+  app. The butler companion is the only working screen reader here.
+
 - If `butler_guide_status` reports stalled: rewrite the stalled step with a
   better `find.label` and start a fresh short guide; never repeat the same
   failing step verbatim.

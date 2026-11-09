@@ -25,7 +25,21 @@ DEFAULT_TIMEOUT = 120.0
 DEFAULT_PET_CLICK_CLAIM = False
 ERROR_STREAK_NOTE = 3  # consecutive poll errors before the note surfaces
 
+# Electron/Chromium apps render their chrome as deeply nested divs. At depth 12
+# a walk sees only the container groups of an overlay/page (settings nav rows,
+# tab labels and buttons all sit below it), so every find.match and expect check
+# silently misses while native apps (much shallower) keep working. The poll
+# therefore starts cheap and shallow, then re-walks ONCE at depth 24 only when
+# the shallow snapshot cannot satisfy the step. Do not "simplify" this back to
+# a single shallow capture.
+SHALLOW_MAX_ELEMENTS = 200
+SHALLOW_DEPTH = 12
+DEEP_MAX_ELEMENTS = 900
+DEEP_DEPTH = 24
+DEEP_CAPTURE_INTERVAL = 1.0  # seconds between deep walks, even if poll is faster
+
 _lock = threading.Lock()
+_last_deep_capture_at = None  # monotonic timestamp of the last deep walk
 _session = None           # latest guide dict
 _thread = None
 _stop_flag = False
@@ -66,6 +80,45 @@ def poll_seconds():
 
 def step_timeout():
     return float(_cfg().get("step_timeout_seconds", DEFAULT_TIMEOUT))
+
+
+def _evaluate_step(step, snap):
+    """Match a step's find and evaluate its expect against ONE snapshot.
+
+    Both halves of a step must see the same AX walk: a find match from one
+    capture and an expect verdict from another can disagree mid-navigation.
+    """
+    find = step.get("find") or {}
+    label_needle = find.get("label")
+    best = None
+    if label_needle:
+        best = bp_capture.best_match(snap.get("elements", []), label_needle,
+                                     find.get("role"))
+    verdict = bp_capture.expect_pending(step.get("expect") or {}, snap, best)
+    return label_needle, best, verdict
+
+
+def _step_needs_deep(step, best, verdict):
+    """True when the shallow walk could not satisfy the current step."""
+    find = step.get("find") or {}
+    if find.get("label") and best is None:
+        return True
+    # An empty expect is a find-only step: expect_pending reports no_expect_given,
+    # which is not a reason to pay for a deep walk.
+    return bool(step.get("expect")) and not verdict.get("verified")
+
+
+def _deep_capture_allowed():
+    if _last_deep_capture_at is None:
+        return True
+    return (time.monotonic() - _last_deep_capture_at) >= DEEP_CAPTURE_INTERVAL
+
+
+def _deep_capture():
+    """One deep AX walk, rate-limited to one per DEEP_CAPTURE_INTERVAL."""
+    global _last_deep_capture_at
+    _last_deep_capture_at = time.monotonic()
+    return bp_capture.capture(max_elements=DEEP_MAX_ELEMENTS, depth=DEEP_DEPTH)
 
 
 def _as_bool(value, default=False):
@@ -259,19 +312,23 @@ def _loop():
 def _poll_once(s):
     idx = s["state"]["idx"]
     step = s["steps"][idx]
-    snap = bp_capture.capture(max_elements=200, depth=12)
+    snap = bp_capture.capture(max_elements=SHALLOW_MAX_ELEMENTS,
+                              depth=SHALLOW_DEPTH)
     if snap.get("error") or (snap.get("trusted") is False):
         s["state"] = dict(s["state"], status="capture_failed")
         s["capture_note"] = snap.get("note") or snap.get("error")
         s["fix"] = snap.get("fix")
         return
-    find = step.get("find") or {}
-    label_needle = find.get("label")
-    best = None
-    if label_needle:
-        best = bp_capture.best_match(snap.get("elements", []), label_needle,
-                                     find.get("role"))
-    verdict = bp_capture.expect_pending(step.get("expect") or {}, snap, best)
+    label_needle, best, verdict = _evaluate_step(step, snap)
+    # Deep pass: Electron overlays/pages nest their real controls below the
+    # shallow walk's depth. Re-walk once, and only when the shallow snapshot
+    # could not satisfy this step; both find and expect then reuse that deep
+    # snapshot (never walk twice for the two halves of one step).
+    if _step_needs_deep(step, best, verdict) and _deep_capture_allowed():
+        deep = _deep_capture()
+        if not deep.get("error") and deep.get("trusted") is not False:
+            snap = deep
+            label_needle, best, verdict = _evaluate_step(step, snap)
     s["last_capture_app"] = snap.get("app")
     s["last_captured_at"] = time.time()
     if not verdict["verified"]:
@@ -366,7 +423,8 @@ def guide_start(args, unattended=False):
         ok, detail = _OVERLAY.start()
         guide["overlay"] = ("unavailable:%s" % detail) if not ok else "starting"
         try:
-            first = bp_capture.capture(max_elements=200, depth=12)
+            first = bp_capture.capture(max_elements=SHALLOW_MAX_ELEMENTS,
+                                       depth=SHALLOW_DEPTH)
         except Exception as exc:  # capture must never orphan a live guide
             guide["state"] = dict(guide["state"], status="capture_failed")
             guide["capture_note"] = "startup capture raised: %r" % exc
@@ -387,6 +445,15 @@ def guide_start(args, unattended=False):
         find0 = steps[0].get("find") or {}
         best = bp_capture.best_match(first.get("elements", []),
                                      find0.get("label"), find0.get("role"))
+        # Same two-pass treatment as the poll: a first-step target inside an
+        # Electron overlay lives below the shallow walk. Try one deep walk
+        # before telling the agent the plan is wrong with overlay "no_match".
+        if find0.get("label") and best is None and _deep_capture_allowed():
+            deep = _deep_capture()
+            if not deep.get("error") and deep.get("trusted") is not False:
+                first = deep
+                best = bp_capture.best_match(first.get("elements", []),
+                                             find0.get("label"), find0.get("role"))
         guide["last_capture_app"] = first.get("app")
         guide["last_captured_at"] = time.time()
         if best is not None and best.get("box"):

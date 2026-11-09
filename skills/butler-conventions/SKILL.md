@@ -110,7 +110,28 @@ Rules:
   survive `plugin install → grant → walkthrough` on a machine that has
   never seen the repo.
 
-## 5. Pet double parity and companion lifetime
+## 5. Capture depth must reach Electron web content
+
+Guides inside Electron apps (Hermes desktop, VS Code, Slack) need a deep AX
+walk. Measure before blaming the plan: `butler_capture(target=App, depth=12,
+max=1200)` returns only containers, while `depth=24` returns the real
+controls. Electron nests its DOM well past level 12, so app chrome ("Open
+settings", "Search") rings fine while everything inside an overlay or page
+(nav rows, tabs, buttons) is invisible — the step never verifies and the
+guide stalls at idx 0 with `overlay: "waiting"` and `current_box: null`.
+
+The engine therefore captures shallow first (depth 12) and re-walks once at
+depth 24 (`engine.py`: `SHALLOW_*` / `DEEP_*`) only when the shallow snapshot
+cannot satisfy the step, rate-limited to one deep walk per second. Never
+collapse that back to a single shallow call, and never invent a `find.label`
+for an Electron control you have not seen in a depth-24 capture.
+
+Stall triage order: `butler_guide_status` (idx, overlay, `last_capture_app`) →
+deep `butler_capture` of the window the user says they are looking at. A
+`last_capture_app` that is not the app under discussion means a poll read the
+wrong frontmost window; the plan is fine, the focus was not.
+
+## 6. Pet double parity and companion lifetime
 
 The companion draws a copy of the user's desktop pet, so it must animate like
 one and it must not outlive the work it was spawned for.
