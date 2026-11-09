@@ -377,10 +377,12 @@ def test_claim_chip_anchors_the_chip_to_the_sprite_not_the_window() -> None:
 
 
 def test_claim_chip_is_a_hat_icon_at_the_pets_top_right() -> None:
-    """The chip is a 26x24 hat badge perched on the sprite's top-right corner.
+    """The chip is a 26x24 hat badge in the sprite's upper-right quadrant.
 
-    Text made it a wide pill beside the pet; the pinned candidate order keeps
-    the hat above the sprite (``pet.minY - gap``) ahead of everything else.
+    Text made it a wide pill beside the pet; the pinned candidate order puts the
+    upper-right placement first. It sits BESIDE the head (``pet.minY + gap``)
+    rather than above it, because the strip above the sprite is where the pet's
+    own speech bubble renders and the chip used to cover those lines.
     """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
@@ -404,15 +406,14 @@ def test_claim_chip_is_a_hat_icon_at_the_pets_top_right() -> None:
 
     frame_body = _swift_function_body(source, "private func claimChipFrame(",
                                       "private func positionClaimChip(")
-    assert "pet.maxX - size.width * 0.3" in frame_body
-    top_right = frame_body.find("pet.minY - gap - size.height")
-    right = frame_body.find("pet.maxX + gap")
+    upper_right = frame_body.find("CGRect(x: pet.maxX + gap, y: pet.minY + gap")
+    lower_right = frame_body.find("y: pet.midY - size.height / 2.0")
     below = frame_body.find("pet.maxY + gap")
-    assert top_right != -1 and right != -1 and below != -1
-    # "Starts with top-right" means ahead of BOTH the right and the below
-    # candidates; comparing minY against maxY alone also held for the old order.
-    assert top_right < right, "top-right must precede the right placement"
-    assert top_right < below, "top-right must precede the below placement"
+    assert upper_right != -1 and lower_right != -1 and below != -1
+    assert upper_right < lower_right, "the head-height placement comes first"
+    assert upper_right < below, "upper-right must precede the below placement"
+    # The chip must never be placed back over the bubble strip above the sprite.
+    assert "pet.minY - gap - size.height" not in frame_body
     # Keep the clamping + no-overlap guard that makes fallbacks skip.
     assert "!frame.intersects(pet)" in frame_body
     assert "return nil" in frame_body

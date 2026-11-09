@@ -2070,17 +2070,18 @@ private final class OverlayController {
         let visible = quartzRect(fromAppKit: screen.visibleFrame,
                                  primaryHeight: primaryHeight)
         let gap = claimChipGap
-        // Top-right first: a hat perched on the pet's head. The 0.3 overlap of
-        // the sprite's own width tucks it toward the crown instead of floating
-        // a full gap away; the intersect guard still rejects any clamped
-        // candidate that lands on the sprite.
+        // Upper-right first, and deliberately BESIDE the head rather than above
+        // it: the pet's own speech bubble ("tinkering…") renders in the strip
+        // above the sprite, so a chip there would cover the pet's lines. Sitting
+        // just below the sprite's top edge keeps it in the top-right quadrant
+        // while leaving the bubble strip clear. The intersect guard still
+        // rejects any clamped candidate that lands on the sprite.
         let candidates = [
-            CGRect(x: pet.maxX - size.width * 0.3,
-                   y: pet.minY - gap - size.height,
+            CGRect(x: pet.maxX + gap, y: pet.minY + gap,
                    width: size.width, height: size.height),
             CGRect(x: pet.maxX + gap, y: pet.midY - size.height / 2.0,
                    width: size.width, height: size.height),
-            CGRect(x: pet.minX - gap - size.width, y: pet.midY - size.height / 2.0,
+            CGRect(x: pet.minX - gap - size.width, y: pet.minY + gap,
                    width: size.width, height: size.height),
             CGRect(x: pet.midX - size.width / 2.0, y: pet.maxY + gap,
                    width: size.width, height: size.height),
