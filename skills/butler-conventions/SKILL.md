@@ -165,11 +165,24 @@ one and it must not outlive the work it was spawned for.
   user reads as "not next to my pet". The sprite size travels in the claim op
   (`sprite_w` / `sprite_h` / `pad_bottom`) because the chip's companion is
   spawned petless and cannot know it.
-- The claim chip is a 26x24 hat badge (`🎩`) at the sprite's TOP-RIGHT: the first
-  placement candidate is `x = pet.maxX - 0.3*width`, `y = pet.minY - gap - height`,
-  so it reads as perched on the pet's head. A borderless `NSWindow` cannot become
-  key by default and then never routes clicks into its content view, so the chip
-  is built from `ClaimChipWindow` (overrides `canBecomeKey` true,
+- The chip's placement is EVENT-DRIVEN: the companion holds an `AXObserver` on
+  the Hermes app (window lifecycle) and on each of its window elements
+  (`AXWindowMoved` / `AXWindowResized` / `AXUIElementDestroyed`), reads the frame
+  straight off the notified element, and coalesces to one placement per 40 ms.
+  A 3.0 s tick reconciles what notifications miss (pop-out created while
+  unobserved, display change, wake); the 0.5 s poll survives only as the
+  fallback when `AXObserverCreate` fails. Measured: 86 move events in one pet
+  drag, ~17 ms apart — never re-enumerate `CGWindowList` on that hot path.
+- Hiding the chip must NOT stop the observer: the slow tick hides it whenever
+  the pop-out is closed or on another Space, so tying observer lifetime to chip
+  visibility rebuilds the observer every few seconds. Stop it only on disarm and
+  shutdown.
+- The claim chip is a 26x24 hat badge (`🎩`) in the sprite's upper-right: the first
+  placement candidate is `x = pet.maxX + gap`, `y = pet.minY + gap`, i.e. beside
+  the head, deliberately NOT above it — the strip above the sprite is where the
+  pet's own speech bubble ("tinkering…") renders. A borderless `NSWindow` cannot
+  become key by default and then never routes clicks into its content view, so the
+  chip is built from `ClaimChipWindow` (overrides `canBecomeKey` true,
   `canBecomeMain` false) and its view overrides `acceptsFirstResponder`.
 - Never verify the chip's click by writing a `summon_pending` row into
   `state.json` yourself: `summon_ack` clears the ENGINE's in-memory pending only
