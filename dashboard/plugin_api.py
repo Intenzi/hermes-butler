@@ -140,14 +140,18 @@ def _plugin_context():
     return None
 
 
-def _summon_frame(text: str) -> str:
-    """The shared summon frame (imported from the plugin body, not copied)."""
+def _summon_frame(text: str, origin: str = "") -> str:
+    """The shared frame for this row (imported from the plugin body, not copied).
+
+    A LOOK row gets the frame that also asks the agent for ``butler_say``; every
+    other row keeps the plain summon frame.
+    """
     root = Path(__file__).resolve().parents[1]
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    from butler_core.summon import frame_summon_text
+    from butler_core.summon import frame_for
 
-    return frame_summon_text(text)
+    return frame_for(text, origin)
 
 
 def _load_overlay_module():
@@ -420,6 +424,32 @@ def _spool_ack(pending_id: str) -> bool:
         return False
 
 
+def _say_path() -> Path:
+    """The agent's short on-screen answer (butler_say), beside the spool."""
+    return bp_paths.plugin_data_dir("butler") / "say.json"
+
+
+def _read_say() -> dict[str, Any] | None:
+    """The last answer the agent asked the pet to speak, read fresh each call.
+
+    A separate file on purpose: the engine owns the write from whichever process
+    ran the tool, and a state.json write from the guide half can never drop it.
+    """
+    try:
+        row = json.loads(_say_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(row, dict):
+        return None
+    say_id = row.get("id")
+    text = row.get("text")
+    if not isinstance(say_id, str) or not say_id.strip():
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return {"id": say_id.strip(), "text": text, "at": row.get("at")}
+
+
 def _read_state() -> dict[str, Any]:
     data: dict[str, Any] = {}
     for path in _state_candidates():
@@ -440,6 +470,11 @@ def _read_state() -> dict[str, Any]:
         spooled = _spool_pending()
         if spooled is not None:
             data["summon_pending"] = spooled
+    # The agent's on-screen answer rides the same snapshot. The desktop speaks
+    # it once per id, then the guide status line resumes.
+    said = _read_say()
+    if said is not None:
+        data["say"] = said
     return data
 
 
@@ -587,8 +622,10 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
     """
     text = body.get("text") if isinstance(body, dict) else None
     session_id = body.get("session_id") if isinstance(body, dict) else None
+    origin = body.get("origin") if isinstance(body, dict) else None
     text = text.strip() if isinstance(text, str) else ""
     session_id = session_id.strip() if isinstance(session_id, str) else ""
+    origin = origin.strip().lower() if isinstance(origin, str) else ""
     if not text or not session_id:
         raise HTTPException(status_code=400, detail="text and session_id are required")
 
@@ -599,8 +636,11 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
     route, detail = _resolve_session_route(ctx, session_id)
     if route is None:
         return {"ok": False, "reason": "unroutable_session", "detail": detail}
+    # A LOOK row came from the ⌘⇧L door: its turn also asks for butler_say, so
+    # the short answer lands beside the pointer instead of only in the chat.
+    frame = _summon_frame(text, origin)
     try:
-        accepted = bool(inject(_summon_frame(text), role="user", session_key=route))
+        accepted = bool(inject(frame, role="user", session_key=route))
     except Exception:
         logger.exception("butler summon injection failed")
         accepted = False

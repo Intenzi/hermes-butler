@@ -1,7 +1,7 @@
 """Butler — Hermes plugin.
 
 Tools: butler_guide_start, butler_guide_status, butler_capture, butler_look,
-butler_stop.
+butler_say, butler_stop.
 Slash command: /butler <request> — inject the request into this chat as a real
 agent turn that plans and starts a guide.
 CLI: hermes butler capture|status|doctor.
@@ -87,6 +87,17 @@ LOOK_SCHEMA = {
     "required": ["target"],
 }
 
+SAY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "text": {
+            "type": "string",
+            "description": "One or two sentences to show beside the user's pointer (max 280 chars).",
+        },
+    },
+    "required": ["text"],
+}
+
 STOP_SCHEMA = {
     "type": "object",
     "properties": {"reason": {"type": "string", "description": "Why the guide ended."}},
@@ -154,6 +165,20 @@ def tool_look(args, **kwargs):
         return _out(result)
     except Exception as exc:  # noqa: BLE001
         logger.exception("butler_look failed")
+        return _out({"error": str(exc)})
+
+
+def tool_say(args, **kwargs):
+    """Show the agent's short answer on the pet itself, beside the pointer.
+
+    Writes a local file only, so unattended runs are fine: nothing is read from
+    the screen and no host state is touched. A failed write still returns a
+    payload (never raises); the chat answer remains the primary one.
+    """
+    try:
+        return _out(bp_engine.say(args.get("text") or ""))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("butler_say failed")
         return _out({"error": str(exc)})
 
 
@@ -263,6 +288,8 @@ def register(ctx):
                       handler=tool_capture, description="Element list (roles, labels, boxes) of a focused or named app's screen.", emoji="👁")
     ctx.register_tool(name="butler_look", toolset="butler", schema=LOOK_SCHEMA,
                       handler=tool_look, description="Fresh element list of the app a LOOK question named, so the agent can answer about the control under the cursor.", emoji="👁")
+    ctx.register_tool(name="butler_say", toolset="butler", schema=SAY_SCHEMA,
+                      handler=tool_say, description="Show a one-or-two-sentence answer beside the user's pointer, on the pet itself.", emoji="💬")
     ctx.register_tool(name="butler_stop", toolset="butler", schema=STOP_SCHEMA,
                       handler=tool_stop, description="End the active butler guide.", emoji="🎩")
     ctx.register_command(
@@ -297,4 +324,4 @@ def register(ctx):
                            description="Butler plugin dev conventions: flat step keys, restart batching, verify-dsh-rule, checklist shape, TCC scope, card etiquette. Load for any butler board or code work.")
     except Exception:
         logger.exception("butler:conventions skill registration failed")
-    logger.info("Butler plugin registered: 5 tools, /butler (injected turn), CLI 'butler', 2 skills")
+    logger.info("Butler plugin registered: 6 tools, /butler (injected turn), CLI 'butler', 2 skills")

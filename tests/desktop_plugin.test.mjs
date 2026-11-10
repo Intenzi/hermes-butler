@@ -24,7 +24,8 @@ const INTERNALS = [
   'readSummonDestination', 'setSummonDestination', 'getSummonDestination', 'butlerCommandText',
   'openFreshButlerSession', 'openButlerSession', 'createButlerSession', 'listButlerSessions',
   'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey', 'dismissSummonBar',
-  'startSummonPendingPolling', 'pollSummonPending'
+  'startSummonPendingPolling', 'pollSummonPending',
+  'petSpeechBeat', 'speakButlerAnswer'
 ]
 
 function makeDocument({
@@ -81,7 +82,7 @@ function makeStorage(initial = {}) {
   }
 }
 
-async function loadPlugin({ host, rest, document, storage }) {
+async function loadPlugin({ host, rest, document, storage, pet = {} }) {
   const contributions = []
   const disposers = []
   const intervals = []
@@ -160,7 +161,7 @@ async function loadPlugin({ host, rest, document, storage }) {
   const plugin = module.namespace.default
   const ctx = {
     rest,
-    pet: {},
+    pet,
     registerMany(items) { contributions.push(...items) },
     onDispose(fn) { disposers.push(fn) },
     setInterval(fn, ms) { intervals.push({ fn, ms }); return () => {} }
@@ -1329,6 +1330,8 @@ test('a text pending row sends to the newest Butler chat and never opens the bar
     assert.equal(sends[0].opts.method, 'POST')
     assert.equal(sends[0].opts.body.text, 'turn off wifi')
     assert.equal(sends[0].opts.body.session_id, 'new-chat')
+    assert.equal('origin' in sends[0].opts.body, false,
+      'plain ask-field rows keep sending without an origin')
     const acks = calls.filter(call => call.path === '/summon/ack')
     assert.deepEqual(acks.map(call => call.opts.body.id), ['pending-text'])
     assert.equal(events.at(-1).open, false, 'a text row never opens the bar')
@@ -1389,6 +1392,8 @@ test('a look row frames the control and the question, never opens the bar', asyn
   assert.equal(sends.length, 1)
   const injected = sends[0].opts.body.text
   assert.equal(sends[0].opts.body.session_id, 'butler-chat')
+  assert.equal(sends[0].opts.body.origin, 'look',
+    'the route needs the LOOK origin to pick the butler_say frame')
   assert.match(injected, /^\[butler look\] /)
   assert.ok(injected.includes('App: Preview'), 'the app is named')
   assert.ok(injected.includes('Window: receipt.pdf'), 'the window is named')
@@ -1989,5 +1994,86 @@ test('a success-shaped session.list with no rows is not an empty inventory', asy
   assert.equal(listCalls, 1)
   assert.deepEqual(sends, [{ text: 'keep the guide open', session_id: 'tracked-only' }])
   assert.deepEqual(trackedIds(storage), ['tracked-only'], 'an unusable response prunes nothing')
+  env.dispose()
+})
+
+// --- butler_say: the answer arrives on the pet, not only in the chat ---
+
+test('a new say.id is spoken once with the answer ttl; the same id is silent', async () => {
+  const said = []
+  const pet = { say(text, options) { said.push({ text, options }) } }
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument(), pet
+  })
+  const answer = { id: 'abcd1234', text: 'It exports the page as a PDF.', at: 1 }
+
+  assert.equal(env.api.petSpeechBeat({ say: answer }, 1000), 'answer')
+  assert.equal(said.length, 1)
+  assert.equal(said[0].text, 'It exports the page as a PDF.')
+  assert.equal(said[0].options.tone, 'info')
+  assert.equal(said[0].options.ttlMs, 15000)
+  assert.equal(said[0].options.id, 'butler-answer')
+
+  // The same id twice says it once, and holds the channel for its ttl.
+  assert.equal(env.api.petSpeechBeat({ say: answer }, 3000), 'holding')
+  assert.equal(env.api.petSpeechBeat({ say: answer }, 15000), 'holding')
+  assert.equal(said.length, 1)
+
+  // A new id (a second answer) speaks again.
+  assert.equal(env.api.petSpeechBeat(
+    { say: { id: 'ffff9999', text: 'The second answer.' } }, 17000), 'answer')
+  assert.equal(said.length, 2)
+  assert.equal(said[1].text, 'The second answer.')
+  assert.equal(said[1].options.ttlMs, 15000)
+  env.dispose()
+})
+
+test('an answer wins the pet channel for its ttl, then the status line resumes', async () => {
+  const said = []
+  const pet = { say(text, options) { said.push({ text, options }) } }
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument(), pet
+  })
+  const cur = {
+    status: 'running',
+    note: null,
+    instruction: 'Click Keyboard',
+    currentStep: 0,
+    total: 3,
+    verified: 0,
+    say: { id: 'abcd1234', text: 'This opens the keyboard settings.' }
+  }
+
+  assert.equal(env.api.petSpeechBeat(cur, 1000), 'answer')
+  assert.deepEqual(said.map(row => row.text), ['This opens the keyboard settings.'])
+
+  // Within the ttl the status line yields instead of overwriting the answer.
+  assert.equal(env.api.petSpeechBeat(cur, 5000), 'holding')
+  assert.deepEqual(said.map(row => row.text), ['This opens the keyboard settings.'])
+
+  // After the ttl the guide instruction resumes on the same channel.
+  assert.equal(env.api.petSpeechBeat(cur, 16001), 'status')
+  assert.equal(said.at(-1).text, 'Click Keyboard')
+  assert.equal(said.at(-1).options.id, 'butler-say')
+  assert.equal(said.at(-1).options.ttlMs, 9000)
+
+  // ...and does not repeat itself on the next beat.
+  assert.equal(env.api.petSpeechBeat(cur, 18001), 'repeat')
+  assert.equal(said.length, 2)
+  env.dispose()
+})
+
+test('a say row without an id or text never speaks', async () => {
+  const said = []
+  const pet = { say(text, options) { said.push({ text, options }) } }
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument(), pet
+  })
+
+  assert.equal(env.api.petSpeechBeat({ say: { id: '', text: 'orphan' } }, 1000), 'idle')
+  assert.equal(env.api.petSpeechBeat({ say: { id: 'abcd1234', text: '   ' } }, 1000), 'idle')
+  assert.equal(env.api.petSpeechBeat({}, 1000), 'idle')
+  assert.equal(env.api.petSpeechBeat({ say: null }, 1000), 'idle')
+  assert.equal(said.length, 0)
   env.dispose()
 })

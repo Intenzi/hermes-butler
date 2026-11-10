@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 
 from dashboard import plugin_api  # noqa: E402  (import after sys.path setup)
 from butler_core import engine, paths as bp_paths  # noqa: E402
-from butler_core.summon import frame_summon_text  # noqa: E402
+from butler_core.summon import frame_look_text, frame_summon_text  # noqa: E402
 
 router = plugin_api.router
 
@@ -650,3 +650,123 @@ def test_a_look_spool_row_keeps_its_origin_and_target(
     inferred = client.get("/state").json()["summon_pending"]
     assert inferred["origin"] == "look"
     assert inferred["target"] == target
+
+
+LOOK_ROW_TEXT = (
+    '[butler look] App: Preview · Window: receipt.pdf · '
+    'Control: Button "Export"\nQuestion: what does this export?'
+)
+
+
+def test_summon_send_frames_a_look_row_with_the_butler_say_instruction(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A LOOK turn must ask for the on-screen answer, not just the chat one."""
+    ctx = FakePluginCtx()
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={
+        "text": LOOK_ROW_TEXT,
+        "session_id": "ses_123",
+        "origin": "look",
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "session": "ses_123", "session_key": "ses_123"}
+    injected = ctx.injected[0]["text"]
+    assert injected == frame_look_text(LOOK_ROW_TEXT)
+    # One header, one question line, then the answer instruction.
+    assert injected.startswith(
+        '[butler look] App: Preview · Window: receipt.pdf · '
+        'Control: Button "Export"\nQuestion: what does this export?\n\n'
+    )
+    assert injected.count("[butler look]") == 1
+    assert "butler_say" in injected
+    assert "at most two sentences" in injected
+    assert "beside their pointer" in injected
+    assert not injected.startswith("[butler summon]")
+
+
+def test_summon_send_keeps_the_summon_frame_without_the_look_origin(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plain ask-field rows keep the exact summon frame they had before."""
+    ctx = FakePluginCtx()
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={
+        "text": "turn off wifi",
+        "session_id": "ses_123",
+        "origin": "chip",
+    })
+
+    assert response.json()["ok"] is True
+    assert ctx.injected == [{
+        "text": frame_summon_text("turn off wifi"),
+        "role": "user",
+        "session_key": "ses_123",
+    }]
+    assert "butler_say" not in ctx.injected[0]["text"]
+
+
+def test_summon_send_frames_a_bare_look_question_with_a_fallback_context(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = FakePluginCtx()
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    client.post("/summon/send", json={
+        "text": "what is this control?",
+        "session_id": "ses_123",
+        "origin": "look",
+    })
+
+    injected = ctx.injected[0]["text"]
+    assert injected.startswith(
+        "[butler look] the control under the user's pointer\n"
+        "Question: what is this control?\n\n"
+    )
+
+
+def test_state_exposes_the_agents_on_screen_answer(
+        client: TestClient, tmp_path: Path) -> None:
+    """say.json is its own file, merged fresh into /state beside the guide."""
+    say = {"id": "abcd1234", "text": "It exports the page as a PDF.", "at": 123.5}
+    path = tmp_path / "plugin-data" / "butler" / "say.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(say), encoding="utf-8")
+
+    body = client.get("/state").json()
+
+    assert body["say"] == say
+
+
+def test_state_omits_say_without_a_usable_row(client: TestClient, tmp_path: Path) -> None:
+    assert "say" not in client.get("/state").json()
+
+    path = tmp_path / "plugin-data" / "butler" / "say.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    assert "say" not in client.get("/state").json()
+
+    # A row without an id or text can never be spoken once: keep it out.
+    path.write_text(json.dumps({"id": "", "text": "orphan"}), encoding="utf-8")
+    assert "say" not in client.get("/state").json()
+    path.write_text(json.dumps({"id": "abcd1234", "text": "   "}), encoding="utf-8")
+    assert "say" not in client.get("/state").json()
+
+
+def test_the_answer_tool_and_state_share_one_say_file(
+        client: TestClient) -> None:
+    """engine.say writes where /state reads, even between two processes' paths."""
+    engine.init(bp_paths.plugin_data_dir("butler"))
+
+    payload = engine.say("It exports the page as a PDF.")
+    assert payload["ok"] is True
+
+    state = client.get("/state").json()
+    assert state["say"]["text"] == "It exports the page as a PDF."
+    stored = json.loads((bp_paths.plugin_data_dir("butler") / "say.json")
+                        .read_text(encoding="utf-8"))
+    assert state["say"]["id"] == stored["id"]
+
+    # A second answer replaces the row and /state sees it without a restart.
+    engine.say("The second answer.")
+    assert client.get("/state").json()["say"]["text"] == "The second answer."

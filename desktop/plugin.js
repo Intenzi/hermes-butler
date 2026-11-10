@@ -74,6 +74,11 @@ const SUMMON_NEW = 'new'
 let rest = null
 let petCtx = null
 let lastSaid = null
+// The say.json id the pet last spoke, and when the answer's ttl runs out. The
+// answer and the guide status line share one channel: a new id speaks over it,
+// the status line stays quiet for the ttl, then resumes on its own.
+let lastSpokenSayId = null
+let answerUntil = 0
 let launcherBusy = false
 let launcherTargetId = null
 // Runtime/stored aliases learned from session.list or an open-session result.
@@ -1145,7 +1150,7 @@ function notifyLookAnswered() {
   }
 }
 
-async function sendPendingSummonText(text, destination = 'recent') {
+async function sendPendingSummonText(text, destination = 'recent', options = {}) {
   const target = await resolveChipSendTarget(destination)
   if (!target) {
     // "new" was asked for: never report a send that did not happen.
@@ -1154,10 +1159,15 @@ async function sendPendingSummonText(text, destination = 'recent') {
       reason: destination === 'new' ? 'session_create_failed' : 'no_session'
     }
   }
+  const body = { text, session_id: target }
+  // Only the LOOK door stamps an origin: the route then frames the turn with
+  // the "answer on the pet" instruction. Plain ask-field rows stay unchanged.
+  const origin = asText(options && options.origin)
+  if (origin) body.origin = origin
   try {
     const response = await rest('/summon/send', {
       method: 'POST',
-      body: { text, session_id: target }
+      body
     })
     if (response && response.ok === true) {
       // A successful send proves the chat is in use: it is now the newest
@@ -1230,7 +1240,7 @@ function pollSummonPending() {
       const outgoing = isLook ? lookPendingText(pending) : text
       // Send in place. A failed send still acks: the text was typed once, and
       // retrying silently is worse than telling the user exactly why it failed.
-      return sendPendingSummonText(outgoing, destination)
+      return sendPendingSummonText(outgoing, destination, isLook ? { origin: 'look' } : {})
         .then(result => {
           if (result && result.ok) {
             if (isLook) {
@@ -1985,6 +1995,64 @@ function petStatusLine(cur) {
   return instruction
 }
 
+/**
+ * Speak the agent's short answer on the pet exactly once per id.
+ *
+ * /state merges say.json as `say`; the desktop speaks it with the answer ttl and
+ * remembers the id. Returns true only when this call actually spoke, so the
+ * guide status line can yield the one shared channel for the answer's ttl.
+ */
+function speakButlerAnswer(say) {
+  const row = say && typeof say === 'object' ? say : {}
+  const id = asText(row.id)
+  const text = asText(row.text)
+  if (!id || !text) return false
+  if (id === lastSpokenSayId) return false
+  try {
+    if (!petCtx || typeof petCtx.say !== 'function') return false
+    petCtx.say(text, { tone: 'info', ttlMs: 15000, id: 'butler-answer' })
+  } catch (err) {
+    return false
+  }
+  petSayTicks += 1
+  petLastTick = new Date().toLocaleTimeString()
+  lastSpokenSayId = id
+  return true
+}
+
+/**
+ * One pet-speech beat on the 2 s clock. Returns which line won: `answer`,
+ * `holding` (the answer is still within its ttl), `status`, `repeat`, or `idle`.
+ *
+ * A spoken answer resets `lastSaid`, so the status line speaks again (instead of
+ * being deduped away) once the answer's ttl lapses. One channel, last call wins,
+ * no queueing.
+ */
+function petSpeechBeat(cur, now = Date.now()) {
+  if (speakButlerAnswer(cur && cur.say)) {
+    lastSaid = null
+    // The answer owns the channel for 15 s; then the status line resumes.
+    answerUntil = now + 15000
+    return 'answer'
+  }
+  if (now < answerUntil) return 'holding'
+  const line = petStatusLine(cur)
+  if (!line) {
+    try { petCtx && petCtx.clear && petCtx.clear('butler-say') } catch (err) { }
+    lastSaid = null
+    return 'idle'
+  }
+  if (lastSaid === line) return 'repeat'
+  try {
+    petCtx && typeof petCtx.say === 'function'
+      && petCtx.say(line, { tone: 'info', ttlMs: 9000, id: 'butler-say' })
+  } catch (err) { }
+  petSayTicks += 1
+  petLastTick = new Date().toLocaleTimeString()
+  lastSaid = line
+  return 'status'
+}
+
 function ButlerApp() {
   const query = useQuery({
     queryKey: ['butler', 'state'],
@@ -2016,37 +2084,29 @@ function ButlerApp() {
   const session = asText(guide && guide.session_id)
   const currentLabel = asText(guide && guide.current_label)
   const sayLine = asText(step && step.say) || asText(state.say)
+  // The agent's on-screen answer (butler_say) arrives as a top-level `say` row.
+  const rawAnswer = data && data.say
+  const answer = rawAnswer && typeof rawAnswer === 'object' && Object.keys(rawAnswer).length > 0
+    ? rawAnswer
+    : null
 
   // Pet speech is evaluated on its own 2 s clock so a stale React feed cannot
-  // pin the last line on screen. Running guides stay silent.
-  const stateRef = useRef({ status: null, note: null, instruction: null, currentStep: 0, total: 0, verified: 0 })
+  // pin the last line on screen. `say` is the agent's on-screen answer; the
+  // beat speaks it once, ahead of the guide status line, for its ttl.
+  const stateRef = useRef({ status: null, note: null, instruction: null, currentStep: 0, total: 0, verified: 0, say: null })
   stateRef.current = {
     status,
     note: asText(state.note),
     instruction: sayLine,
     currentStep,
     total: steps.length,
-    verified: verifications.length
+    verified: verifications.length,
+    say: answer
   }
   useEffect(() => {
-    const beat = () => {
-      const line = petStatusLine(stateRef.current)
-      if (!line) {
-        try { petCtx && petCtx.clear && petCtx.clear('butler-say') } catch (err) { }
-        lastSaid = null
-        return
-      }
-      if (lastSaid === line) return
-      try {
-        petCtx && typeof petCtx.say === 'function'
-          && petCtx.say(line, { tone: 'info', ttlMs: 9000, id: 'butler-say' })
-      } catch (err) { }
-      petSayTicks += 1
-      petLastTick = new Date().toLocaleTimeString()
-      lastSaid = line
-    }
+    const beat = () => { petSpeechBeat(stateRef.current) }
     beat()
-    const id = window.setInterval(beat, 2000)
+    const id = window.setInterval(beat, PET_STATUS_REFRESH_MS)
     return () => window.clearInterval(id)
   }, [])
 

@@ -3,10 +3,11 @@
 State lives under the plugin data dir:
   guides/<id>.json   one session
   state.json         snapshot for the desktop surface / plugin_api
+  say.json           the agent's short on-screen answer (butler_say)
 
 Fail-closed: unattended runs are rejected at the tool layer (kwargs has no
-approval context), always. This module only mutates session files; the poll
-thread refreshes them from live captures.
+approval context), always. This module only writes its own data files (sessions,
+``say.json``); the poll thread refreshes them from live captures.
 """
 import json
 import os
@@ -24,6 +25,9 @@ DEFAULT_POLL = 1.5
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_PET_CLICK_CLAIM = True
 ERROR_STREAK_NOTE = 3  # consecutive poll errors before the note surfaces
+#: The pet bubble is one or two sentences; longer text belongs in the chat.
+SAY_MAX_CHARS = 280
+SAY_ELLIPSIS = "…"
 
 # Electron/Chromium apps render their chrome as deeply nested divs. At depth 12
 # a walk sees only the container groups of an overlay/page (settings nav rows,
@@ -337,6 +341,58 @@ def consume_summon_pending(pending_id=None):
     # just consumed.
     _write_state(clear_summon=True)
     return True
+
+
+def _clip_say_text(text, limit=SAY_MAX_CHARS):
+    """Trim an answer to the bubble cap, cutting on a word boundary.
+
+    The stored text fits ``limit`` INCLUDING the ellipsis. A single unbroken
+    token (a URL, a hash) has no boundary to cut on, so it keeps the hard cut
+    rather than being dropped.
+    """
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = text[: max(0, limit - 1)]
+    cut = max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"), head.rfind("\r"))
+    if cut > 0:
+        head = head[:cut]
+    return head.rstrip() + SAY_ELLIPSIS
+
+
+def say(text):
+    """Publish a short answer for the pet to speak once, beside the pointer.
+
+    The agent calls this after a LOOK question: the short answer belongs on
+    screen, the full explanation stays in the chat. The row is written to
+    ``say.json`` atomically (id/text/at); ``/state`` merges it on every read.
+    Never raises — a lost bubble must not fail the agent's turn.
+    """
+    try:
+        shown = _clip_say_text(text)
+        if not shown:
+            return {"ok": False, "error": "text is required"}
+        if not DATA_DIR:
+            return {"ok": False, "error": "butler engine: init() not called"}
+        row = {"id": uuid.uuid4().hex[:8], "text": shown, "at": time.time()}
+        path = os.path.join(str(DATA_DIR), "say.json")
+        # A unique temp name: two processes (two sessions, a CLI call) may write
+        # the answer at the same moment. A shared "say.json.tmp" could interleave
+        # two small writes and publish unparsable JSON while both report ok.
+        tmp = "%s.%s.tmp" % (path, uuid.uuid4().hex[:8])
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(row, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        return {"ok": True, "shown": shown}
+    except Exception as exc:  # noqa: BLE001 - the chat answer is primary
+        return {"ok": False, "error": str(exc)}
 
 
 def set_claim_chip(enabled):
