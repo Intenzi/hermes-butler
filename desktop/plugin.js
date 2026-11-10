@@ -2057,6 +2057,60 @@ function speakButlerAnswer(say) {
  * being deduped away) once the answer's ttl lapses. One channel, last call wins,
  * no queueing.
  */
+/**
+ * The slice of /state the pet speech beat needs, built the same way the pane
+ * builds it so the two speakers cannot drift.
+ */
+function speechSnapshot(data) {
+  const rawGuide = data && data.guide
+  const guide = rawGuide && typeof rawGuide === 'object' && Object.keys(rawGuide).length > 0 ? rawGuide : null
+  const state = guide && guide.state && typeof guide.state === 'object' ? guide.state : {}
+  const steps = asArray(guide && guide.steps)
+  const verifications = asArray(guide && guide.verifications)
+  const rawIdx = Number(state.idx)
+  const idx = Number.isInteger(rawIdx) && rawIdx >= 0 ? rawIdx : 0
+  const currentStep = steps.length > 0 ? Math.min(idx, steps.length - 1) : 0
+  const rawAnswer = data && data.say
+  const rawWatch = data && data.watch
+  return {
+    status: asText(state.status) || asText(guide && guide.status) || 'running',
+    note: asText(state.note),
+    instruction: asText(steps[currentStep] && steps[currentStep].say) || asText(state.say),
+    currentStep,
+    total: steps.length,
+    verified: verifications.length,
+    say: rawAnswer && typeof rawAnswer === 'object' && Object.keys(rawAnswer).length > 0 ? rawAnswer : null,
+    watch: rawWatch && typeof rawWatch === 'object' && Object.keys(rawWatch).length > 0 ? rawWatch : null
+  }
+}
+
+/**
+ * Speak on the pet from module scope, NOT from the pane.
+ *
+ * The beat used to live in ButlerApp's effect, so the pet only spoke while the
+ * butler pane was open — and `butler_say` answers written with the pane closed
+ * (a watch hit, a LOOK answer) were never spoken at all. Same failure class as
+ * the summon-pending hook: a consumer inside a component that may not be
+ * mounted. Dedupe ids are module-scope, so the pane's own beat and this one
+ * cannot double-speak the same line.
+ */
+let petSpeechTimer = null
+function startPetSpeechPolling(ctx) {
+  if (petSpeechTimer !== null) return
+  const tick = () => {
+    try {
+      const pending = typeof rest === 'function' ? rest('/state') : Promise.resolve({})
+      pending.then(data => { petSpeechBeat(speechSnapshot(data)) }).catch(() => { })
+    } catch (err) { }
+  }
+  tick()
+  try {
+    petSpeechTimer = ctx && typeof ctx.setInterval === 'function'
+      ? ctx.setInterval(tick, PET_STATUS_REFRESH_MS)
+      : window.setInterval(tick, PET_STATUS_REFRESH_MS)
+  } catch (err) { petSpeechTimer = null }
+}
+
 function petSpeechBeat(cur, now = Date.now()) {
   if (speakButlerAnswer(cur && cur.say)) {
     lastSaid = null
@@ -2145,6 +2199,7 @@ function ButlerApp() {
     const id = window.setInterval(beat, PET_STATUS_REFRESH_MS)
     return () => window.clearInterval(id)
   }, [])
+  void speechSnapshot
 
   const stallNote = asText(state.note) || (stalled
     ? `Step ${currentStep + 1} is still unverified. The butler is waiting on the OS layer; ask the agent to revise or skip this step.`
@@ -2342,5 +2397,6 @@ export default {
     try { syncPetClickClaim() } catch (err) { }
     startClaimConfigPolling(ctx)
     startSummonPendingPolling(ctx)
+    startPetSpeechPolling(ctx)
   }
 }

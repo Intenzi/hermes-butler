@@ -2103,3 +2103,12 @@ test('a say row without an id or text never speaks', async () => {
   assert.equal(said.length, 0)
   env.dispose()
 })
+
+test('pet speech runs from module scope, not only while the pane is open', () => {
+  const src = readFileSync(PLUGIN_JS, 'utf8')
+  assert.match(src, /function startPetSpeechPolling\(ctx\)/)
+  assert.match(src, /startPetSpeechPolling\(ctx\)/, 'activate() must start it')
+  assert.match(src, /function speechSnapshot\(data\)/)
+  // The poller must speak the answer row, not just the guide status line.
+  assert.match(src, /petSpeechBeat\(speechSnapshot\(data\)\)/)
+})
