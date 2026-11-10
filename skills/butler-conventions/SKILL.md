@@ -269,6 +269,15 @@ sentences, call `butler_say` with that same sentence, and keep the full
 explanation for the chat. The bubble is one line — detail belongs in chat — and
 without an `at`-freshness gate a desktop reload re-speaks the last answer.
 
+**The speech beat must live at module scope.** It began inside `ButlerApp`'s
+`useEffect`, so the pet only spoke while the butler pane was open and every
+`butler_say` answer written with the pane closed (watch hit, LOOK answer) was
+silent. `startPetSpeechPolling(ctx)` is started from `activate()` beside
+`startSummonPendingPolling`; both share module-scope dedupe ids, so the pane's
+own beat cannot double-speak. Same failure class as the summon-pending hook —
+when a pet line never appears, check WHO is supposed to call the beat and
+whether that component is mounted at all.
+
 ### Hermes already ships a HUD — pitch accordingly
 
 `⌘⇧H` detaches the chat into an always-on-top bar whose *position* is the
