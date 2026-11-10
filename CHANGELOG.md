@@ -8,7 +8,7 @@ All notable changes to this plugin are documented here. The format follows
 
 ### Added
 
-- LOOK door: ⌘⇧L hit-tests the element under the cursor through the
+- LOOK door: ⌘⇧A hit-tests the element under the cursor through the
   system-wide Accessibility API and opens the ask field with that control as
   context (`Button · "Export" — Preview`). Submitting sends the question plus
   the app/role/label/window/box to the Butler chat without planning a guide.
@@ -19,6 +19,8 @@ All notable changes to this plugin are documented here. The format follows
 
 ### Added
 
+- Look: drag the hat onto any control to read its role, label, app and window in
+  place, with no chat and no typing.
 - Summon door: a ⌘⇧A floating bar and a 26x24 hat badge on the popped-out pet.
   Both open the same "Ask the butler" bar and destination picker.
 - The hat badge is always on once the plugin is installed; there is no separate
