@@ -1042,7 +1042,8 @@ def test_summon_field_is_a_local_in_place_text_entry() -> None:
     opened = _swift_function_body(source, "private func openSummonField()",
                                   "private func closeSummonField(")
     assert ".borderless" in opened
-    assert ".statusBar" in opened
+    assert "NSWindow.Level.screenSaver.rawValue + 1" in opened, (
+        "the field must outrank INSPECT MODE overlays or keystrokes leak to the app below")
     assert "canJoinAllSpaces" in opened
     assert "isMovable = false" in opened
     assert "NSApp.activate(ignoringOtherApps: true)" in opened
@@ -1816,3 +1817,18 @@ def test_right_click_arms_inspect_mode_and_option_right_click_is_the_menu() -> N
                 '"What did the watch see?"', '"Stop watching"'):
         assert row in menu, f"the Option menu keeps {row}"
     assert "self?.armInspectMode()" in menu
+
+
+def test_ask_field_sits_above_inspect_overlays_and_asserts_focus() -> None:
+    """Measured: Return typed into the butler field also fired in the app behind.
+
+    Two causes are covered here: the field was at `.statusBar` while INSPECT
+    MODE's overlays sit at `.screenSaver` (a leftover overlay hid the field, so
+    keystrokes went to the app underneath), and a refused activation was silent.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert "NSWindow.Level.screenSaver.rawValue + 1" in source, \
+        "the ask field must outrank the inspect overlays"
+    assert "ask-focus active=" in source, "focus is asserted, not assumed"
+    assert "NSRunningApplication.current.activate(options:" in source

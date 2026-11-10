@@ -681,7 +681,7 @@ def test_summon_send_frames_a_look_row_with_the_butler_say_instruction(
     )
     assert injected.count("[butler look]") == 1
     assert "butler_say" in injected
-    assert "at most two sentences" in injected
+    assert "at most 90 characters" in injected
     assert "beside their pointer" in injected
     assert not injected.startswith("[butler summon]")
 

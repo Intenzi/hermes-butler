@@ -119,14 +119,14 @@ def test_each_answer_mints_a_new_id_so_the_pet_speaks_again(tmp_path: Path) -> N
     assert list(tmp_path.glob("say.json*")) == [tmp_path / "say.json"]
 
 
-def test_butler_say_truncates_at_280_chars_on_a_word_boundary(tmp_path: Path) -> None:
+def test_butler_say_truncates_inside_the_pet_bubble_cap(tmp_path: Path) -> None:
     ctx = _registered(tmp_path)
     long_text = "alpha " * 100  # 600 characters, every boundary is a word gap
 
     payload = _call(ctx, {"text": long_text})
 
     shown = payload["shown"]
-    assert len(shown) <= engine.SAY_MAX_CHARS == 280
+    assert len(shown) <= engine.SAY_MAX_CHARS == 110
     assert shown.endswith("…")
     # The cut lands between words: no half "alph" before the ellipsis.
     assert shown[:-1].endswith("alpha")
@@ -139,9 +139,9 @@ def test_an_unbroken_token_keeps_a_hard_cut_at_the_cap(tmp_path: Path) -> None:
     payload = _call(ctx, {"text": "x" * 400})
 
     shown = payload["shown"]
-    assert len(shown) <= 280
+    assert len(shown) <= engine.SAY_MAX_CHARS
     assert shown.endswith("…")
-    assert shown == "x" * 279 + "…"
+    assert shown == "x" * (engine.SAY_MAX_CHARS - 1) + "…"
 
 
 def test_a_short_answer_is_stored_verbatim(tmp_path: Path) -> None:
@@ -185,3 +185,10 @@ def test_engine_say_never_raises_without_an_init(tmp_path: Path, monkeypatch) ->
 
     assert payload["ok"] is False
     assert "init" in payload["error"]
+
+
+def test_the_say_cap_fits_the_pet_bubble() -> None:
+    """The host truncates every plugin line at PET_MESSAGE_MAX_CHARS (120) with an
+    ellipsis, so a 280-char cap guaranteed a "…" in the bubble."""
+    from butler_core import engine
+    assert engine.SAY_MAX_CHARS <= 110

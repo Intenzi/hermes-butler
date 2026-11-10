@@ -26,8 +26,9 @@ SUMMON_ACK = "Butler request injected — answering in this chat."
 LOOK_FRAMING_TEMPLATE = (
     "[butler look] {context}\nQuestion: {text}\n\n"
     "Answer from the screen: read what you need with butler_capture for the "
-    "app named above if the context is not enough. Then reply in at most two "
-    "sentences AND call butler_say with that same short answer, so the user "
+    "app named above if the context is not enough. Then call butler_say with ONE "
+    "line of at most 90 characters (a dozen words — the pet bubble truncates "
+    "past 120) giving the short answer, so the user "
     "sees it beside their pointer instead of opening the chat. Keep the full "
     "explanation for the chat."
 )

@@ -28,8 +28,10 @@ DEFAULT_POLL = 1.5
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_PET_CLICK_CLAIM = True
 ERROR_STREAK_NOTE = 3  # consecutive poll errors before the note surfaces
-#: The pet bubble is one or two sentences; longer text belongs in the chat.
-SAY_MAX_CHARS = 280
+#: The host truncates every plugin line at PET_MESSAGE_MAX_CHARS = 120, so a
+#: longer answer shows an ellipsis in the bubble. Stay under it with headroom
+#: for the plugin label; the chat carries the full explanation.
+SAY_MAX_CHARS = 110
 SAY_ELLIPSIS = "…"
 
 # Electron/Chromium apps render their chrome as deeply nested divs. At depth 12

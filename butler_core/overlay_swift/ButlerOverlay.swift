@@ -4990,7 +4990,11 @@ private final class OverlayController {
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = true
-        window.level = .statusBar
+        // Above path INSPECT MODE's overlays (.screenSaver): a leftover overlay
+        // would otherwise cover the field, and the user's keystrokes (Return
+        // included) would go to the app underneath — "pressing enter also
+        // triggers enter in the active window".
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         window.collectionBehavior = [.canJoinAllSpaces,
                                      .stationary,
                                      .fullScreenAuxiliary,
@@ -5043,6 +5047,20 @@ private final class OverlayController {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKey()
         window.makeFirstResponder(view.field)
+        // Activation can be refused (macOS 14 refuses a background accessory
+        // stealing focus mid-click). The field still DRAWS, so the user types
+        // into the app underneath — including Return. Check, retry once, and
+        // journal the truth so this is never guessed at again.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self, weak window] in
+            guard let self = self, let window = window, self.summonFieldOpen else { return }
+            if !NSApp.isActive || !window.isKeyWindow {
+                NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps,
+                                                               .activateAllWindows])
+                window.makeKey()
+                window.makeFirstResponder(view.field)
+            }
+            chipJournal("ask-focus active=\(NSApp.isActive ? 1 : 0) key=\(window.isKeyWindow ? 1 : 0)")
+        }
         if let prefill = prefill, !prefill.isEmpty,
            let editor = view.field.currentEditor() {
             // Caret at the END: the prefilled command is editable, not selected.
