@@ -687,8 +687,17 @@ private func axElementList(_ element: AXUIElement, attribute: String) -> [AXUIEl
 ///   3. up to 4 `AXParent` levels for the first labelled ancestor;
 ///   4. `Window · <frontmost app>`, never a bare `Group`.
 private func lookElementDescriptor(at point: CGPoint) -> LookDescriptor {
+    return lookDescriptor(for: axElementUnderCursor(point), at: point)
+}
+
+/// Compose the read-out from an already hit-tested element.
+///
+/// Two doors share this body: the system-wide hit-test (after our own windows
+/// are parked) and the app-scoped hover preview of INSPECT MODE, whose overlay
+/// is topmost everywhere and would otherwise answer every point.
+private func lookDescriptor(for hit: AXUIElement?, at point: CGPoint) -> LookDescriptor {
     let frontmost = axNonEmpty(NSWorkspace.shared.frontmostApplication?.localizedName)
-    guard let hit = axElementUnderCursor(point) else {
+    guard let hit = hit else {
         return LookDescriptor(role: nil, label: nil, app: frontmost,
                               window: nil, doc: nil, enabled: nil, value: nil,
                               box: nil, isWindowFallback: true)
@@ -779,11 +788,17 @@ private func lookElementDescriptor(at point: CGPoint) -> LookDescriptor {
 
 /// True when the hit element belongs to THIS process.
 ///
-/// The hat is a status-level window, so wherever it happens to be, AX hit
-/// testing finds it before anything underneath. Reporting "Window ·
-/// ButlerOverlay" is never a useful answer, so the caller retries with the hat
-/// parked and finally falls back to the active app's window.
+/// The hat is a status-level window and the INSPECT overlay is a screenSaver-
+/// level one, so wherever they happen to be, AX hit testing finds them before
+/// anything underneath. Reporting "Window · ButlerOverlay" is never a useful
+/// answer, so the caller retries with our windows parked and finally falls back
+/// to the active app's window. The pid is the exact test (a descriptor whose AX
+/// pid read failed falls through to the app-name comparison).
 private func lookDescriptorIsSelf(_ descriptor: LookDescriptor) -> Bool {
+    if descriptor.pid != 0,
+       descriptor.pid == ProcessInfo.processInfo.processIdentifier {
+        return true
+    }
     guard let app = descriptor.app else { return false }
     let me = ProcessInfo.processInfo.processName
     let mine = NSRunningApplication.current.localizedName ?? me
@@ -1799,20 +1814,11 @@ private final class ClaimChipView: NSView {
     /// True from the first moved point until mouseUp; the controller then drops
     /// the read-out card at the release point.
     private(set) var lookMode = false
-    /// True while EYE MODE owns this view: the hat is detached from the pet and
-    /// follows the pointer as an eye. A press then asks about the captured
-    /// target — it is never a LOOK drag.
-    var eyeMode = false {
-        didSet {
-            guard eyeMode != oldValue else { return }
-            needsDisplay = true
-        }
-    }
     private var pressStart: NSPoint?
     private var dragging = false
     var onClick: (() -> Void)?
-    /// The hat's second door: a right-click opens the LOOK/watch menu (or, in
-    /// EYE MODE, ends the mode). The point is in this view's coordinates.
+    /// The hat's second door: a right-click arms INSPECT MODE or, with Option,
+    /// opens the LOOK/watch menu. The point is in this view's coordinates.
     var onRightClick: ((NSPoint) -> Void)?
     /// Fires on mouseDown, before a drag exists, so the placement timer stops
     /// the moment the user grabs the hat.
@@ -1919,9 +1925,7 @@ private final class ClaimChipView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        // In EYE MODE a press is a click on the eye, never a LOOK drag: the
-        // follow tick owns the frame, so a wobble must not turn it into one.
-        guard let start = pressStart, !eyeMode else { return }
+        guard let start = pressStart else { return }
         let point = screenPoint(for: event)
         let dx = point.x - start.x
         let dy = point.y - start.y
@@ -1938,8 +1942,8 @@ private final class ClaimChipView: NSView {
         }
     }
 
-    /// Right-click is the menu door (and the second right-click that leaves EYE
-    /// MODE). Acted on mouseDown so the menu tracks immediately.
+    /// Right-click is the menu door. Acted on mouseDown so the menu tracks
+    /// immediately.
     override func rightMouseDown(with event: NSEvent) {
         pressStart = nil
         dragging = false
@@ -1992,11 +1996,9 @@ private final class ClaimChipView: NSView {
         path.lineWidth = 1.0
         path.stroke()
 
-        let glyph = (eyeMode || lookMode) ? ClaimChipView.lookGlyph
-                                          : ClaimChipView.glyph
+        let glyph = lookMode ? ClaimChipView.lookGlyph : ClaimChipView.glyph
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: (eyeMode || lookMode) ? ClaimChipView.lookGlyphFont
-                                         : ClaimChipView.glyphFont,
+            .font: lookMode ? ClaimChipView.lookGlyphFont : ClaimChipView.glyphFont,
             .foregroundColor: NSColor.white
         ]
         let glyphSize = (glyph as NSString).size(withAttributes: attributes)
@@ -2360,43 +2362,78 @@ private final class SummonFieldView: NSView, NSTextFieldDelegate {
     }
 }
 
-// MARK: - EYE MODE (right-click the hat → a pointer-following eye)
+// MARK: - INSPECT MODE (right-click the hat → a click-catching overlay)
 
-/// Geometry and cadence for EYE MODE, fixed on purpose.
+/// Geometry and cadence for INSPECT MODE, fixed on purpose.
 ///
-/// `offset` must stay > 8 pt: the eye and its read-out sit off the point under
-/// test, so hovering a control never makes the eye the element Accessibility
-/// answers with (the §8 self-hit class of defect).
-private enum EyeModeSpec {
-    static let offset: CGFloat = 16.0
-    /// The read-out label hangs below the eye, clear of the tested point.
-    static let labelOffset: CGFloat = 46.0
-    static let labelWidth: CGFloat = 220.0
-    static let labelHeight: CGFloat = 18.0
-    /// One row of 11 pt text plus air: the label never wraps or grows.
-    static let labelFontSize: CGFloat = 11.0
+/// The badge is centred +18/+26 from the pointer: far enough away that the pill
+/// (and the window it lives in) is never the element under test, and the
+/// placement flips it around the cursor at a screen edge so a clamp can never
+/// leave it on the point (§8 self-hit class of defect).
+private enum InspectModeSpec {
+    static let badgeOffsetX: CGFloat = 18.0
+    static let badgeOffsetY: CGFloat = 26.0
+    static let badgeFontSize: CGFloat = 11.0
+    /// 15 pt per row for an 11 pt line: the 👀 glyph is taller than the Latin
+    /// text and must not clip inside the pill.
+    static let badgeLineHeight: CGFloat = 15.0
+    static let badgeLineGap: CGFloat = 2.0
+    static let badgeInsetX: CGFloat = 9.0
+    static let badgeInsetY: CGFloat = 6.0
+    /// Widen to the longest line, never below 180 nor above 320, so the pill
+    /// stays a glance and the second line never wraps.
+    static let badgeMinWidth: CGFloat = 180.0
+    static let badgeMaxWidth: CGFloat = 320.0
     /// "Cap the text at 30 characters, ellipsise."
-    static let labelMaxCharacters = 30
-    /// ~15 Hz pointer follow: attached to the cursor, cheap enough to run while
-    /// the user works in another app.
-    static let tickInterval: TimeInterval = 1.0 / 15.0
-    /// At most one AX hit-test per 100 ms, whatever the tick does.
-    static let hitTestInterval: TimeInterval = 0.1
-    /// A pointer that moved less than this keeps the captured target: menus,
-    /// tooltips and the eye itself jitter by a point or two.
+    static let badgeMaxCharacters = 30
+    /// 10 Hz pointer follow: the badge rides the cursor, the AX read is
+    /// movement-gated so this never becomes 10 reads a second.
+    static let tickInterval: TimeInterval = 1.0 / 10.0
+    /// A pointer that moved less than this keeps the last tested point: menus,
+    /// tooltips and the badge itself jitter by a point or two.
     static let moveThreshold: CGFloat = 6.0
+    /// No click for a minute cancels the mode on its own.
+    static let timeout: TimeInterval = 60.0
+    /// The badge's fixed first line.
+    static let titleText = "👀 click to ask · right-click to cancel"
 }
 
-/// Hard cap + tail ellipsis for the live label line.
-private func eyeLabelText(_ text: String,
-                          limit: Int = EyeModeSpec.labelMaxCharacters) -> String {
+/// Hard cap + tail ellipsis for the live target line.
+private func inspectTargetText(_ text: String,
+                               limit: Int = InspectModeSpec.badgeMaxCharacters) -> String {
     guard limit > 1, text.count > limit else { return text }
     return String(text.prefix(limit - 1)) + "\u{2026}"
 }
 
-/// The read-out label's panel. Like the LOOK card it must never take focus:
-/// the user's app keeps typing while the eye is up.
-private final class EyeLabelWindow: NSPanel {
+/// The descriptor as one line: `Button · "Merge pull request"`.
+///
+/// An unnamed control still says WHERE it is (window, then app) instead of
+/// printing a bare "Window" — the §8 "Group alone is never an answer" rule.
+private func inspectTargetLine(_ descriptor: LookDescriptor) -> String {
+    var text: String
+    if let role = axNonEmpty(descriptor.role) {
+        if let label = axNonEmpty(descriptor.label) {
+            text = role + " \u{00B7} \u{201C}" + label + "\u{201D}"
+        } else if let window = axNonEmpty(descriptor.window) {
+            text = role + " \u{00B7} " + window
+        } else if let app = axNonEmpty(descriptor.app) {
+            text = role + " \u{00B7} " + app
+        } else {
+            text = role
+        }
+    } else if let label = axNonEmpty(descriptor.label) {
+        text = "\u{201C}" + label + "\u{201D}"
+    } else {
+        text = axNonEmpty(descriptor.window) ?? axNonEmpty(descriptor.app) ?? "\u{2026}"
+    }
+    return inspectTargetText(text)
+}
+
+/// A screen-sized click catcher. It must never take key or main status: the
+/// user's app keeps keyboard focus while the mode is up. Mouse delivery does
+/// not depend on key status, and `acceptsFirstMouse` makes the first click
+/// count; `.nonactivatingPanel` means the click never activates this helper.
+private final class InspectOverlayWindow: NSPanel {
     override var canBecomeKey: Bool {
         return false
     }
@@ -2406,64 +2443,44 @@ private final class EyeLabelWindow: NSPanel {
     }
 }
 
-/// A 220x18 dark pill with ONE 11 pt line: `Button · "Merge pull request"`.
-/// No buttons, no footer, no interaction — it is a glance, not a surface.
-private final class EyeLabelView: NSView {
-    private static let inset: CGFloat = 7.0
-    private static let textHeight: CGFloat = 14.0
-    private let label = NSTextField(labelWithString: "")
+/// The click-catching surface: a 5% black wash, a crosshair cursor, and one
+/// badge that follows the pointer with the control under it.
+///
+/// The badge never covers the point under the pointer (the placement helper
+/// flips it around the cursor and clamps it inside the screen), so the hover
+/// preview can read exactly that point. The mode captures POINTER clicks only:
+/// no key, no focus, no first responder.
+private final class InspectOverlayView: NSView {
+    private static let titleFont = NSFont.systemFont(ofSize: InspectModeSpec.badgeFontSize,
+                                                     weight: .semibold)
+    private static let detailFont = NSFont.systemFont(ofSize: InspectModeSpec.badgeFontSize)
+    private static let titleAttributes: [NSAttributedString.Key: Any] = [
+        .font: titleFont,
+        .foregroundColor: NSColor.white
+    ]
+    private static let detailAttributes: [NSAttributedString.Key: Any] = [
+        .font: detailFont,
+        .foregroundColor: NSColor.white.withAlphaComponent(0.78)
+    ]
 
-    /// The descriptor as one live line: role plus its quoted label, capped.
-    /// An unnamed control still says WHERE it is (window, then app) instead of
-    /// printing a bare "Window" — the §8 "Group alone is never an answer" rule.
-    static func line(for descriptor: LookDescriptor) -> String {
-        var text: String
-        if let role = axNonEmpty(descriptor.role) {
-            if let label = axNonEmpty(descriptor.label) {
-                text = role + " \u{00B7} \u{201C}" + label + "\u{201D}"
-            } else if let window = axNonEmpty(descriptor.window) {
-                text = role + " \u{00B7} " + window
-            } else if let app = axNonEmpty(descriptor.app) {
-                text = role + " \u{00B7} " + app
-            } else {
-                text = role
-            }
-        } else if let label = axNonEmpty(descriptor.label) {
-            text = "\u{201C}" + label + "\u{201D}"
-        } else {
-            text = axNonEmpty(descriptor.window) ?? axNonEmpty(descriptor.app) ?? "\u{2026}"
-        }
-        return eyeLabelText(text)
-    }
+    /// Where the badge is drawn, in this view's coordinates. Empty when the
+    /// pointer is on another display (only one badge exists at a time).
+    private(set) var badgeFrame = NSRect.zero
+    private var badgeDetail = ""
+    private var badgeCursor: NSPoint?
+    private var cursorTracking: NSTrackingArea?
 
-    var text: String = "" {
-        didSet {
-            guard text != oldValue else { return }
-            label.stringValue = text
-        }
-    }
+    /// Left click on the overlay, reported in AppKit screen coordinates.
+    var onInspectClick: ((NSPoint) -> Void)?
+    /// Right click anywhere: the documented exit.
+    var onCancel: (() -> Void)?
+    /// A click inside the badge is a cancel, not a read.
+    var onBadgeClick: (() -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
-        label.font = NSFont.systemFont(ofSize: EyeModeSpec.labelFontSize)
-        label.textColor = NSColor.white
-        // One visual line, tail ellipsis: the card never wraps or grows.
-        label.lineBreakMode = .byTruncatingTail
-        label.usesSingleLineMode = true
-        label.maximumNumberOfLines = 1
-        label.cell?.lineBreakMode = .byTruncatingTail
-        label.cell?.usesSingleLineMode = true
-        label.isEditable = false
-        label.isSelectable = false
-        label.isBezeled = false
-        label.isBordered = false
-        label.drawsBackground = false
-        label.focusRingType = .none
-        label.refusesFirstResponder = true
-        label.setAccessibilityLabel("Butler eye read-out")
-        addSubview(label)
     }
 
     @available(*, unavailable)
@@ -2471,22 +2488,172 @@ private final class EyeLabelView: NSView {
         return nil
     }
 
-    override var isFlipped: Bool {
+    /// Never a first responder: the mode captures pointer clicks only, so no
+    /// key event is ever routed here.
+    override var acceptsFirstResponder: Bool {
+        return false
+    }
+
+    /// The very first click counts: the window never becomes key, so without
+    /// this the click that activates the helper would be swallowed.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         return true
     }
 
-    override func layout() {
-        super.layout()
-        label.frame = NSRect(x: EyeLabelView.inset,
-                             y: (bounds.height - EyeLabelView.textHeight) / 2.0,
-                             width: max(0.0, bounds.width - EyeLabelView.inset * 2.0),
-                             height: EyeLabelView.textHeight)
+    /// The crosshair is the mode's cursor, set for the whole surface.
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+
+    /// `.activeAlways` is what makes the crosshair survive this helper being a
+    /// background accessory: the default tracking only fires for the active app.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = cursorTracking {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited,
+                                            .cursorUpdate,
+                                            .activeAlways,
+                                            .inVisibleRect],
+                                  owner: self,
+                                  userInfo: nil)
+        addTrackingArea(area)
+        cursorTracking = area
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.crosshair.set()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        if badgeFrame.contains(local) {
+            onBadgeClick?()
+            return
+        }
+        guard let window = window else { return }
+        onInspectClick?(window.convertPoint(toScreen: event.locationInWindow))
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        onCancel?()
+    }
+
+    /// Two 11 pt lines plus air: the pill is small, the second line one glance.
+    static func badgeSize(for detail: String) -> NSSize {
+        let titleWidth = (InspectModeSpec.titleText as NSString)
+            .size(withAttributes: [.font: titleFont]).width
+        let detailLine = detail.isEmpty ? "\u{2026}" : detail
+        let detailWidth = (detailLine as NSString)
+            .size(withAttributes: [.font: detailFont]).width
+        let width = min(max(titleWidth, detailWidth) + InspectModeSpec.badgeInsetX * 2.0,
+                        InspectModeSpec.badgeMaxWidth)
+        let height = InspectModeSpec.badgeInsetY * 2.0
+            + InspectModeSpec.badgeLineHeight * 2.0
+            + InspectModeSpec.badgeLineGap
+        return NSSize(width: ceil(max(width, InspectModeSpec.badgeMinWidth)),
+                      height: ceil(height))
+    }
+
+    /// Centred at (cursor + 18, cursor + 26) in window coordinates, clamped
+    /// inside the screen. Four candidate centres are tried so a clamp at an
+    /// edge can never leave the pill on the point under test.
+    private func badgeFrame(cursor: NSPoint, size: NSSize) -> NSRect {
+        func clamped(center: NSPoint) -> NSRect {
+            var frame = NSRect(x: center.x - size.width / 2.0,
+                               y: center.y - size.height / 2.0,
+                               width: size.width,
+                               height: size.height)
+            if bounds.width > size.width {
+                frame.origin.x = min(max(frame.origin.x, bounds.minX + 4.0),
+                                     bounds.maxX - size.width - 4.0)
+            } else {
+                frame.origin.x = bounds.midX - size.width / 2.0
+            }
+            if bounds.height > size.height {
+                frame.origin.y = min(max(frame.origin.y, bounds.minY + 4.0),
+                                     bounds.maxY - size.height - 4.0)
+            } else {
+                frame.origin.y = bounds.midY - size.height / 2.0
+            }
+            return frame
+        }
+        let offsets = [(InspectModeSpec.badgeOffsetX, InspectModeSpec.badgeOffsetY),
+                       (-InspectModeSpec.badgeOffsetX, -InspectModeSpec.badgeOffsetY),
+                       (InspectModeSpec.badgeOffsetX, -InspectModeSpec.badgeOffsetY),
+                       (-InspectModeSpec.badgeOffsetX, InspectModeSpec.badgeOffsetY)]
+        for (dx, dy) in offsets {
+            let frame = clamped(center: NSPoint(x: cursor.x + dx, y: cursor.y + dy))
+            if !frame.contains(cursor) {
+                return frame
+            }
+        }
+        // Every centred candidate was clamped onto the point (a corner of the
+        // screen). Pin the pill entirely to one SIDE of the cursor instead: the
+        // x range alone then keeps the tested point clear.
+        let y = min(max(cursor.y + InspectModeSpec.badgeOffsetY - size.height / 2.0,
+                        bounds.minY + 4.0),
+                    bounds.maxY - size.height - 4.0)
+        var sideFrames: [NSRect] = []
+        if cursor.x + InspectModeSpec.badgeOffsetX + size.width <= bounds.maxX - 4.0 {
+            sideFrames.append(NSRect(x: cursor.x + InspectModeSpec.badgeOffsetX,
+                                     y: y,
+                                     width: size.width,
+                                     height: size.height))
+        }
+        let leftX = max(cursor.x - InspectModeSpec.badgeOffsetX - size.width,
+                        bounds.minX + 4.0)
+        sideFrames.append(NSRect(x: leftX, y: y,
+                                 width: size.width, height: size.height))
+        for frame in sideFrames where !frame.contains(cursor) {
+            return frame
+        }
+        // A panel narrower than the pill cannot clear it horizontally: keep the
+        // pill entirely above (or below) the cursor so the Y range alone clears
+        // the tested point.
+        let clearX = min(max(cursor.x + InspectModeSpec.badgeOffsetX - size.width / 2.0,
+                             bounds.minX + 4.0),
+                         bounds.maxX - size.width - 4.0)
+        if cursor.y + InspectModeSpec.badgeOffsetY + size.height <= bounds.maxY - 4.0 {
+            return NSRect(x: clearX,
+                          y: cursor.y + InspectModeSpec.badgeOffsetY,
+                          width: size.width,
+                          height: size.height)
+        }
+        let belowY = cursor.y - InspectModeSpec.badgeOffsetY - size.height
+        if belowY >= bounds.minY + 4.0 {
+            return NSRect(x: clearX, y: belowY,
+                          width: size.width, height: size.height)
+        }
+        return sideFrames.first ?? NSRect(x: clearX, y: y,
+                                          width: size.width, height: size.height)
+    }
+
+    /// The controller feeds the pointer (in this view's coordinates) and the
+    /// current target line on every tick. A nil cursor hides the badge.
+    func updateBadge(cursor: NSPoint?, detail: String) {
+        let text = inspectTargetText(detail)
+        guard cursor != badgeCursor || text != badgeDetail else { return }
+        badgeCursor = cursor
+        badgeDetail = text
+        if let cursor = cursor {
+            badgeFrame = badgeFrame(cursor: cursor,
+                                    size: InspectOverlayView.badgeSize(for: text))
+        } else {
+            badgeFrame = .zero
+        }
+        needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let background = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let path = NSBezierPath(roundedRect: background, xRadius: 5.0, yRadius: 5.0)
+        guard !badgeFrame.isEmpty else { return }
+
+        let path = NSBezierPath(roundedRect: badgeFrame,
+                                xRadius: badgeFrame.height / 2.0,
+                                yRadius: badgeFrame.height / 2.0)
         NSColor(red: 22.0 / 255.0,
                 green: 23.0 / 255.0,
                 blue: 26.0 / 255.0,
@@ -2498,13 +2665,31 @@ private final class EyeLabelView: NSView {
                 alpha: 0.55).setStroke()
         path.lineWidth = 1.0
         path.stroke()
+
+        let content = badgeFrame.insetBy(dx: InspectModeSpec.badgeInsetX,
+                                         dy: InspectModeSpec.badgeInsetY)
+        let titleRect = NSRect(x: content.minX,
+                               y: content.maxY - InspectModeSpec.badgeLineHeight,
+                               width: content.width,
+                               height: InspectModeSpec.badgeLineHeight)
+        (InspectModeSpec.titleText as NSString).draw(
+            in: titleRect,
+            withAttributes: InspectOverlayView.titleAttributes)
+        let detail = badgeDetail.isEmpty ? "\u{2026}" : badgeDetail
+        let detailRect = NSRect(x: content.minX,
+                                y: titleRect.minY - InspectModeSpec.badgeLineGap
+                                    - InspectModeSpec.badgeLineHeight,
+                                width: content.width,
+                                height: InspectModeSpec.badgeLineHeight)
+        (detail as NSString).draw(in: detailRect,
+                                  withAttributes: InspectOverlayView.detailAttributes)
     }
 }
 
 /// NSMenu needs an NSObject target/action pair and the controller is a plain
 /// class, so each item's action lives in one of these boxes (held strong by the
 /// controller for the life of the menu, since `NSMenuItem.target` is weak).
-private final class EyeMenuItemTarget: NSObject {
+private final class HatMenuItemTarget: NSObject {
     private let handler: () -> Void
 
     init(_ handler: @escaping () -> Void) {
@@ -2892,29 +3077,28 @@ private final class OverlayController {
     /// The element the open field is asking about, or nil for the plain door.
     private var summonFieldLookTarget: LookTarget?
 
-    // MARK: EYE MODE state
+    // MARK: INSPECT MODE state
     //
-    // Right-clicking the hat detaches it from the pet and turns it into an eye
-    // that follows the pointer until Esc, a second right-click or a click in
-    // another app. The target is captured on HOVER, not on click: the click on
-    // the eye lands in OUR window, so the app's control never fires.
-    private var eyeMode = false
-    private var eyeTickTimer: Timer?
-    private var eyeLabelWindow: NSPanel?
-    private var eyeLabelView: EyeLabelView?
-    private var eyeMonitors: [Any] = []
-    /// Last point a hit-test was taken from, and when. The 15 Hz tick must not
-    /// turn into 15 AX reads a second.
-    private var eyeLastTestedPoint: CGPoint?
-    private var eyeLastHitTestAt: Date?
-    /// What the pointer was over, kept ("latched") while it is over our own
-    /// windows — the stored descriptor is what makes click-the-eye answerable.
-    private var eyeLatchedDescriptor: LookDescriptor?
-    private var eyeLatchedPoint: CGPoint?
-    /// One `eye-latch` line per entry into the latch, not per tick.
-    private var eyeLatchAnnounced = false
+    // Right-clicking the hat raises a screen-sized click catcher on every
+    // display and hides the hat. The click the user means to make on a control
+    // lands on US, so the control never fires; we read the element under that
+    // point and ask about it. The hat is only an indicator while the mode is up
+    // — a follower with an offset can never itself be clicked.
+    private var inspectMode = false
+    private var inspectWindows: [NSPanel] = []
+    private var inspectViews: [InspectOverlayView] = []
+    private var inspectTickTimer: Timer?
+    private var inspectTimeoutTimer: Timer?
+    /// Where the mode was armed: a click that never left that point tests the
+    /// arming point, never a stale pre-arm read-out.
+    private var inspectArmPoint: CGPoint?
+    /// Last point the hover preview hit-tested, and the badge's second line.
+    private var inspectLastTestedPoint: CGPoint?
+    private var inspectBadgeDetail = ""
+    /// A click is being resolved: the overlays are parked and the tick stops.
+    private var inspectResolving = false
     /// NSMenu action boxes must outlive the tracking loop.
-    private var hatMenuTargets: [EyeMenuItemTarget] = []
+    private var hatMenuTargets: [HatMenuItemTarget] = []
     // AX notifications replace the 0.5 s reposition poll while the chip is
     // armed: the Hermes pop-out posts ~17 ms AXWindowMoved events during a
     // drag (a probe logged 86 in one drag, each with live AXPosition/AXSize).
@@ -3355,9 +3539,9 @@ private final class OverlayController {
         }
         claimChipPadBottom = spec.padBottom
         if !spec.enabled {
-            // Disarming first: EYE MODE holds a timer and monitors that a
-            // closed hat must not leave behind.
-            disarmEyeMode()
+            // Disarming first: INSPECT MODE holds timers and screen-sized
+            // overlays that a closed hat must not leave behind.
+            disarmInspectMode()
             claimChipTimer?.invalidate()
             claimChipTimer = nil
             claimChipTimerInterval = 0.0
@@ -4327,9 +4511,9 @@ private final class OverlayController {
         recoverLostPressIfNeeded()
         // The drag owns the frame until mouseUp; the timer must stay out of it.
         guard !claimChipDragging else { return }
-        // EYE MODE owns the frame: the follow tick places the chip, so the pet
-        // placement tick must never snap it back to the pop-out.
-        guard !eyeMode else { return }
+        // INSPECT MODE hides the hat on purpose: the overlay owns the pointer,
+        // so the placement tick must never bring the chip back mid-mode.
+        guard !inspectMode else { return }
         guard claimChipEnabled, !isShuttingDown,
               let primaryHeight = primaryScreenHeight() else {
             hideClaimChip()
@@ -4349,8 +4533,8 @@ private final class OverlayController {
     private func applyClaimChipFrame(petWindow: CGRect, primaryHeight: CGFloat) {
         recoverLostPressIfNeeded()
         guard !claimChipDragging else { return }
-        // The follow tick owns the frame while the eye is detached.
-        guard !eyeMode else { return }
+        // The overlay owns the frame while the mode is up.
+        guard !inspectMode else { return }
         guard claimChipEnabled, !isShuttingDown else {
             hideClaimChip()
             return
@@ -4443,12 +4627,6 @@ private final class OverlayController {
         claimChipDragging = false
         // Using the hat again puts any read-out away first.
         dismissLookCard()
-        // In EYE MODE the hat IS the eye: the click landed in our own window, so
-        // the app's control never fired and the captured target is the subject.
-        if eyeMode {
-            answerEyeClick()
-            return
-        }
         guard claimChipEnabled else {
             chipJournal("click-skipped:disabled")
             return
@@ -4797,10 +4975,10 @@ private final class OverlayController {
         }
         let appKitFrame = appKitRect(fromQuartz: frame,
                                      primaryHeight: primaryHeight)
-        // An open ask field is one of EYE MODE's exits: the eye has delivered its
-        // target, so the hat goes home while the user types. This runs AFTER the
-        // frame above was taken, so the field still opens where the eye was.
-        disarmEyeMode()
+        // An open ask field is one of INSPECT MODE's exits: the mode has
+        // delivered its target, so the overlays close and the hat goes home
+        // while the user types. This runs AFTER the frame above was taken.
+        disarmInspectMode()
         // Captured BEFORE we activate: this is the app the user was working in
         // and the one that gets focus back when the field closes.
         summonFieldReturnApp = NSWorkspace.shared.frontmostApplication
@@ -5039,208 +5217,356 @@ private final class OverlayController {
         }
     }
 
-    // MARK: EYE MODE
+    // MARK: INSPECT MODE
 
-    /// Right-click the hat turns it into an eye that follows the pointer, with a
-    /// live label naming the control under the cursor. The target is captured on
-    /// HOVER (see `eyeTick`), never by catching the user's click: the eye only
-    /// ever reads.
-    private func armEyeMode() {
-        // Never behind an open ask field: the field and the eye would fight for
-        // the same corner, and the field's own open door disarms the eye anyway.
-        guard !eyeMode, !summonFieldOpen, !isShuttingDown,
+    /// Right-click the hat: every display gets a screen-sized click catcher, the
+    /// hat is hidden, and the badge under the pointer names the control a click
+    /// would ask about. Pointer-only: no key, no focus, no first responder.
+    private func armInspectMode() {
+        // Never behind an open ask field: the field and the overlays would both
+        // want the pointer, and every door into the field disarms the mode.
+        guard !inspectMode, !summonFieldOpen, !isShuttingDown,
               claimChipEnabled else { return }
         guard claimChipWindow != nil, claimChipView != nil else { return }
-        // Another of our windows on screen would sit in the eye's read path.
+        // Another of our windows on screen would sit in the read path.
         dismissLookCard()
-        eyeMode = true
-        eyeLatchedDescriptor = nil
-        eyeLatchedPoint = nil
-        eyeLastTestedPoint = nil
-        eyeLastHitTestAt = nil
-        eyeLatchAnnounced = false
-        claimChipView?.eyeMode = true
-        chipJournal("eye-arm")
-        ensureEyeLabel()
-        installEyeMonitors()
-        let timer = Timer(timeInterval: EyeModeSpec.tickInterval,
-                          repeats: true) { [weak self] _ in
-            self?.eyeTick()
+        inspectMode = true
+        inspectResolving = false
+        inspectArmPoint = cursorQuartzPoint()
+        inspectLastTestedPoint = nil
+        inspectBadgeDetail = ""
+        NSCursor.crosshair.push()
+        // The hat is an indicator only while the mode is up; the overlay owns
+        // the pointer. Hidden, not torn down: disarm puts it back on the pet.
+        claimChipWindow?.orderOut(nil)
+        chipJournal("inspect-arm")
+        raiseInspectOverlays()
+        // No screen means no click catcher and no way to leave the mode except
+        // the timeout: do not arm at all.
+        guard !inspectWindows.isEmpty else {
+            disarmInspectMode()
+            return
         }
-        RunLoop.main.add(timer, forMode: .common)
-        eyeTickTimer = timer
-        // Place the eye on the current pointer at once: waiting up to 66 ms
-        // leaves the hat visible at the pet after the menu closes.
-        eyeTick()
+        installInspectTimers()
+        // Place the badge on the current pointer at once: waiting up to 100 ms
+        // leaves the hat visible at the pet after the click.
+        inspectTick()
     }
 
-    /// Esc, a second right-click, a click outside our windows, the ask opening
-    /// or teardown all land here, so no monitor or timer outlives the mode.
-    private func disarmEyeMode() {
-        guard eyeMode else { return }
-        eyeMode = false
-        eyeTickTimer?.invalidate()
-        eyeTickTimer = nil
-        removeEyeMonitors()
-        dismissEyeLabel()
-        claimChipView?.eyeMode = false
-        eyeLatchedDescriptor = nil
-        eyeLatchedPoint = nil
-        eyeLastTestedPoint = nil
-        eyeLastHitTestAt = nil
-        eyeLatchAnnounced = false
-        chipJournal("eye-disarm")
+    /// One click catcher per screen, covering that screen's full frame. Nothing
+    /// becomes key or main, so the user's app keeps keyboard focus.
+    private func raiseInspectOverlays() {
+        for screen in NSScreen.screens {
+            let frame = screen.frame
+            guard frame.width > 0.0, frame.height > 0.0 else { continue }
+            let window = InspectOverlayWindow(contentRect: frame,
+                                              styleMask: [.borderless, .nonactivatingPanel],
+                                              backing: .buffered,
+                                              defer: false)
+            window.isOpaque = false
+            window.backgroundColor = NSColor.black.withAlphaComponent(0.05)
+            window.hasShadow = false
+            // Above every app and the menu bar: a click anywhere means US.
+            window.level = .screenSaver
+            window.collectionBehavior = [.canJoinAllSpaces,
+                                         .stationary,
+                                         .fullScreenAuxiliary,
+                                         .ignoresCycle]
+            window.ignoresMouseEvents = false
+            window.isMovable = false
+            window.isMovableByWindowBackground = false
+            window.isReleasedWhenClosed = false
+            window.acceptsMouseMovedEvents = false
+            window.hidesOnDeactivate = false
+
+            let view = InspectOverlayView(frame: NSRect(origin: .zero, size: frame.size))
+            view.autoresizingMask = [.width, .height]
+            view.onInspectClick = { [weak self] point in
+                self?.inspectClicked(at: point)
+            }
+            view.onCancel = { [weak self] in
+                self?.cancelInspectMode(reason: "right-click")
+            }
+            view.onBadgeClick = { [weak self] in
+                self?.cancelInspectMode(reason: "badge")
+            }
+            window.contentView = view
+            inspectWindows.append(window)
+            inspectViews.append(view)
+            window.orderFrontRegardless()
+        }
+    }
+
+    private func installInspectTimers() {
+        let tick = Timer(timeInterval: InspectModeSpec.tickInterval,
+                         repeats: true) { [weak self] _ in
+            self?.inspectTick()
+        }
+        RunLoop.main.add(tick, forMode: .common)
+        inspectTickTimer = tick
+        let timeout = Timer(timeInterval: InspectModeSpec.timeout,
+                            repeats: false) { [weak self] _ in
+            self?.inspectTimedOut()
+        }
+        RunLoop.main.add(timeout, forMode: .common)
+        inspectTimeoutTimer = timeout
+    }
+
+    /// Right-click, a badge click, the ask opening or teardown all land here, so
+    /// no timer or overlay outlives the mode. A cancel is a mode exit, hence the
+    /// hat returning to the pet.
+    private func cancelInspectMode(reason: String) {
+        guard inspectMode else { return }
+        chipJournal("inspect-cancel:" + reason)
+        disarmInspectMode()
+    }
+
+    private func inspectTimedOut() {
+        guard inspectMode else { return }
+        chipJournal("inspect-timeout")
+        cancelInspectMode(reason: "timeout")
+    }
+
+    private func disarmInspectMode() {
+        guard inspectMode else { return }
+        inspectMode = false
+        inspectResolving = false
+        inspectTickTimer?.invalidate()
+        inspectTickTimer = nil
+        inspectTimeoutTimer?.invalidate()
+        inspectTimeoutTimer = nil
+        for window in inspectWindows {
+            window.orderOut(nil)
+            window.close()
+        }
+        inspectWindows.removeAll()
+        inspectViews.removeAll()
+        // Leave no crosshair behind: pop the cursor pushed at arm, then drop the
+        // stale cursor rects so the app underneath gets its own cursor back.
+        NSCursor.pop()
+        NSCursor.arrow.set()
+        inspectArmPoint = nil
+        inspectLastTestedPoint = nil
+        inspectBadgeDetail = ""
+        chipJournal("inspect-disarm")
         // The hat returns to the pet.
         positionClaimChip()
         claimChipWindow?.orderFrontRegardless()
     }
 
-    /// The whole 15 Hz loop: move the eye and its label, then — only when the
-    /// pointer moved and at most every 100 ms — hit-test the point under it and
-    /// latch what it found.
-    private func eyeTick() {
-        guard eyeMode, !isShuttingDown else { return }
+    /// The 10 Hz loop: move the badge, then — only when the pointer moved ≥ 6 pt
+    /// since the last test — take ONE AX read of the point under it.
+    private func inspectTick() {
+        guard inspectMode, !inspectResolving, !isShuttingDown else { return }
         guard let primaryHeight = primaryScreenHeight() else { return }
         let mouse = NSEvent.mouseLocation
         guard mouse.x.isFinite, mouse.y.isFinite else { return }
         let quartz = CGPoint(x: mouse.x, y: primaryHeight - mouse.y)
 
-        positionEyeWindow(quartz: quartz, primaryHeight: primaryHeight)
-        positionEyeLabel(quartz: quartz, primaryHeight: primaryHeight)
-
-        // Our own windows win every AX hit-test (§8): while the pointer is over
-        // the eye, the label or the ask field, keep the stored descriptor —
-        // latch — and take no hit-test at all. This is what makes
-        // click-the-eye work after the pointer travels to the eye.
-        if eyePointIsOurs(quartz, primaryHeight: primaryHeight) {
-            if eyeLatchedDescriptor != nil, !eyeLatchAnnounced {
-                eyeLatchAnnounced = true
-                chipJournal("eye-latch")
-            }
-            return
-        }
-        eyeLatchAnnounced = false
-
-        if let last = eyeLastTestedPoint {
+        if let last = inspectLastTestedPoint {
             let dx = quartz.x - last.x
             let dy = quartz.y - last.y
-            if (dx * dx + dy * dy).squareRoot() < EyeModeSpec.moveThreshold {
+            if (dx * dx + dy * dy).squareRoot() < InspectModeSpec.moveThreshold {
+                updateInspectBadges(cursor: mouse)
                 return
             }
         }
-        if let tested = eyeLastHitTestAt,
-           Date().timeIntervalSince(tested) < EyeModeSpec.hitTestInterval {
+        // Never AX-test a point under our own badge: our windows win every
+        // hit-test and a read-out pill is not a target (§8). The badge placement
+        // keeps the cursor outside its rect, so this guard is belt and braces.
+        if inspectBadgeContains(quartz, primaryHeight: primaryHeight) {
+            updateInspectBadges(cursor: mouse)
             return
         }
-        eyeLastTestedPoint = quartz
-        eyeLastHitTestAt = Date()
-
-        let descriptor = lookElementDescriptor(at: quartz)
-        // §8: never trust a hit that lands in our own process. The window
-        // server can still report our own window for a beat after the eye
-        // moved, so drop the test point and retry on the next tick.
-        if eyeDescriptorIsSelf(descriptor) {
-            eyeLastTestedPoint = nil
-            return
+        inspectLastTestedPoint = quartz
+        // The overlay is topmost everywhere, so a system-wide hit-test would
+        // answer with it. Ask the app that owns the window UNDER the overlay
+        // instead: an application-scoped hit-test is restricted to that app
+        // (AXUIElement.h), so the preview needs no parking and no dim flicker.
+        if let descriptor = inspectDescriptorUnderCursor(at: quartz),
+           !lookDescriptorIsSelf(descriptor) {
+            inspectBadgeDetail = inspectTargetLine(descriptor)
+        } else {
+            // Nothing readable under the pointer (desktop, AX refusal, our own
+            // second companion): never keep naming the last control seen.
+            inspectBadgeDetail = ""
         }
-        eyeLatchedDescriptor = descriptor
-        eyeLatchedPoint = quartz
-        updateEyeLabel()
-        chipJournal("eye-hover:" + (descriptor.role ?? "?"))
+        updateInspectBadges(cursor: mouse)
     }
 
-    /// True when the resolved element belongs to THIS process. The pid is the
-    /// exact test; the name comparison catches a descriptor whose AX pid read
-    /// failed but whose app name is still ours.
-    private func eyeDescriptorIsSelf(_ descriptor: LookDescriptor) -> Bool {
-        if descriptor.pid != 0,
-           descriptor.pid == ProcessInfo.processInfo.processIdentifier {
-            return true
-        }
-        return lookDescriptorIsSelf(descriptor)
-    }
-
-    /// True when a Quartz point lands inside one of THIS process's windows: the
-    /// eye, its label, or the ask field. No AX hit-test is taken there.
-    private func eyePointIsOurs(_ quartz: CGPoint, primaryHeight: CGFloat) -> Bool {
-        let windows: [NSWindow?] = [claimChipWindow, eyeLabelWindow, summonFieldWindow]
-        for window in windows {
-            guard let window = window, window.isVisible else { continue }
-            let frame = quartzRect(fromAppKit: window.frame,
-                                   primaryHeight: primaryHeight)
-            if frame.contains(quartz) {
-                return true
+    /// Feed each overlay view the pointer in ITS coordinates. Only the display
+    /// under the pointer carries the badge: a pill clamped onto another screen
+    /// would be a ghost.
+    private func updateInspectBadges(cursor: NSPoint) {
+        for view in inspectViews {
+            guard let window = view.window else { continue }
+            let local = view.convert(window.convertPoint(fromScreen: cursor), from: nil)
+            if view.bounds.contains(local) {
+                view.updateBadge(cursor: local, detail: inspectBadgeDetail)
+            } else {
+                view.updateBadge(cursor: nil, detail: inspectBadgeDetail)
             }
+        }
+    }
+
+    /// True when a Quartz point lands inside the badge drawn on our overlay.
+    private func inspectBadgeContains(_ quartz: CGPoint,
+                                      primaryHeight: CGFloat) -> Bool {
+        let appKitPoint = NSPoint(x: quartz.x, y: primaryHeight - quartz.y)
+        for view in inspectViews {
+            guard let window = view.window, window.isVisible else { continue }
+            let local = view.convert(window.convertPoint(fromScreen: appKitPoint),
+                                     from: nil)
+            guard view.bounds.contains(local) else { continue }
+            return view.badgeFrame.contains(local)
         }
         return false
     }
 
-    /// The exits are observed, never swallowed: a global monitor needs no new
-    /// grant (the companion already holds Accessibility) and lets the click
-    /// reach the app. Escape is the only key read; no event tap and no
-    /// modifier-key stream, so this path asks for no extra permission.
-    private func installEyeMonitors() {
-        guard eyeMonitors.isEmpty else { return }
-        let mouse: NSEvent.EventTypeMask = [.leftMouseDown,
-                                            .rightMouseDown,
-                                            .otherMouseDown]
-        if let globalMouse = NSEvent.addGlobalMonitorForEvents(
-            matching: mouse,
-            handler: { [weak self] _ in
-                // The click landed in another app: outside our windows' reach.
-                self?.disarmEyeMode()
-            }) {
-            eyeMonitors.append(globalMouse)
+    /// The pid of the topmost window at `point` that is not ours: what the user
+    /// is actually looking at while our overlay covers the display.
+    private func inspectUnderlyingPid(at point: CGPoint) -> pid_t? {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(options,
+                                                    kCGNullWindowID) as? [[String: Any]] else {
+            return nil
         }
-        let escape: UInt16 = 53
-        let keyHandler: (NSEvent) -> Void = { [weak self] event in
-            if event.keyCode == escape {
-                self?.disarmEyeMode()
+        let me = ProcessInfo.processInfo.processIdentifier
+        for window in info {
+            guard let rawPid = intValue(window[kCGWindowOwnerPID as String]),
+                  rawPid > 0, pid_t(rawPid) != me,
+                  let alpha = numberValue(window[kCGWindowAlpha as String]),
+                  alpha > 0.0,
+                  let bounds = windowBounds(window),
+                  bounds.contains(point) else {
+                continue
+            }
+            return pid_t(rawPid)
+        }
+        return nil
+    }
+
+    /// Read the control under `point` from the app BELOW our overlay. The
+    /// system-wide element would answer with this process's overlay window, so
+    /// the hit-test is scoped to the underlying app instead.
+    private func inspectDescriptorUnderCursor(at point: CGPoint) -> LookDescriptor? {
+        guard let pid = inspectUnderlyingPid(at: point) else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        var element: AXUIElement?
+        let error = AXUIElementCopyElementAtPosition(app,
+                                                     Float(point.x),
+                                                     Float(point.y),
+                                                     &element)
+        guard error == .success, let hit = element else { return nil }
+        return lookDescriptor(for: hit, at: point)
+    }
+
+    /// Left click on the overlay. The click is captured on purpose: at this
+    /// point the topmost window is OUR overlay, so the control under it never
+    /// fires and the question becomes "what did I just click?".
+    private func inspectClicked(at screenPoint: NSPoint) {
+        guard inspectMode, !inspectResolving, !isShuttingDown else { return }
+        guard let primaryHeight = primaryScreenHeight(),
+              screenPoint.x.isFinite, screenPoint.y.isFinite else {
+            cancelInspectMode(reason: "no-point")
+            return
+        }
+        // A click that never left the arming point tests THAT point (the
+        // pointer never moved); any real travel uses the click itself. Either
+        // way the descriptor is resolved FRESH after parking — never reuse a
+        // pre-arm or pre-click read-out.
+        let clicked = CGPoint(x: screenPoint.x, y: primaryHeight - screenPoint.y)
+        var point = clicked
+        if let arm = inspectArmPoint {
+            let dx = clicked.x - arm.x
+            let dy = clicked.y - arm.y
+            if (dx * dx + dy * dy).squareRoot() < InspectModeSpec.moveThreshold {
+                point = arm
             }
         }
-        if let localKey = NSEvent.addLocalMonitorForEvents(
-            matching: .keyDown,
-            handler: { event in
-                keyHandler(event)
-                return event
-            }) {
-            eyeMonitors.append(localKey)
+        inspectResolving = true
+        inspectTickTimer?.invalidate()
+        inspectTickTimer = nil
+        inspectTimeoutTimer?.invalidate()
+        inspectTimeoutTimer = nil
+        // §8: our own windows win every AX hit-test, so every overlay is parked
+        // off-screen (orderOut alone is applied by the window server on the NEXT
+        // pass) and the read happens on the next run-loop turn.
+        for window in inspectWindows {
+            window.setFrameOrigin(NSPoint(x: -20000.0, y: -20000.0))
         }
-        if let globalKey = NSEvent.addGlobalMonitorForEvents(
-            matching: .keyDown,
-            handler: keyHandler) {
-            eyeMonitors.append(globalKey)
+        DispatchQueue.main.async { [weak self] in
+            self?.resolveInspectClick(at: point, retries: 1)
         }
     }
 
-    private func removeEyeMonitors() {
-        for monitor in eyeMonitors {
-            NSEvent.removeMonitor(monitor)
+    /// Read the click point with the overlays parked, tolerating the window
+    /// server still reporting our own window for a beat. Never answers with
+    /// "ButlerOverlay".
+    private func resolveInspectClick(at point: CGPoint, retries: Int) {
+        guard inspectMode else { return }
+        var descriptor = lookElementDescriptor(at: point)
+        if lookDescriptorIsSelf(descriptor), retries > 0 {
+            // One short retry while the parked overlays settle; they stay
+            // off-screen until this resolves.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+                self?.resolveInspectClick(at: point, retries: retries - 1)
+            }
+            return
         }
-        eyeMonitors.removeAll()
+        if lookDescriptorIsSelf(descriptor) {
+            descriptor = lookDescriptorForActiveApp()
+            chipJournal("inspect-self-hit-fallback")
+        }
+        // The last resort must not be us either: an accessory helper can be the
+        // menu-bar owner's fallback when nothing else is focused. Asking the
+        // butler about itself is never the answer, so exit instead.
+        if lookDescriptorIsSelf(descriptor) {
+            cancelInspectMode(reason: "self-after-fallback")
+            return
+        }
+        chipJournal("inspect-click:" + (descriptor.role ?? "?"))
+        let target = LookTarget(app: descriptor.app,
+                                role: descriptor.role,
+                                label: descriptor.label,
+                                window: descriptor.window,
+                                doc: descriptor.doc,
+                                enabled: descriptor.enabled,
+                                box: descriptor.box)
+        let line = target.contextLine
+        pendingLookContext = line.isEmpty ? nil : line
+        pendingLookTarget = line.isEmpty ? nil : target
+        // Close the overlays and put the hat back BEFORE the field opens: the
+        // field is placed against the pet, and the mode must not outlive the
+        // click. The existing LOOK door then raises the same ask box the drag
+        // route uses.
+        disarmInspectMode()
+        openSummonField()
     }
 
-    /// The hat's right-click: the LOOK/watch menu, or the documented exit from
-    /// EYE MODE (the same right-click that armed it).
+    /// The hat's right-click: INSPECT MODE, or the LOOK/watch menu with Option.
+    /// (The hat is hidden while the mode is up, so the in-mode branch is a belt-
+    /// and-braces exit for a stale visible chip.)
     private func claimChipRightClicked(at point: NSPoint) {
         claimChipDragging = false
         claimChipView?.cancelPendingPress()
-        if eyeMode {
-            disarmEyeMode()
+        if inspectMode {
+            cancelInspectMode(reason: "right-click")
             return
         }
-        // The user's gesture, literally: right-click the hat and an eye rides the
-        // cursor until you click something. The watch actions moved behind
-        // Option-right-click so the primary click is not a menu.
+        // The user's gesture, literally: right-click the hat and a click catcher
+        // covers the screens until you click something. The watch actions moved
+        // behind Option-right-click so the primary click is not a menu.
         if NSEvent.modifierFlags.contains(.option) {
             presentHatMenu(at: point)
             return
         }
-        armEyeMode()
+        armInspectMode()
     }
 
-    /// `Look at this…` arms the eye; the three watch items open the SAME ask
-    /// field prefilled, so they ride the normal agent turn with no new plumbing.
+    /// `Look at this…` arms INSPECT MODE; the three watch items open the SAME
+    /// ask field prefilled, so they ride the normal agent turn with no new
+    /// plumbing.
     private func presentHatMenu(at point: NSPoint) {
         guard !isShuttingDown, !summonFieldOpen, let view = claimChipView else {
             return
@@ -5253,14 +5579,14 @@ private final class OverlayController {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        var targets: [EyeMenuItemTarget] = []
+        var targets: [HatMenuItemTarget] = []
         func entry(_ title: String,
                    enabled: Bool = true,
                    action: @escaping () -> Void) -> NSMenuItem {
-            let target = EyeMenuItemTarget(action)
+            let target = HatMenuItemTarget(action)
             targets.append(target)
             let item = NSMenuItem(title: title,
-                                  action: #selector(EyeMenuItemTarget.fire(_:)),
+                                  action: #selector(HatMenuItemTarget.fire(_:)),
                                   keyEquivalent: "")
             item.target = target
             item.isEnabled = enabled
@@ -5268,7 +5594,7 @@ private final class OverlayController {
         }
 
         menu.addItem(entry("Look at this…") { [weak self] in
-            self?.armEyeMode()
+            self?.armInspectMode()
         })
         menu.addItem(.separator())
         // No nameable frontmost app: keep the row visible but disabled rather
@@ -5329,182 +5655,6 @@ private final class OverlayController {
             return nil
         }
         return object["watch"] as? [String: Any]
-    }
-
-    /// Clicking the eye asks about the latched target. The click landed in OUR
-    /// window, so the app's control never saw it: no button activated, no menu
-    /// item ran. The question is answerable from the captured descriptor even
-    /// when an open menu has already closed — a stale-location read, not a lost
-    /// one.
-    private func answerEyeClick() {
-        guard eyeMode else { return }
-        guard let descriptor = eyeLatchedDescriptor else {
-            chipJournal("eye-miss")
-            return
-        }
-        chipJournal("eye-ask:" + (descriptor.role ?? "?"))
-        let target = LookTarget(app: descriptor.app,
-                                role: descriptor.role,
-                                label: descriptor.label,
-                                window: descriptor.window,
-                                doc: descriptor.doc,
-                                enabled: descriptor.enabled,
-                                box: descriptor.box)
-        let line = target.contextLine
-        pendingLookContext = line.isEmpty ? nil : line
-        pendingLookTarget = line.isEmpty ? nil : target
-        // openSummonField() disarms EYE MODE itself once it has the frame, so
-        // every door into the field (this one, ⌘⇧A, the menu) leaves the mode.
-        openSummonField()
-    }
-
-    /// +16/+16 from the pointer, clamped into the screen's visible frame. If the
-    /// clamped frame would cover the point under test, the offset flips to the
-    /// other side, so the eye is never the element being read.
-    private func eyeFollowFrame(quartz: CGPoint,
-                                size: CGSize,
-                                primaryHeight: CGFloat) -> CGRect? {
-        let anchor = CGRect(x: quartz.x, y: quartz.y, width: 1.0, height: 1.0)
-        guard let screen = screenContaining(anchor,
-                                            primaryHeight: primaryHeight) else {
-            return nil
-        }
-        let visible = quartzRect(fromAppKit: screen.visibleFrame,
-                                 primaryHeight: primaryHeight)
-        func clamped(_ rect: CGRect) -> CGRect {
-            var frame = rect
-            frame.origin.x = min(max(frame.origin.x, visible.minX + 4.0),
-                                 visible.maxX - size.width - 4.0)
-            frame.origin.y = min(max(frame.origin.y, visible.minY + 4.0),
-                                 visible.maxY - size.height - 4.0)
-            return frame
-        }
-        var frame = clamped(CGRect(x: quartz.x + EyeModeSpec.offset,
-                                   y: quartz.y + EyeModeSpec.offset,
-                                   width: size.width,
-                                   height: size.height))
-        if frame.contains(quartz) {
-            frame = clamped(CGRect(x: quartz.x - EyeModeSpec.offset - size.width,
-                                   y: quartz.y - EyeModeSpec.offset - size.height,
-                                   width: size.width,
-                                   height: size.height))
-        }
-        return frame
-    }
-
-    private func positionEyeWindow(quartz: CGPoint, primaryHeight: CGFloat) {
-        guard let window = claimChipWindow else { return }
-        guard let frame = eyeFollowFrame(quartz: quartz,
-                                         size: claimChipSize(),
-                                         primaryHeight: primaryHeight) else {
-            return
-        }
-        let appKitFrame = appKitRect(fromQuartz: frame,
-                                     primaryHeight: primaryHeight)
-        if window.frame != appKitFrame {
-            window.setFrame(appKitFrame, display: false)
-            if let view = claimChipView {
-                view.frame = NSRect(origin: .zero, size: appKitFrame.size)
-                view.needsDisplay = true
-            }
-        }
-        window.orderFrontRegardless()
-    }
-
-    /// The read-out hangs at +16/+38 from the pointer: below the eye and clear
-    /// of the tested point, clamped into the same visible frame.
-    private func positionEyeLabel(quartz: CGPoint, primaryHeight: CGFloat) {
-        guard let window = eyeLabelWindow else { return }
-        let size = CGSize(width: EyeModeSpec.labelWidth,
-                          height: EyeModeSpec.labelHeight)
-        let anchor = CGRect(x: quartz.x, y: quartz.y, width: 1.0, height: 1.0)
-        guard let screen = screenContaining(anchor,
-                                            primaryHeight: primaryHeight) else {
-            return
-        }
-        let visible = quartzRect(fromAppKit: screen.visibleFrame,
-                                 primaryHeight: primaryHeight)
-        var frame = CGRect(x: quartz.x + EyeModeSpec.offset,
-                           y: quartz.y + EyeModeSpec.labelOffset,
-                           width: size.width,
-                           height: size.height)
-        frame.origin.x = min(max(frame.origin.x, visible.minX + 4.0),
-                             visible.maxX - frame.width - 4.0)
-        frame.origin.y = min(max(frame.origin.y, visible.minY + 4.0),
-                             visible.maxY - frame.height - 4.0)
-        if frame.contains(quartz) {
-            // Near an edge the clamp can land the pill ON the point under test,
-            // which would latch forever (our own window wins every hit-test).
-            // Mirror it above-left and clamp again.
-            frame = CGRect(x: quartz.x - EyeModeSpec.offset - size.width,
-                           y: quartz.y - EyeModeSpec.labelOffset - size.height,
-                           width: size.width,
-                           height: size.height)
-            frame.origin.x = min(max(frame.origin.x, visible.minX + 4.0),
-                                 visible.maxX - frame.width - 4.0)
-            frame.origin.y = min(max(frame.origin.y, visible.minY + 4.0),
-                                 visible.maxY - frame.height - 4.0)
-        }
-        let appKitFrame = appKitRect(fromQuartz: frame,
-                                     primaryHeight: primaryHeight)
-        if window.frame != appKitFrame {
-            window.setFrame(appKitFrame, display: true)
-        }
-        window.orderFrontRegardless()
-    }
-
-    /// The label is created with the mode and lives until it ends: creating a
-    /// window per descriptor would flash a frame at the origin.
-    private func ensureEyeLabel() {
-        guard eyeMode, eyeLabelWindow == nil else { return }
-        let size = CGSize(width: EyeModeSpec.labelWidth,
-                          height: EyeModeSpec.labelHeight)
-        let window = EyeLabelWindow(contentRect: NSRect(origin: .zero, size: size),
-                                    styleMask: [.borderless, .nonactivatingPanel],
-                                    backing: .buffered,
-                                    defer: false)
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.level = .statusBar
-        window.collectionBehavior = [.canJoinAllSpaces,
-                                     .stationary,
-                                     .fullScreenAuxiliary,
-                                     .ignoresCycle]
-        // A read-out, never a target: the click goes straight through to the
-        // control underneath.
-        window.ignoresMouseEvents = true
-        window.isMovable = false
-        window.isMovableByWindowBackground = false
-        window.isReleasedWhenClosed = false
-        window.acceptsMouseMovedEvents = false
-        window.hidesOnDeactivate = false
-
-        let view = EyeLabelView(frame: NSRect(origin: .zero, size: size))
-        view.autoresizingMask = [.width, .height]
-        view.text = "\u{2026}"
-        window.contentView = view
-        eyeLabelWindow = window
-        eyeLabelView = view
-        window.orderFrontRegardless()
-    }
-
-    private func updateEyeLabel() {
-        guard eyeMode, let view = eyeLabelView else { return }
-        if let descriptor = eyeLatchedDescriptor {
-            view.text = EyeLabelView.line(for: descriptor)
-        } else {
-            view.text = "\u{2026}"
-        }
-    }
-
-    private func dismissEyeLabel() {
-        if let window = eyeLabelWindow {
-            window.orderOut(nil)
-            window.close()
-        }
-        eyeLabelWindow = nil
-        eyeLabelView = nil
     }
 
     // MARK: System-wide summon hot key
@@ -6215,8 +6365,9 @@ private final class OverlayController {
         }
         isShuttingDown = true
         cancelPendingExit()
-        // Kill the eye's timer/monitors/label before anything else tears down.
-        disarmEyeMode()
+        // Kill INSPECT MODE's timers and screen-sized overlays before anything
+        // else tears down.
+        disarmInspectMode()
         watchdogTimer?.invalidate()
         watchdogTimer = nil
         activeRing = nil
