@@ -343,18 +343,90 @@ def _resolve_session_route(ctx, session_id: str) -> tuple[str | None, str | None
     return None, f"no gateway session route for {session_id}"
 
 
+def _spool_path() -> Path:
+    """The ask-field spool the companion appends to.
+
+    File-based on purpose: the companion lives behind a pipe owned by whichever
+    plugin host spawned it, and that handle has gone stale more than once (the
+    companion writes, nobody reads, no error anywhere). A file cannot lose its
+    reader.
+    """
+    return bp_paths.plugin_data_dir("butler") / "summon-spool.jsonl"
+
+
+def _spool_pending() -> dict[str, Any] | None:
+    """The newest unacknowledged ask-field request, or None."""
+    path = _spool_path()
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(row, dict) and row.get("id") and isinstance(row.get("text"), str):
+            if row["text"].strip():
+                return {
+                    "origin": "chip",
+                    "id": str(row["id"]),
+                    "text": row["text"],
+                    "at": row.get("at"),
+                }
+    return None
+
+
+def _spool_ack(pending_id: str) -> bool:
+    """Drop one row from the spool. Rewrites atomically; never raises."""
+    path = _spool_path()
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return False
+    kept: list[str] = []
+    removed = False
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(row, dict) and str(row.get("id")) == pending_id:
+            removed = True
+            continue
+        kept.append(line)
+    if not removed:
+        return False
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
 def _read_state() -> dict[str, Any]:
+    data: dict[str, Any] = {}
     for path in _state_candidates():
         if not path.exists():
             continue
         try:
             with open(path, encoding="utf-8") as f:
-                data = json.load(f)
+                state = json.load(f)
         except Exception:
             continue
-        if isinstance(data, dict):
-            return data
-    return {}
+        if isinstance(state, dict):
+            data = state
+            break
+    # The companion's ask field is a file spool, not a pipe event: merge the
+    # newest unacked row in so the desktop sees it through the same /state row
+    # it already polls.
+    if not data.get("summon_pending"):
+        spooled = _spool_pending()
+        if spooled is not None:
+            data["summon_pending"] = spooled
+    return data
 
 
 def _started_at_key(value: Any) -> float:
@@ -476,6 +548,10 @@ def summon_ack(body: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         logger.exception("butler summon ack failed")
         cleared = False
+    # The ask-field row lives in the file spool; clearing it is what stops the
+    # same text being sent twice.
+    if pending_id:
+        cleared = _spool_ack(pending_id) or cleared
     return {"ok": True, "cleared": bool(cleared)}
 
 

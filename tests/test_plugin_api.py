@@ -536,3 +536,37 @@ def test_cli_handler_prints_because_the_host_ignores_returned_strings() -> None:
     assert "print(" in body, "the payload must be printed, not returned"
     assert "return _json.dumps(" not in body, "a returned string is discarded"
     assert "return None" in body
+
+
+def test_ask_field_spool_becomes_the_state_row_and_the_ack_clears_it(
+        client: TestClient, tmp_path: Path) -> None:
+    """The companion's ask field is a file spool, not a pipe event.
+
+    A stale stdout handle once made every typed request vanish with no error, so
+    /state merges the newest spooled row and /summon/ack removes exactly that
+    row. This is the contract the desktop polls.
+    """
+    spool = bp_paths.plugin_data_dir("butler") / "summon-spool.jsonl"
+    spool.write_text(
+        '{"op":"summon_text","text":"older","id":"aaaa1111"}\n'
+        '{"op":"summon_text","text":"turn off dnd","id":"bbbb2222"}\n',
+        encoding="utf-8",
+    )
+
+    state = client.get("/state").json()
+    assert state["summon_pending"]["id"] == "bbbb2222"
+    assert state["summon_pending"]["text"] == "turn off dnd"
+    assert state["summon_pending"]["origin"] == "chip"
+
+    assert client.post("/summon/ack", json={"id": "bbbb2222"}).json()["cleared"] is True
+    remaining = spool.read_text(encoding="utf-8").splitlines()
+    assert len(remaining) == 1
+    assert "aaaa1111" in remaining[0]
+    # The older row is now the newest one and stays visible until acked.
+    assert client.get("/state").json()["summon_pending"]["text"] == "older"
+
+
+def test_a_row_with_blank_text_never_surfaces(client: TestClient) -> None:
+    spool = bp_paths.plugin_data_dir("butler") / "summon-spool.jsonl"
+    spool.write_text('{"op":"summon_text","text":"   ","id":"cccc3333"}\n', encoding="utf-8")
+    assert "summon_pending" not in client.get("/state").json()

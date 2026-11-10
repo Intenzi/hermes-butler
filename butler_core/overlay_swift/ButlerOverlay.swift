@@ -2848,9 +2848,32 @@ private final class OverlayController {
             closeSummonField(journal: nil)
             return
         }
+        // File spool first: the companion's stdout goes to whichever plugin host
+        // spawned it, and that pipe handle has gone stale in practice (write
+        // succeeds, nobody reads). The spool cannot lose its reader — the
+        // dashboard API merges it into /state and the desktop acks it.
+        appendSummonSpool(line)
         FileHandle.standardOutput.write(Data((line + "\n").utf8))
         chipJournal("ask-submit:\(text.count)chars")
         closeSummonField(journal: nil)
+    }
+
+    /// Append one request to the file spool the dashboard API reads.
+    /// Bounded to the last 50 rows so a never-acked request cannot grow the file.
+    private func appendSummonSpool(_ line: String) {
+        let dir = (NSHomeDirectory() as NSString)
+            .appendingPathComponent(".hermes/plugin-data/butler")
+        let path = (dir as NSString).appendingPathComponent("summon-spool.jsonl")
+        var rows = (try? String(contentsOfFile: path, encoding: .utf8))?
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init) ?? []
+        rows.append(line)
+        if rows.count > 50 {
+            rows.removeFirst(rows.count - 50)
+        }
+        try? (rows.joined(separator: "\n") + "\n").write(toFile: path,
+                                                        atomically: true,
+                                                        encoding: .utf8)
     }
 
     private func cancelSummonField() {
