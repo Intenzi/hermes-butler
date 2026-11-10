@@ -24,6 +24,14 @@
 //  Event lines the renderer writes to stdout (never a request response):
 //    {"op":"launcher_click"}
 //    {"op":"summon_text","text":"...","id":"a1b2c3d4","destination":"recent"}
+//    {"op":"look_text","text":"...","id":"a1b2c3d4","destination":"recent",
+//     "target":{"app":"Preview","role":"Button","label":"Export",
+//               "window":"receipt.pdf","doc":"file:///...","enabled":true,
+//               "box":[x,y,w,h]}}
+//
+//  Two global Carbon hot keys: ⌘⇧A opens the plain ask field, ⌘⇧L hit-tests the
+//  element under the cursor (AXUIElementCopyElementAtPosition on the system-wide
+//  element) and opens the same field in LOOK mode with that element as context.
 //
 //  The legacy {"op":"claim_click"} (text-less) event is no longer emitted by
 //  this renderer; the engine still accepts it for older companion binaries.
@@ -397,6 +405,186 @@ private func readAXFields(_ element: AXUIElement) -> AXFields {
         role = "unknown"
     }
     return AXFields(role: role, label: label, box: box)
+}
+
+// MARK: - LOOK hit-test (element under the cursor)
+
+/// One element the ⌘⇧L door is asking about. Every field is optional: an
+/// attribute the OS refused to read is simply absent from the wire payload
+/// (and from the one-line context), never sent as a null.
+private struct LookTarget {
+    var app: String?
+    var role: String?
+    var label: String?
+    var window: String?
+    var doc: String?
+    var enabled: Bool?
+    var box: [Int]?
+
+    /// `Button · "Export" — Preview`, with unread parts omitted.
+    var contextLine: String {
+        var head: [String] = []
+        if let role = role, !role.isEmpty { head.append(role) }
+        if let label = label, !label.isEmpty {
+            head.append("\u{201C}\(label)\u{201D}")
+        }
+        let joined = head.joined(separator: " \u{00B7} ")
+        if let app = app, !app.isEmpty {
+            return joined.isEmpty ? app : joined + " \u{2014} " + app
+        }
+        return joined
+    }
+
+    /// The `target` object. Keys that could not be read are omitted.
+    var payload: [String: Any] {
+        var object: [String: Any] = [:]
+        if let app = app, !app.isEmpty { object["app"] = app }
+        if let role = role, !role.isEmpty { object["role"] = role }
+        if let label = label, !label.isEmpty { object["label"] = label }
+        if let window = window, !window.isEmpty { object["window"] = window }
+        if let doc = doc, !doc.isEmpty { object["doc"] = doc }
+        if let enabled = enabled { object["enabled"] = enabled }
+        if let box = box, box.count == 4 { object["box"] = box }
+        return object
+    }
+}
+
+/// Trimmed non-empty string or nil: AX loves empty titles.
+private func axNonEmpty(_ value: String?) -> String? {
+    guard let value = value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+}
+
+/// The cursor in Quartz (top-left) space. `NSEvent.mouseLocation` is AppKit
+/// bottom-left global space; the primary screen's height flips it.
+private func cursorQuartzPoint() -> CGPoint? {
+    guard let primaryHeight = primaryScreenHeight() else { return nil }
+    let mouse = NSEvent.mouseLocation
+    guard mouse.x.isFinite, mouse.y.isFinite else { return nil }
+    return CGPoint(x: mouse.x, y: primaryHeight - mouse.y)
+}
+
+/// System-wide hit-test at a Quartz point. No new TCC grant: the companion's
+/// existing Accessibility trust covers `AXUIElementCreateSystemWide()`.
+private func axElementUnderCursor(_ point: CGPoint) -> AXUIElement? {
+    let systemWide = AXUIElementCreateSystemWide()
+    var element: AXUIElement?
+    let error = AXUIElementCopyElementAtPosition(systemWide,
+                                                 Float(point.x),
+                                                 Float(point.y),
+                                                 &element)
+    guard error == .success else { return nil }
+    return element
+}
+
+/// `AXButton` → `Button`; an exotic/unknown role is left alone.
+private func axRoleName(_ raw: String?) -> String? {
+    guard let raw = axNonEmpty(raw) else { return nil }
+    if raw.hasPrefix("AX"), raw.count > 2 {
+        return String(raw.dropFirst(2))
+    }
+    return raw
+}
+
+private func axEnabledAttribute(_ element: AXUIElement) -> Bool? {
+    guard let raw = copyAXAttribute(element, "AXEnabled") else { return nil }
+    let object = raw as AnyObject
+    guard CFGetTypeID(object) == CFBooleanGetTypeID(),
+          let number = object as? NSNumber else {
+        return nil
+    }
+    return number.boolValue
+}
+
+/// Window title + document URL from up to four parent hops, because the
+/// hit-tested control itself never carries either.
+private func axEnclosingWindow(_ element: AXUIElement) -> (window: String?, doc: String?) {
+    var windowTitle: String?
+    var document: String?
+    var current = element
+    for _ in 0..<4 {
+        guard let parent = axElement(from: copyAXAttribute(current, "AXParent")) else {
+            break
+        }
+        current = parent
+        let role = axString(current, "AXRole") ?? ""
+        if role == "AXWindow" || role == "AXDocument" {
+            if windowTitle == nil {
+                windowTitle = axNonEmpty(axString(current, "AXTitle"))
+                    ?? axNonEmpty(axString(current, "AXDescription"))
+            }
+            if document == nil {
+                document = axNonEmpty(axString(current, "AXDocument"))
+                    ?? axNonEmpty(axString(current, "AXURL"))
+            }
+        }
+        if windowTitle != nil && document != nil {
+            break
+        }
+    }
+    return (windowTitle, document)
+}
+
+/// AXPosition/AXSize as Quartz top-left whole points, rounded like the
+/// desktop's number formatter.
+private func axBoxAttribute(_ element: AXUIElement) -> [Int]? {
+    guard let rawPosition = copyAXAttribute(element, "AXPosition"),
+          let rawSize = copyAXAttribute(element, "AXSize") else {
+        return nil
+    }
+    let positionObject = rawPosition as AnyObject
+    let sizeObject = rawSize as AnyObject
+    guard CFGetTypeID(positionObject) == AXValueGetTypeID(),
+          CFGetTypeID(sizeObject) == AXValueGetTypeID() else {
+        return nil
+    }
+    let position: AXValue = unsafeBitCast(positionObject, to: AXValue.self)
+    let size: AXValue = unsafeBitCast(sizeObject, to: AXValue.self)
+    var point = CGPoint.zero
+    var dimensions = CGSize.zero
+    guard AXValueGetValue(position, .cgPoint, &point),
+          AXValueGetValue(size, .cgSize, &dimensions),
+          point.x.isFinite, point.y.isFinite,
+          dimensions.width.isFinite, dimensions.height.isFinite else {
+        return nil
+    }
+    return [Int(point.x.rounded()), Int(point.y.rounded()),
+            Int(dimensions.width.rounded()), Int(dimensions.height.rounded())]
+}
+
+/// Hit-test the cursor and compose the LOOK context + target. When AX has no
+/// element (or no screen height) it falls back to the frontmost app's window,
+/// so ⌘⇧L still opens instead of failing silently.
+private func axLookTargetUnderCursor() -> (context: String, target: LookTarget) {
+    let frontmost = axNonEmpty(NSWorkspace.shared.frontmostApplication?.localizedName)
+    guard let point = cursorQuartzPoint(),
+          let element = axElementUnderCursor(point) else {
+        return ("Window: " + (frontmost ?? "unknown"),
+                LookTarget(app: frontmost))
+    }
+    let fields = readAXFields(element)
+    let role = axRoleName(fields.role == "unknown" ? nil : fields.role)
+    let label = axNonEmpty(fields.label)
+    var app: String?
+    var pid: pid_t = 0
+    if AXUIElementGetPid(element, &pid) == .success, pid > 0 {
+        app = axNonEmpty(NSRunningApplication(processIdentifier: pid)?.localizedName)
+    }
+    if app == nil { app = frontmost }
+    let enclosing = axEnclosingWindow(element)
+    let target = LookTarget(app: app,
+                            role: role,
+                            label: label,
+                            window: enclosing.window,
+                            doc: enclosing.doc,
+                            enabled: axEnabledAttribute(element),
+                            box: axBoxAttribute(element))
+    var context = target.contextLine
+    if context.isEmpty {
+        context = "Window: " + (enclosing.window ?? app ?? frontmost ?? "unknown")
+    }
+    return (context, target)
 }
 
 private func walkAX(_ element: AXUIElement,
@@ -1424,8 +1612,15 @@ private enum SummonDestination: String {
 private final class SummonFieldView: NSView, NSTextFieldDelegate {
     static let fieldWidth: CGFloat = 280.0
     static let fieldHeight: CGFloat = 34.0
+    /// LOOK mode adds a muted target line above the input, so the same pill
+    /// gets one extra 18 pt row.
+    static let lookFieldHeight: CGFloat = 52.0
     private static let inset: CGFloat = 12.0
     private static let textHeight: CGFloat = 22.0
+    private static let contextHeight: CGFloat = 14.0
+    /// 4 (top) + 14 (line) = the 18 pt row LOOK adds above the 34 pt input
+    /// band, so the context never dips into the input row.
+    private static let contextTopInset: CGFloat = 4.0
     /// Room reserved at the right of the pill for the inline destination hint.
     private static let hintWidth: CGFloat = 58.0
     private static let hintGap: CGFloat = 6.0
@@ -1435,8 +1630,17 @@ private final class SummonFieldView: NSView, NSTextFieldDelegate {
     /// The discoverable half of the ⌘↵ choice: a muted, right-aligned label.
     /// A label is never editable or focusable, so it cannot steal the caret.
     let hint = NSTextField(labelWithString: "⌘↵ new")
+    /// The muted one-line "what is under the cursor" above the input. Hidden
+    /// for the plain ask door so the box keeps its exact 34 pt shape.
+    private let contextLabel = NSTextField(labelWithString: "")
+    private(set) var lookContext: String?
     var onSubmit: ((String, SummonDestination) -> Void)?
     var onCancel: (() -> Void)?
+
+    /// Window height for a door: LOOK needs the extra context row.
+    static func height(forLook look: Bool) -> CGFloat {
+        return look ? lookFieldHeight : fieldHeight
+    }
     /// One Return press can arrive twice (key equivalent, then command
     /// selector). The first delivery wins; a double send is a bug.
     private var submitInFlight = false
@@ -1477,6 +1681,44 @@ private final class SummonFieldView: NSView, NSTextFieldDelegate {
         hint.refusesFirstResponder = true
         hint.setAccessibilityLabel("Command-Return starts a new Butler chat")
         addSubview(hint)
+
+        // Same muted 10.5 pt treatment as the destination hint; a label can
+        // never take the caret away from the input.
+        contextLabel.font = NSFont.systemFont(ofSize: 10.5)
+        contextLabel.textColor = NSColor.white.withAlphaComponent(0.55)
+        contextLabel.alignment = .left
+        contextLabel.lineBreakMode = .byTruncatingTail
+        contextLabel.usesSingleLineMode = true
+        contextLabel.cell?.lineBreakMode = .byTruncatingTail
+        contextLabel.cell?.usesSingleLineMode = true
+        contextLabel.isEditable = false
+        contextLabel.isSelectable = false
+        contextLabel.isBezeled = false
+        contextLabel.isBordered = false
+        contextLabel.drawsBackground = false
+        contextLabel.focusRingType = .none
+        contextLabel.refusesFirstResponder = true
+        contextLabel.isHidden = true
+        contextLabel.setAccessibilityLabel("Look context")
+        addSubview(contextLabel)
+    }
+
+    /// Switch the box into LOOK mode (a non-nil context) or back to the plain
+    /// ask door. The placeholder is the contract the user sees.
+    func configureForLook(context: String?) {
+        lookContext = context
+        if let context = context {
+            contextLabel.stringValue = context
+            contextLabel.isHidden = false
+            field.placeholderString = "Ask about this…"
+            field.setAccessibilityLabel("Ask about this control")
+        } else {
+            contextLabel.stringValue = ""
+            contextLabel.isHidden = true
+            field.placeholderString = "Ask the butler…"
+            field.setAccessibilityLabel("Ask the butler")
+        }
+        needsLayout = true
     }
 
     @available(*, unavailable)
@@ -1497,8 +1739,23 @@ private final class SummonFieldView: NSView, NSTextFieldDelegate {
                             height: SummonFieldView.hintHeight)
         // The input keeps its placeholder but yields room to the hint.
         let inputWidth = hintX - SummonFieldView.hintGap - SummonFieldView.inset
+        // LOOK keeps the input on the 34 pt bottom row and paints the context
+        // line above it; the plain door stays vertically centred.
+        let inputY = lookContext == nil
+            ? (bounds.height - SummonFieldView.textHeight) / 2.0
+            : (SummonFieldView.fieldHeight - SummonFieldView.textHeight) / 2.0
+        if lookContext != nil {
+            contextLabel.frame = NSRect(
+                x: SummonFieldView.inset,
+                y: bounds.height - SummonFieldView.contextTopInset
+                    - SummonFieldView.contextHeight,
+                width: max(0.0, bounds.width - SummonFieldView.inset * 2.0),
+                height: SummonFieldView.contextHeight)
+        } else {
+            contextLabel.frame = .zero
+        }
         field.frame = NSRect(x: SummonFieldView.inset,
-                             y: (bounds.height - SummonFieldView.textHeight) / 2.0,
+                             y: inputY,
                              width: max(0.0, inputWidth),
                              height: SummonFieldView.textHeight)
     }
@@ -1917,6 +2174,12 @@ private final class OverlayController {
     /// activated itself), re-activated once the field closes.
     private var summonFieldReturnApp: NSRunningApplication?
     private let summonFieldGap: CGFloat = 8.0
+    /// Set by the ⌘⇧L door just before `openSummonField()` raises the same box
+    /// in LOOK mode; consumed and cleared by that call.
+    private var pendingLookContext: String?
+    private var pendingLookTarget: LookTarget?
+    /// The element the open field is asking about, or nil for the plain door.
+    private var summonFieldLookTarget: LookTarget?
     // AX notifications replace the 0.5 s reposition poll while the chip is
     // armed: the Hermes pop-out posts ~17 ms AXWindowMoved events during a
     // drag (a probe logged 86 in one drag, each with live AXPosition/AXSize).
@@ -1991,6 +2254,8 @@ private final class OverlayController {
     /// extra TCC grant.
     private var summonHotKeyRef: EventHotKeyRef?
     private var summonHotKeyHandler: EventHandlerRef?
+    /// The second door: ⌘⇧L hit-tests the cursor and opens LOOK mode.
+    private var lookHotKeyRef: EventHotKeyRef?
     private var watchdogTimer: Timer?
     private var lastOpUptime: TimeInterval = 0.0
 
@@ -2010,6 +2275,7 @@ private final class OverlayController {
         lastOpUptime = ProcessInfo.processInfo.systemUptime
         observeEnvironment()
         installSummonHotKey()
+        installLookHotKey()
         startWatchdog()
         let thread = Thread { [weak self] in
             self?.readStdin()
@@ -2770,18 +3036,20 @@ private final class OverlayController {
 
     private func toggleSummonField() {
         if summonFieldOpen {
-            closeSummonField(journal: "ask-cancel")
+            let event = summonFieldLookTarget != nil ? "look-cancel" : "ask-cancel"
+            closeSummonField(journal: event)
         } else {
             openSummonField()
         }
     }
 
     /// A 280x34 box: centred on the chip and 8 pt above it when the chip is
-    /// visible, otherwise centred under the pet's sprite box. Clamped fully on
-    /// screen exactly like `claimChipFrame`.
-    private func summonFieldFrame(primaryHeight: CGFloat) -> CGRect? {
+    /// visible, otherwise centred under the pet's sprite box. LOOK passes its
+    /// taller height. Clamped fully on screen exactly like `claimChipFrame`.
+    private func summonFieldFrame(primaryHeight: CGFloat,
+                                  fieldHeight: CGFloat = SummonFieldView.fieldHeight) -> CGRect? {
         let size = CGSize(width: SummonFieldView.fieldWidth,
-                          height: SummonFieldView.fieldHeight)
+                          height: fieldHeight)
         let anchor: CGRect
         let below: Bool
         if let chip = claimChipWindow, chip.isVisible {
@@ -2816,11 +3084,21 @@ private final class OverlayController {
     }
 
     private func openSummonField() {
+        // Consume LOOK state before ANY guard: an aborted open must never leave
+        // a queued element behind for the next hat tap to inherit.
+        let lookContext = pendingLookContext
+        let lookTarget = pendingLookTarget
+        pendingLookContext = nil
+        pendingLookTarget = nil
         guard !isShuttingDown, !summonFieldOpen else {
             return
         }
+        // LOOK mode is queued by openLookField(); the plain doors leave these
+        // nil and get today's behaviour unchanged.
+        let fieldHeight = SummonFieldView.height(forLook: lookContext != nil)
         guard let primaryHeight = primaryScreenHeight(),
-              let frame = summonFieldFrame(primaryHeight: primaryHeight) else {
+              let frame = summonFieldFrame(primaryHeight: primaryHeight,
+                                           fieldHeight: fieldHeight) else {
             chipJournal("ask-open-failed")
             return
         }
@@ -2855,8 +3133,14 @@ private final class OverlayController {
         let view = SummonFieldView(frame: NSRect(origin: .zero,
                                                  size: appKitFrame.size))
         view.autoresizingMask = [.width, .height]
+        view.configureForLook(context: lookContext)
         view.onSubmit = { [weak self] text, destination in
-            self?.submitSummonText(text, destination: destination)
+            guard let self = self else { return }
+            if let target = self.summonFieldLookTarget {
+                self.submitLookText(text, destination: destination, target: target)
+            } else {
+                self.submitSummonText(text, destination: destination)
+            }
         }
         view.onCancel = { [weak self] in
             self?.cancelSummonField()
@@ -2871,6 +3155,7 @@ private final class OverlayController {
         summonFieldWindow = window
         summonFieldView = view
         summonFieldOpen = true
+        summonFieldLookTarget = lookContext != nil ? (lookTarget ?? LookTarget()) : nil
         window.orderFrontRegardless()
         // Our own panel takes key focus. This is deliberately NOT the Hermes
         // window: the companion becomes the active app just long enough to
@@ -2899,6 +3184,9 @@ private final class OverlayController {
         }
         summonFieldWindow = nil
         summonFieldView = nil
+        summonFieldLookTarget = nil
+        pendingLookContext = nil
+        pendingLookTarget = nil
         if let event = event {
             chipJournal(event)
         }
@@ -2909,6 +3197,18 @@ private final class OverlayController {
         if restoreFocus && !isShuttingDown {
             restoreFrontmostApp(returnApp)
         }
+    }
+
+    /// ⌘⇧L: hit-test the cursor once, then raise the SAME ask box in LOOK mode.
+    /// The element is captured now, before the field steals focus.
+    private func openLookField() {
+        guard !isShuttingDown, !summonFieldOpen else {
+            return
+        }
+        let hit = axLookTargetUnderCursor()
+        pendingLookContext = hit.context
+        pendingLookTarget = hit.target
+        openSummonField()
     }
 
     private func submitSummonText(_ raw: String,
@@ -2944,6 +3244,36 @@ private final class OverlayController {
         closeSummonField(journal: nil)
     }
 
+    /// LOOK submit: the question plus the element context the hit-test found.
+    /// Same one-line protocol and the same file spool as the ask field.
+    private func submitLookText(_ raw: String,
+                                destination: SummonDestination,
+                                target: LookTarget) {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            closeSummonField(journal: "look-cancel")
+            return
+        }
+        let payload: [String: Any] = [
+            "op": "look_text",
+            "text": text,
+            "id": String(format: "%08x", arc4random()),
+            "destination": destination.rawValue,
+            "target": target.payload
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload,
+                                                     options: []),
+              let line = String(data: data, encoding: .utf8) else {
+            chipJournal("look-submit-failed")
+            closeSummonField(journal: nil)
+            return
+        }
+        appendSummonSpool(line)
+        FileHandle.standardOutput.write(Data((line + "\n").utf8))
+        chipJournal("look-submit:\(text.count)chars")
+        closeSummonField(journal: nil)
+    }
+
     /// Append one request to the file spool the dashboard API reads.
     /// Bounded to the last 50 rows so a never-acked request cannot grow the file.
     private func appendSummonSpool(_ line: String) {
@@ -2966,7 +3296,8 @@ private final class OverlayController {
         guard summonFieldOpen else {
             return
         }
-        closeSummonField(journal: "ask-cancel")
+        let event = summonFieldLookTarget != nil ? "look-cancel" : "ask-cancel"
+        closeSummonField(journal: event)
     }
 
     private func summonFieldResignedKey() {
@@ -2979,7 +3310,8 @@ private final class OverlayController {
         if let chip = claimChipWindow, NSApp.keyWindow === chip {
             return
         }
-        closeSummonField(journal: "ask-cancel", restoreFocus: false)
+        let event = summonFieldLookTarget != nil ? "look-cancel" : "ask-cancel"
+        closeSummonField(journal: event, restoreFocus: false)
     }
 
     /// Hand focus back to the app the user was in before the field opened.
@@ -2999,23 +3331,41 @@ private final class OverlayController {
 
     // MARK: System-wide summon hot key
 
-    /// Register ⌘⇧A with Carbon so it works from any app. The desktop keybind
-    /// stays as the in-app path; when Hermes is already frontmost this handler
-    /// steps aside so the two never double-open the bar.
-    private func installSummonHotKey() {
-        guard summonHotKeyRef == nil else {
-            return
+    /// One Carbon handler for both doors. The event carries the hot key id, so
+    /// id 1 (⌘⇧A sum) and id 2 (⌘⇧L look) stay distinguishable without a
+    /// second event target.
+    private func installHotKeyHandlerIfNeeded() -> Bool {
+        if summonHotKeyHandler != nil {
+            return true
         }
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                       eventKind: UInt32(kEventHotKeyPressed))
-        let handler: EventHandlerUPP = { _, _, userData in
-            guard let userData = userData else {
+        let handler: EventHandlerUPP = { _, event, userData in
+            guard let event = event, let userData = userData else {
                 return noErr
             }
-            Unmanaged<OverlayController>
+            var hotKeyID = EventHotKeyID()
+            let status = GetEventParameter(event,
+                                           EventParamName(kEventParamDirectObject),
+                                           EventParamType(typeEventHotKeyID),
+                                           nil,
+                                           MemoryLayout<EventHotKeyID>.size,
+                                           nil,
+                                           &hotKeyID)
+            guard status == noErr else {
+                return noErr
+            }
+            let controller = Unmanaged<OverlayController>
                 .fromOpaque(userData)
                 .takeUnretainedValue()
-                .summonHotKeyFired()
+            switch hotKeyID.id {
+            case 1:
+                controller.summonHotKeyFired()
+            case 2:
+                controller.lookHotKeyFired()
+            default:
+                break
+            }
             return noErr
         }
         let installed = InstallEventHandler(GetApplicationEventTarget(),
@@ -3026,6 +3376,19 @@ private final class OverlayController {
                                             &summonHotKeyHandler)
         guard installed == noErr else {
             chipJournal("hotkey-handler-failed:\(installed)")
+            return false
+        }
+        return true
+    }
+
+    /// Register ⌘⇧A with Carbon so it works from any app. The desktop keybind
+    /// stays as the in-app path; when Hermes is already frontmost this handler
+    /// steps aside so the two never double-open the bar.
+    private func installSummonHotKey() {
+        guard summonHotKeyRef == nil else {
+            return
+        }
+        guard installHotKeyHandlerIfNeeded() else {
             return
         }
         let hotKeyID = EventHotKeyID(signature: OSType(0x42544C52), id: 1)  // 'BTLR'
@@ -3045,7 +3408,37 @@ private final class OverlayController {
         chipJournal("hotkey-installed")
     }
 
+    /// The second door: ⌘⇧L asks about the thing under the cursor. Reuses the
+    /// shared handler, registers its own id 2 and its own failure journal so a
+    /// chord stolen by another app is diagnosable.
+    private func installLookHotKey() {
+        guard lookHotKeyRef == nil else {
+            return
+        }
+        guard installHotKeyHandlerIfNeeded() else {
+            chipJournal("look-hotkey-failed:no-handler")
+            return
+        }
+        let hotKeyID = EventHotKeyID(signature: OSType(0x42544C52), id: 2)  // 'BTLR'
+        let status = RegisterEventHotKey(UInt32(kVK_ANSI_L),
+                                         UInt32(cmdKey | shiftKey),
+                                         hotKeyID,
+                                         GetApplicationEventTarget(),
+                                         0,
+                                         &lookHotKeyRef)
+        if status != noErr {
+            lookHotKeyRef = nil
+            chipJournal("look-hotkey-failed:\(status)")
+            return
+        }
+        chipJournal("look-hotkey-installed")
+    }
+
     private func removeSummonHotKey() {
+        if let lookRef = lookHotKeyRef {
+            UnregisterEventHotKey(lookRef)
+        }
+        lookHotKeyRef = nil
         if let ref = summonHotKeyRef {
             UnregisterEventHotKey(ref)
         }
@@ -3073,6 +3466,21 @@ private final class OverlayController {
         // itself whenever the companion is not running.
         chipJournal("hotkey-fired")
         openSummonField()
+    }
+
+    /// ⌘⇧L: the LOOK door. A second press cancels the open field, exactly like
+    /// ⌘⇧A; otherwise it hit-tests the cursor and opens the context box.
+    private func lookHotKeyFired() {
+        guard !isShuttingDown else {
+            return
+        }
+        if summonFieldOpen {
+            let event = summonFieldLookTarget != nil ? "look-cancel" : "ask-cancel"
+            closeSummonField(journal: event)
+            return
+        }
+        chipJournal("look-open")
+        openLookField()
     }
 
     // MARK: Pet double

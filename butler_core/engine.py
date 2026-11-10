@@ -257,9 +257,11 @@ def _on_overlay_event(event):
     Two doors share this row. ``summon_text`` carries text typed in the local
     ask field, so the desktop posts it straight to the Butler chat and never
     opens its bar; its ``destination`` says whether that is the newest chat
-    (``recent``) or a freshly minted one (``new``). The legacy ``claim_click``
-    (older companion binaries) stays text-less and keeps the old "open the
-    bar" behaviour.
+    (``recent``) or a freshly minted one (``new``). ``look_text`` is the same
+    text row plus the element the ⌘⇧L hit-test found, so the desktop can frame
+    the question around that control. The legacy ``claim_click`` (older
+    companion binaries) stays text-less and keeps the old "open the bar"
+    behaviour.
     """
     global _summon_pending
     if not isinstance(event, dict):
@@ -284,6 +286,28 @@ def _on_overlay_event(event):
         }
         # Hop-level breadcrumb for support: companion → engine → desktop.
         bp_overlay.journal_click("engine-pending:text")
+        _write_state()
+        return
+    if op == "look_text":
+        text = event.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return
+        pending_id = event.get("id")
+        if not isinstance(pending_id, str) or not pending_id.strip():
+            pending_id = uuid.uuid4().hex[:8]
+        destination = "new" if event.get("destination") == "new" else "recent"
+        # The hit-tested element travels with the question so the desktop can
+        # frame the turn; keep every key the companion managed to read.
+        target = event.get("target")
+        _summon_pending = {
+            "origin": "look",
+            "id": pending_id.strip(),
+            "text": text,
+            "target": dict(target) if isinstance(target, dict) else {},
+            "destination": destination,
+            "at": time.time(),
+        }
+        bp_overlay.journal_click("engine-pending:look")
         _write_state()
         return
     if op != "claim_click":

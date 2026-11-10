@@ -4,6 +4,17 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 `plugin.yaml`.
 
+## [Unreleased]
+
+### Added
+
+- LOOK door: ⌘⇧L hit-tests the element under the cursor through the
+  system-wide Accessibility API and opens the ask field with that control as
+  context (`Button · "Export" — Preview`). Submitting sends the question plus
+  the app/role/label/window/box to the Butler chat without planning a guide.
+- `butler_look` tool: a live capture of the app a LOOK question named, so the
+  agent can answer with fresh neighbours without asking the user again.
+
 ## [0.2.0] - 2026-11-09
 
 ### Added

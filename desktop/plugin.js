@@ -1098,6 +1098,53 @@ function notifyChipSendFailure(result) {
   }
 }
 
+/**
+ * The turn a LOOK row posts to the Butler chat: the element the user pointed at
+ * (context first) and their question (second). Every part the companion could
+ * not read is omitted, never rendered as "undefined".
+ */
+function lookPendingText(pending) {
+  const row = pending && typeof pending === 'object' ? pending : {}
+  const target = row.target && typeof row.target === 'object' ? row.target : {}
+  const parts = []
+  const app = asText(target.app)
+  if (app) parts.push(`App: ${app}`)
+  const windowName = asText(target.window)
+  if (windowName) parts.push(`Window: ${windowName}`)
+  const control = []
+  const role = asText(target.role)
+  if (role) control.push(role)
+  const label = asText(target.label)
+  if (label) control.push(`"${label}"`)
+  if (typeof target.enabled === 'boolean') {
+    control.push(target.enabled ? '(enabled)' : '(disabled)')
+  }
+  const box = Array.isArray(target.box) && target.box.length === 4
+    ? target.box.map(value => {
+        const number = Number(value)
+        return Number.isFinite(number) ? String(Math.round(number)) : null
+      })
+    : null
+  if (box && box.every(value => value !== null)) {
+    control.push(`at ${box.join(',')}`)
+  }
+  if (control.length) parts.push(`Control: ${control.join(' ')}`)
+  const head = parts.length ? `[butler look] ${parts.join(' · ')}` : '[butler look]'
+  return `${head}\nQuestion: ${asText(row.text) || ''}`
+}
+
+function notifyLookAnswered() {
+  try {
+    host && host.notify && host.notify({
+      kind: 'success',
+      title: 'Butler',
+      message: 'Asked about that control'
+    })
+  } catch (err) {
+    // A missing toast surface must not break the send.
+  }
+}
+
 async function sendPendingSummonText(text, destination = 'recent') {
   const target = await resolveChipSendTarget(destination)
   if (!target) {
@@ -1146,6 +1193,8 @@ function ackSummonPending(pendingId) {
  * A row WITH text is the local ask field: the text is posted straight to the
  * Butler chat and the row acked — the bar never opens and Hermes is never
  * raised. Its `destination` ("new" or the default "recent") picks the chat.
+ * A row with `origin === "look"` is the ⌘⇧L door: the same in-place send, but
+ * the injected text names the control and app under the cursor first.
  * A row WITHOUT text is the legacy chip/marker click, which keeps opening the
  * bar exactly as before.
  *
@@ -1175,12 +1224,20 @@ function pollSummonPending() {
       // The ask field chooses per send: only an exact "new" mints a chat.
       const destination = asText(pending && pending.destination) === 'new'
         ? 'new' : 'recent'
+      // A LOOK row is a text row with an element attached: the bar never opens,
+      // and the injected turn leads with the control the user pointed at.
+      const isLook = asText(pending && pending.origin) === 'look'
+      const outgoing = isLook ? lookPendingText(pending) : text
       // Send in place. A failed send still acks: the text was typed once, and
       // retrying silently is worse than telling the user exactly why it failed.
-      return sendPendingSummonText(text, destination)
+      return sendPendingSummonText(outgoing, destination)
         .then(result => {
           if (result && result.ok) {
-            notifyChipSendSuccess(destination)
+            if (isLook) {
+              notifyLookAnswered()
+            } else {
+              notifyChipSendSuccess(destination)
+            }
           } else {
             notifyChipSendFailure(result)
           }

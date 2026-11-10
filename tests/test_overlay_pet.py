@@ -303,6 +303,24 @@ def test_summon_text_event_reaches_the_engine_callback() -> None:
     assert seen == [{"op": "summon_text", "text": "hi", "id": "abc"}]
 
 
+def test_look_text_event_reaches_the_engine_callback() -> None:
+    """⌘⇧L must take the same event door as the ask field, target included."""
+    controller = overlay.Overlay()
+    seen = []
+    controller.on_event = seen.append
+    message = {
+        "op": "look_text",
+        "text": "what is this?",
+        "id": "look1",
+        "destination": "recent",
+        "target": {"app": "Preview", "role": "Button", "label": "Export"},
+    }
+
+    controller._handle_message(message)
+
+    assert seen == [message]
+
+
 def test_reader_dispatches_click_events_and_queues_ax_responses() -> None:
     read_fd, write_fd = os.pipe()
     proc = _FakeProc()
@@ -782,6 +800,67 @@ def test_summon_works_outside_hermes_without_raising_the_window() -> None:
                                  "// MARK: In-place ask field")
     assert "toggleSummonField()" in click
     assert "emitSummon" not in click
+
+
+def test_look_hot_key_hit_tests_the_cursor_and_asks_about_that_element() -> None:
+    """⌘⇧L is a second door: point at a control, then type the question."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    # A second, distinguishable Carbon hot key (id 2 = ⌘⇧L, id 1 stays ⌘⇧A).
+    assert "EventHotKeyID(signature: OSType(0x42544C52), id: 2)" in source
+    assert "kVK_ANSI_L" in source
+    assert "GetEventParameter" in source
+    assert "kEventParamDirectObject" in source
+    assert "typeEventHotKeyID" in source
+    install = _swift_function_body(source, "private func installLookHotKey()",
+                                   "private func removeSummonHotKey()")
+    assert "RegisterEventHotKey" in install
+    assert '"look-hotkey-installed"' in install
+    assert '"look-hotkey-failed:' in install
+
+    # Hit-test the element under the cursor with the system-wide AX API.
+    assert "AXUIElementCreateSystemWide()" in source
+    assert "AXUIElementCopyElementAtPosition(" in source
+    assert "NSEvent.mouseLocation" in source
+    assert "AXUIElementGetPid(" in source
+    assert "AXEnabled" in source
+    assert "AXDocument" in source
+    assert "AXURL" in source
+    # The failed hit-test still opens LOOK, labelled with the frontmost app, and
+    # an element with no readable parts falls back to its enclosing window.
+    assert '"Window: " + (frontmost ?? "unknown")' in source
+    assert '"Window: " + (enclosing.window ?? app ?? frontmost ?? "unknown")' in source
+
+    # The one-line context: role without AX, quoted label, app name.
+    assert "lookContext" in source
+    assert "contextLine" in source
+    assert "func configureForLook(context:" in source
+    assert "Ask about this…" in source
+    assert "contextLabel.lineBreakMode = .byTruncatingTail" in source
+    assert "NSFont.systemFont(ofSize: 10.5)" in source
+    assert "static let lookFieldHeight: CGFloat = 52.0" in source
+
+    # The wire payload and its journal trail.
+    submit = _swift_function_body(source, "private func submitLookText(",
+                                  "private func appendSummonSpool(")
+    assert '"look_text"' in submit
+    assert '"target": target.payload' in submit
+    assert "JSONSerialization.data(withJSONObject: payload" in submit
+    assert "FileHandle.standardOutput.write" in submit
+    assert "appendSummonSpool(line)" in submit
+    assert '"look-submit:' in submit
+    assert '"look-open"' in source
+    assert '"look-cancel"' in source
+
+    # ⌘⇧L opens LOOK mode, never the plain ask path; ⌘⇧A still does.
+    look = _swift_function_body(source, "private func lookHotKeyFired()",
+                                "// MARK: Pet double")
+    assert "openLookField()" in look
+    assert "openSummonField()" not in look
+    opened = _swift_function_body(source, "private func openLookField()",
+                                  "private func submitSummonText(")
+    assert "axLookTargetUnderCursor()" in opened
+    assert "openSummonField()" in opened
 
 
 def test_summon_field_is_a_local_in_place_text_entry() -> None:

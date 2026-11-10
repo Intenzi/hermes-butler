@@ -8,6 +8,7 @@ the agent's one clarifying question) is a normal chat reply.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -85,6 +86,31 @@ def test_register_installs_the_butler_slash_command(tmp_path: Path) -> None:
     assert "chat" in command["description"].lower()
     assert callable(command["handler"])
     assert plugin.get_plugin_context() is ctx
+
+
+def test_register_installs_butler_look_and_it_calls_the_capture_path(
+        tmp_path: Path, monkeypatch) -> None:
+    """The agent's LOOK tool re-captures the named app instead of re-asking."""
+    ctx = RegisterCtx(tmp_path)
+    plugin.register(ctx)
+
+    tool = next(row for row in ctx.tools if row["name"] == "butler_look")
+    assert "target" in tool["schema"]["properties"]
+    assert tool["schema"]["required"] == ["target"]
+
+    seen = {}
+
+    def fake_capture(**kwargs):
+        seen.update(kwargs)
+        return {"app": "Preview", "count": 1, "elements": [{"role": "AXButton"}]}
+
+    monkeypatch.setattr(plugin.bp_capture, "capture", fake_capture)
+    payload = json.loads(tool["handler"]({"target": "Preview"}))
+
+    assert payload["app"] == "Preview"
+    assert seen["target"] == "Preview"
+    assert seen["max_elements"] == 150
+    assert seen["depth"] == 10
 
 
 def test_registered_handler_injects_the_same_frame_and_returns_the_short_ack(
