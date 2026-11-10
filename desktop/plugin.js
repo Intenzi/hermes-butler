@@ -59,7 +59,11 @@ const BUTLER_PREVIOUS_TITLE = 'Butler (previous)'
 // content. Keep the ordered ids the butler has actually used and route by them;
 // a title match survives only as the legacy fallback below.
 const TRACKED_CHAT_IDS_KEY = 'butler.chat.ids'
-const TRACKED_CHAT_IDS_LIMIT = 12
+// Only the newest LIVE id is ever used. The two older entries exist for one
+// case: the user deletes the current butler chat, and falling back to the
+// previous one keeps continuity instead of minting a new chat behind their
+// back. More than that is untested surface, not resilience.
+const TRACKED_CHAT_IDS_LIMIT = 3
 // One page of session.list. Hitting this page boundary means the response may
 // be truncated, so absence from it is not confirmed absence.
 const SESSION_LIST_LIMIT = 200
