@@ -1623,3 +1623,270 @@ test('summon targets the NEWEST Butler chat when several share the title', async
   assert.deepEqual(opened, ['new-chat'])
   env.dispose()
 })
+
+// ----------------------------------------------------- tracked chat ids
+
+function trackedIds(storage) {
+  const raw = storage.values.get('butler.chat.ids')
+  return raw ? JSON.parse(raw) : []
+}
+
+function pendingTextRest(sends, { destination = 'recent' } = {}) {
+  return async (requestPath, opts) => {
+    if (requestPath === '/state') {
+      return {
+        summon_pending: {
+          id: `pending-${destination}`, text: 'keep the guide open', origin: 'chip', destination
+        }
+      }
+    }
+    if (requestPath === '/summon/send') {
+      sends.push({ text: opts.body.text, session_id: opts.body.session_id })
+      return { ok: true, session: opts.body.session_id }
+    }
+    if (requestPath === '/summon/ack') return { ok: true, cleared: true }
+    return {}
+  }
+}
+
+test('a tracked id is chosen even when NO chat still carries the Butler title', async () => {
+  // The reported failure: the gateway renamed the chat from its content, so the
+  // exact-title rule found nothing and every send created a new chat. The id is
+  // the identity and must win without any title match.
+  const storage = makeStorage({ 'butler.chat.ids': JSON.stringify(['chat-42']) })
+  const sends = []
+  const requests = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      requests.push({ method, params })
+      if (method === 'session.list') {
+        return [{ id: 'chat-42', title: 'Fixing the wifi', updated_at: 900 }]
+      }
+      throw new Error(`unexpected request ${method}: ${JSON.stringify(params)}`)
+    }
+  })
+  const env = await loadPlugin({
+    host, rest: pendingTextRest(sends), document: makeDocument(), storage
+  })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  assert.deepEqual(sends, [{ text: 'keep the guide open', session_id: 'chat-42' }])
+  assert.ok(!requests.some(entry => entry.method === 'session.create'),
+    'a renamed tracked chat must stop the create-every-send fallback')
+  assert.deepEqual(trackedIds(storage), ['chat-42'])
+  env.dispose()
+})
+
+test('tracked ids whose sessions are gone are skipped; the next tracked id wins', async () => {
+  const storage = makeStorage({
+    'butler.chat.ids': JSON.stringify(['gone-chat', 'alive-new', 'alive-old'])
+  })
+  const sends = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      if (method === 'session.list') {
+        // List order is irrelevant: the tracked order decides which chat is
+        // "recent", and a missing id is pruned only because it is confirmed absent.
+        return [
+          { id: 'alive-old', title: 'Older guide', updated_at: 10 },
+          { id: 'alive-new', title: 'Newer guide', updated_at: 900 }
+        ]
+      }
+      throw new Error(`unexpected request ${method}: ${JSON.stringify(params)}`)
+    }
+  })
+  const env = await loadPlugin({
+    host, rest: pendingTextRest(sends), document: makeDocument(), storage
+  })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  assert.deepEqual(sends, [{ text: 'keep the guide open', session_id: 'alive-new' }])
+  assert.deepEqual(trackedIds(storage), ['alive-new', 'alive-old'],
+    'the confirmed-absent id is pruned, the survivors keep their order')
+  env.dispose()
+})
+
+test('nothing tracked and no title creates, titles, remembers, and sends to the fresh id',
+  async () => {
+    const storage = makeStorage()
+    const sends = []
+    const titleCalls = []
+    const host = defaultHost({
+      request: async (method, params) => {
+        if (method === 'session.list') {
+          return [{ id: 'unrelated', title: 'An unrelated chat', updated_at: 5 }]
+        }
+        if (method === 'session.create') {
+          assert.equal(Object.keys(params || {}).length, 0, 'the create stays untitled')
+          return { session_id: 'runtime-fresh', stored_session_id: 'stored-fresh' }
+        }
+        if (method === 'session.title') {
+          titleCalls.push({ session_id: params.session_id, title: params.title })
+          return {}
+        }
+        throw new Error(`unexpected request ${method}: ${JSON.stringify(params)}`)
+      }
+    })
+    const env = await loadPlugin({
+      host, rest: pendingTextRest(sends), document: makeDocument(), storage
+    })
+
+    assert.equal(await env.api.pollSummonPending(), true)
+
+    assert.deepEqual(sends, [{ text: 'keep the guide open', session_id: 'stored-fresh' }])
+    assert.deepEqual(titleCalls, [{ session_id: 'runtime-fresh', title: 'Butler' }],
+      'only the fresh chat is titled; the unrelated chat is never renamed')
+    assert.deepEqual(trackedIds(storage), ['stored-fresh'],
+      'the routed stored id is remembered for the next send')
+    env.dispose()
+  })
+
+test('destination:"new" creates and prepends the fresh id to the tracked list', async () => {
+  const storage = makeStorage({
+    'butler.chat.ids': JSON.stringify(['tracked-old', 'tracked-older'])
+  })
+  const sends = []
+  const titleCalls = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      if (method === 'session.list') {
+        return [{ id: 'tracked-old', title: 'Butler', updated_at: 900 }]
+      }
+      if (method === 'session.create') {
+        return { session_id: 'runtime-new', stored_session_id: 'stored-new' }
+      }
+      if (method === 'session.title') {
+        titleCalls.push({ session_id: params.session_id, title: params.title })
+        return {}
+      }
+      throw new Error(`unexpected request ${method}: ${JSON.stringify(params)}`)
+    }
+  })
+  const env = await loadPlugin({
+    host,
+    rest: pendingTextRest(sends, { destination: 'new' }),
+    document: makeDocument(),
+    storage
+  })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  assert.deepEqual(sends, [{ text: 'keep the guide open', session_id: 'stored-new' }])
+  assert.deepEqual(trackedIds(storage), ['stored-new', 'tracked-old', 'tracked-older'],
+    'the fresh id is newest, the old ids are untouched')
+  assert.deepEqual(titleCalls.at(-1), { session_id: 'runtime-new', title: 'Butler' })
+  env.dispose()
+})
+
+test('a failed session.list leaves the tracked list intact and still uses its newest id',
+  async () => {
+    const storage = makeStorage({
+      'butler.chat.ids': JSON.stringify(['tracked-only', 'tracked-older'])
+    })
+    const sends = []
+    const host = defaultHost({
+      request: async method => {
+        if (method === 'session.list') throw new Error('gateway list unavailable')
+        throw new Error(`unexpected request ${method}`)
+      }
+    })
+    const env = await loadPlugin({
+      host, rest: pendingTextRest(sends), document: makeDocument(), storage
+    })
+
+    assert.equal(await env.api.pollSummonPending(), true)
+
+    // A transient list failure cannot confirm absence, so nothing is pruned and
+    // no duplicate chat is minted; the newest known id still receives the send.
+    assert.deepEqual(sends, [{ text: 'keep the guide open', session_id: 'tracked-only' }])
+    assert.deepEqual(trackedIds(storage), ['tracked-only', 'tracked-older'])
+    env.dispose()
+  })
+
+test('the legacy exact-title chat is remembered once found', async () => {
+  // Rule 2: nothing tracked yet, but a chat still titled Butler. It is found by
+  // title once, verified through the session list, and remembered so the next
+  // send is id-first even after the gateway renames it.
+  const storage = makeStorage()
+  const sends = []
+  const requests = []
+  const host = defaultHost({
+    request: async method => {
+      requests.push(method)
+      if (method === 'session.list') {
+        return [{ id: 'legacy-butler', title: 'Butler', updated_at: 10 }]
+      }
+      throw new Error(`unexpected request ${method}`)
+    }
+  })
+  const env = await loadPlugin({
+    host, rest: pendingTextRest(sends), document: makeDocument(), storage
+  })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  assert.deepEqual(sends, [{ text: 'keep the guide open', session_id: 'legacy-butler' }])
+  assert.deepEqual(trackedIds(storage), ['legacy-butler'])
+  assert.ok(!requests.includes('session.create'))
+  env.dispose()
+})
+
+test('a full session.list page does not prune an id it may have truncated away', async () => {
+  // A 200-row page is the request limit: absence from it is not confirmed
+  // absence, so the stale front id survives instead of being erased.
+  const storage = makeStorage({
+    'butler.chat.ids': JSON.stringify(['maybe-on-page-2', 'alive-on-page-1'])
+  })
+  const sends = []
+  const rows = Array.from({ length: 200 }, (_, index) => ({
+    id: `filler-${index}`, title: `Chat ${index}`, updated_at: index
+  }))
+  rows[0] = { id: 'alive-on-page-1', title: 'A renamed Butler chat', updated_at: 900 }
+  const host = defaultHost({
+    request: async method => {
+      if (method === 'session.list') return rows
+      throw new Error(`unexpected request ${method}`)
+    }
+  })
+  const env = await loadPlugin({
+    host, rest: pendingTextRest(sends), document: makeDocument(), storage
+  })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  assert.deepEqual(sends, [{ text: 'keep the guide open', session_id: 'alive-on-page-1' }])
+  // The successful send marks the used id newest; the point is that the id the
+  // possibly-truncated page could not show was not erased.
+  assert.deepEqual(trackedIds(storage), ['alive-on-page-1', 'maybe-on-page-2'],
+    'a possibly truncated page must not be treated as a full inventory')
+  env.dispose()
+})
+
+test('a success-shaped session.list with no rows is not an empty inventory', async () => {
+  const storage = makeStorage({
+    'butler.chat.ids': JSON.stringify(['tracked-only'])
+  })
+  const sends = []
+  let listCalls = 0
+  const host = defaultHost({
+    request: async method => {
+      if (method === 'session.list') {
+        listCalls += 1
+        return { ok: true } // no `sessions`: an unreadable inventory shape
+      }
+      throw new Error(`unexpected request ${method}`)
+    }
+  })
+  const env = await loadPlugin({
+    host, rest: pendingTextRest(sends), document: makeDocument(), storage
+  })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  assert.equal(listCalls, 1)
+  assert.deepEqual(sends, [{ text: 'keep the guide open', session_id: 'tracked-only' }])
+  assert.deepEqual(trackedIds(storage), ['tracked-only'], 'an unusable response prunes nothing')
+  env.dispose()
+})
