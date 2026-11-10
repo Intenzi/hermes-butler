@@ -1086,3 +1086,28 @@ def test_summon_field_carries_the_destination_per_send() -> None:
     assert '"destination": destination.rawValue' in submit
     assert "destination: SummonDestination" in submit
     assert "ask-submit:\\(text.count)chars:\\(destination.rawValue)" in submit
+
+
+def test_look_reads_under_the_hat_and_click_then_asks_about_it() -> None:
+    """The drop must read the ELEMENT under the pointer, not our own chip.
+
+    Measured failure: at mouseUp the hat is the topmost window at the cursor, so
+    an immediate hit-test answered "Button · Ask butler — ButlerOverlay" wherever
+    the user dropped it. The window is parked off-screen and the hit-test runs on
+    the next run-loop turn; a click within the ask window then asks about THAT
+    element instead of opening a blank request.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    drop = _swift_function_body(source, "private func endLookDrag(at screenPoint: NSPoint)",
+                                "/// Place the card next to the drop point")
+    assert "-20000.0" in drop, "the hat must be parked off-screen before the hit-test"
+    assert "DispatchQueue.main.async" in drop, "the hit-test must run after the window server catches up"
+    assert "lastLookDescriptor = descriptor" in drop
+
+    click = _swift_function_body(source, "private func claimChipClicked()",
+                                 "// MARK: Pointer LOOK gesture")
+    assert "lastLookDescriptor" in click
+    assert "pendingLookTarget" in click
+    assert 'chipJournal("ask-about-look")' in click
+    assert "toggleSummonField()" in click, "a plain click with no recent look still opens the ask field"

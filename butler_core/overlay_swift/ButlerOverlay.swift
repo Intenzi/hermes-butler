@@ -2562,6 +2562,12 @@ private final class OverlayController {
     /// raises the same box in LOOK mode; consumed and cleared by that call.
     private var pendingLookContext: String?
     private var pendingLookTarget: LookTarget?
+    /// What the last drag read out. A hat click within `lookAskWindow` asks
+    /// about THAT element instead of starting a blank request, so the gesture
+    /// is "drag to see, click to ask about it".
+    private var lastLookDescriptor: LookDescriptor?
+    private var lastLookAt: Date?
+    private let lookAskWindow: TimeInterval = 90.0
     /// The element the open field is asking about, or nil for the plain door.
     private var summonFieldLookTarget: LookTarget?
     // AX notifications replace the 0.5 s reposition poll while the chip is
@@ -3431,6 +3437,29 @@ private final class OverlayController {
             chipJournal("click-skipped:disabled")
             return
         }
+        // Drag-to-look then click-to-ask: the element the user just dropped the
+        // hat on is the subject of the request, so they never have to describe
+        // what they are pointing at.
+        if let descriptor = lastLookDescriptor,
+           let at = lastLookAt,
+           Date().timeIntervalSince(at) < lookAskWindow,
+           !summonFieldOpen {
+            lastLookDescriptor = nil
+            lastLookAt = nil
+            let target = LookTarget(app: descriptor.app,
+                                    role: descriptor.role,
+                                    label: descriptor.label,
+                                    window: descriptor.window,
+                                    doc: descriptor.doc,
+                                    enabled: descriptor.enabled,
+                                    box: descriptor.box)
+            let line = target.contextLine
+            pendingLookContext = line.isEmpty ? nil : line
+            pendingLookTarget = line.isEmpty ? nil : target
+            chipJournal("ask-about-look")
+            openSummonField()
+            return
+        }
         toggleSummonField()
     }
 
@@ -3488,15 +3517,25 @@ private final class OverlayController {
             claimChipWindow?.orderFrontRegardless()
             return
         }
-        // The hat is sitting exactly under the cursor at mouseUp. Take it off
-        // screen BEFORE the hit-test or AX would answer with our own chip.
-        claimChipWindow?.orderOut(nil)
         let point = CGPoint(x: screenPoint.x,
                             y: primaryHeight - screenPoint.y)
-        let descriptor = lookElementDescriptor(at: point)
-        positionClaimChip()
-        claimChipWindow?.orderFrontRegardless()
-        presentLookCard(descriptor, at: point, primaryHeight: primaryHeight)
+        // The hat sits exactly under the cursor at mouseUp, and `orderOut` is
+        // applied by the window server on the NEXT pass — an immediate AX
+        // hit-test therefore still answered with our own chip ("Button · Ask
+        // butler"). Park the window off-screen, let the run loop turn, then
+        // hit-test what is really underneath.
+        if let window = claimChipWindow {
+            window.setFrameOrigin(NSPoint(x: -20000.0, y: -20000.0))
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let descriptor = lookElementDescriptor(at: point)
+            self.positionClaimChip()
+            self.claimChipWindow?.orderFrontRegardless()
+            self.lastLookDescriptor = descriptor
+            self.lastLookAt = Date()
+            self.presentLookCard(descriptor, at: point, primaryHeight: primaryHeight)
+        }
     }
 
     /// Place the card next to the drop point, flipped/clamped so it never sits
