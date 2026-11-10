@@ -570,3 +570,31 @@ def test_a_row_with_blank_text_never_surfaces(client: TestClient) -> None:
     spool = bp_paths.plugin_data_dir("butler") / "summon-spool.jsonl"
     spool.write_text('{"op":"summon_text","text":"   ","id":"cccc3333"}\n', encoding="utf-8")
     assert "summon_pending" not in client.get("/state").json()
+
+
+def test_the_spooled_destination_survives_the_state_row(client: TestClient) -> None:
+    """A row read from the file must behave exactly like the pipe event."""
+    spool = bp_paths.plugin_data_dir("butler") / "summon-spool.jsonl"
+    spool.write_text(
+        '{"op":"summon_text","text":"old","id":"dddd4444","destination":"recent"}\n'
+        '{"op":"summon_text","text":"fresh chat","id":"eeee5555","destination":"new"}\n',
+        encoding="utf-8",
+    )
+
+    assert client.get("/state").json()["summon_pending"] == {
+        "origin": "chip",
+        "id": "eeee5555",
+        "text": "fresh chat",
+        "destination": "new",
+        "at": None,
+    }
+
+    # Missing or unknown values collapse to the safe default.
+    spool.write_text('{"op":"summon_text","text":"default","id":"ffff6666"}\n',
+                     encoding="utf-8")
+    assert client.get("/state").json()["summon_pending"]["destination"] == "recent"
+    spool.write_text(
+        '{"op":"summon_text","text":"bogus","id":"gggg7777","destination":"cabinet"}\n',
+        encoding="utf-8",
+    )
+    assert client.get("/state").json()["summon_pending"]["destination"] == "recent"

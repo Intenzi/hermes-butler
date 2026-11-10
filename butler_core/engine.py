@@ -256,8 +256,10 @@ def _on_overlay_event(event):
 
     Two doors share this row. ``summon_text`` carries text typed in the local
     ask field, so the desktop posts it straight to the Butler chat and never
-    opens its bar. The legacy ``claim_click`` (older companion binaries) stays
-    text-less and keeps the old "open the bar" behaviour.
+    opens its bar; its ``destination`` says whether that is the newest chat
+    (``recent``) or a freshly minted one (``new``). The legacy ``claim_click``
+    (older companion binaries) stays text-less and keeps the old "open the
+    bar" behaviour.
     """
     global _summon_pending
     if not isinstance(event, dict):
@@ -270,10 +272,14 @@ def _on_overlay_event(event):
         pending_id = event.get("id")
         if not isinstance(pending_id, str) or not pending_id.strip():
             pending_id = uuid.uuid4().hex[:8]
+        # The ask field chooses per send: ⌘↵ starts a fresh chat, ↵ continues
+        # the newest one. Anything else is the safe default, never an error.
+        destination = "new" if event.get("destination") == "new" else "recent"
         _summon_pending = {
             "origin": "chip",
             "id": pending_id.strip(),
             "text": text,
+            "destination": destination,
             "at": time.time(),
         }
         # Hop-level breadcrumb for support: companion → engine → desktop.

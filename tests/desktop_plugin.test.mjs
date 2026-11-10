@@ -1341,6 +1341,163 @@ test('a text pending row sends to the newest Butler chat and never opens the bar
     env.dispose()
   })
 
+test('a destination:"new" row mints a fresh chat and posts to that id', async () => {
+  const statePayload = {
+    summon_pending: {
+      id: 'pending-new', text: 'start something new', origin: 'chip', destination: 'new'
+    }
+  }
+  const calls = []
+  const requests = []
+  const notifications = []
+  const rest = async (requestPath, opts) => {
+    calls.push({ path: requestPath, opts })
+    if (requestPath === '/state') return statePayload
+    if (requestPath === '/summon/send') return { ok: true, session: opts.body.session_id }
+    if (requestPath === '/summon/ack') return { ok: true, cleared: true }
+    return {}
+  }
+  const host = defaultHost({
+    request: async (method, opts) => {
+      requests.push({ method, opts })
+      if (method === 'session.list') {
+        return [
+          { id: 'old-chat', title: 'Butler', created_at: 10 },
+          { id: 'new-chat', title: 'Butler', created_at: 900 }
+        ]
+      }
+      // Untitled create first: a titled create would hand back the old chat.
+      if (method === 'session.create') {
+        // The opts object comes from the vm realm, so compare keys, not
+        // prototypes (deepStrictEqual would reject the foreign prototype).
+        assert.equal(Object.keys(opts).length, 0, 'create must be untitled')
+        return { session_id: 'fresh-runtime', stored_session_id: 'fresh-stored' }
+      }
+      if (method === 'session.title') return { ok: true }
+      if (method === 'session.activate') return { ok: true }
+      throw new Error(`unexpected request ${method}`)
+    },
+    openSession: async id => {
+      requests.push({ method: 'openSession', id })
+      return true
+    },
+    notify: payload => notifications.push(payload)
+  })
+  const env = await loadPlugin({ host, rest, document: makeDocument() })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+  const sends = calls.filter(call => call.path === '/summon/send')
+  assert.equal(sends.length, 1)
+  assert.equal(sends[0].opts.body.text, 'start something new')
+  assert.equal(sends[0].opts.body.session_id, 'fresh-stored',
+    'the send targets the freshly minted id, not either existing chat')
+  assert.ok(!sends.some(call => call.opts.body.session_id === 'new-chat'))
+  assert.ok(!sends.some(call => call.opts.body.session_id === 'old-chat'))
+
+  const creates = requests.filter(entry => entry.method === 'session.create')
+  assert.equal(creates.length, 1, 'a fresh chat is always minted')
+  // The title is claimed for the new chat after freeing it from the old ones.
+  const titles = requests.filter(entry => entry.method === 'session.title')
+  assert.deepEqual(
+    titles.map(entry => [entry.opts.session_id, entry.opts.title]).at(-1),
+    ['fresh-runtime', 'Butler'])
+  // The whole point of the field: no window may be raised.
+  assert.equal(requests.filter(entry => entry.method === 'session.activate').length, 0)
+  assert.equal(requests.filter(entry => entry.method === 'openSession').length, 0)
+
+  const acks = calls.filter(call => call.path === '/summon/ack')
+  assert.deepEqual(acks.map(call => call.opts.body.id), ['pending-new'])
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].kind, 'success')
+  assert.equal(notifications[0].message, 'Started a new Butler chat')
+
+  env.dispose()
+})
+
+test('a destination:"recent" row posts to the newest chat and never creates', async () => {
+  const statePayload = {
+    summon_pending: {
+      id: 'pending-recent', text: 'keep going', origin: 'chip', destination: 'recent'
+    }
+  }
+  const calls = []
+  const requests = []
+  const notifications = []
+  const rest = async (requestPath, opts) => {
+    calls.push({ path: requestPath, opts })
+    if (requestPath === '/state') return statePayload
+    if (requestPath === '/summon/send') return { ok: true, session: opts.body.session_id }
+    if (requestPath === '/summon/ack') return { ok: true, cleared: true }
+    return {}
+  }
+  const host = defaultHost({
+    request: async (method, opts) => {
+      requests.push({ method, opts })
+      if (method === 'session.list') {
+        return [
+          { id: 'old-chat', title: 'Butler', created_at: 10 },
+          { id: 'new-chat', title: 'Butler', created_at: 900 },
+          { id: 'other', title: 'Not Butler', created_at: 999 }
+        ]
+      }
+      throw new Error(`unexpected request ${method}`)
+    },
+    notify: payload => notifications.push(payload)
+  })
+  const env = await loadPlugin({ host, rest, document: makeDocument() })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  const sends = calls.filter(call => call.path === '/summon/send')
+  assert.equal(sends.length, 1)
+  assert.equal(sends[0].opts.body.session_id, 'new-chat')
+  assert.equal(requests.filter(entry => entry.method === 'session.create').length, 0,
+    'recent must never mint a chat while one exists')
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].message, 'Sent to Butler')
+
+  env.dispose()
+})
+
+test('a failed fresh-chat create reports session_create_failed and sends nothing',
+  async () => {
+    const statePayload = {
+      summon_pending: {
+        id: 'pending-no-create', text: 'do not fall back', destination: 'new'
+      }
+    }
+    const calls = []
+    const notifications = []
+    const rest = async (requestPath, opts) => {
+      calls.push({ path: requestPath, opts })
+      if (requestPath === '/state') return statePayload
+      if (requestPath === '/summon/ack') return { ok: true, cleared: true }
+      return {}
+    }
+    const host = defaultHost({
+      request: async method => {
+        if (method === 'session.list') return [{ id: 'new-chat', title: 'Butler' }]
+        if (method === 'session.create') throw new Error('gateway said no')
+        throw new Error(`unexpected request ${method}`)
+      },
+      notify: payload => notifications.push(payload)
+    })
+    const env = await loadPlugin({ host, rest, document: makeDocument() })
+
+    assert.equal(await env.api.pollSummonPending(), true)
+
+    assert.equal(calls.filter(call => call.path === '/summon/send').length, 0,
+      'a failed "new" must never silently use an existing chat')
+    assert.equal(notifications.length, 1)
+    assert.equal(notifications[0].kind, 'error')
+    assert.match(notifications[0].message, /session_create_failed/)
+    assert.deepEqual(
+      calls.filter(call => call.path === '/summon/ack').map(call => call.opts.body.id),
+      ['pending-no-create'])
+
+    env.dispose()
+  })
+
 test('a text-less pending row still opens the bar and posts no send', async () => {
   const calls = []
   const rest = async (requestPath, opts) => {

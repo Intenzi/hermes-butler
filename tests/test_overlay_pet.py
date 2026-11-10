@@ -852,3 +852,67 @@ def test_summon_field_is_a_local_in_place_text_entry() -> None:
     # Empty text closes without emitting.
     assert "closeSummonField(journal: \"ask-cancel\")" in submit
     assert "FileHandle.standardOutput.write" in submit
+
+
+def test_summon_field_carries_the_destination_per_send() -> None:
+    """↵ continues the newest chat, ⌘↵ starts a new one — chosen in the field."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    # One per-send enum, two values, no persistence.
+    assert "private enum SummonDestination: String" in source
+    destination = _swift_function_body(
+        source,
+        "private enum SummonDestination: String",
+        "/// The typing box that appears beside the pet.")
+    assert "case recent" in destination
+    assert "case new" in destination
+
+    view = _swift_function_body(source,
+                                "private final class SummonFieldView: NSView",
+                                "// MARK: - Pet sprite sheet")
+    # The hint is an inline label inside the same 280x34 box, discoverable
+    # without docs: muted, right-aligned, never editable or focusable.
+    assert "⌘↵ new" in view
+    assert 'NSTextField(labelWithString: "⌘↵ new")' in view
+    assert "hint.alignment = .right" in view
+    assert "NSFont.systemFont(ofSize: 10.5)" in view
+    assert "withAlphaComponent(0.55)" in view
+    assert "hint.isEditable = false" in view
+    assert "hint.isSelectable = false" in view
+    assert "hint.refusesFirstResponder = true" in view
+    # The input keeps its placeholder and yields width to the hint.
+    assert 'placeholderString = "Ask the butler…"' in view
+    assert "inputWidth" in view
+    assert "static let fieldWidth: CGFloat = 280.0" in view
+    assert "static let fieldHeight: CGFloat = 34.0" in view
+    # Return inspects the command modifier on the event ...
+    assert "NSApp.currentEvent?.modifierFlags.contains(.command)" in view
+    assert "insertNewline" in view
+    assert "insertNewlineIgnoringFieldEditor" in view
+    assert "emitSubmit(destination: commandHeld ? .new : .recent)" in view
+    # ... and a single press still emits once (key equivalent + selector).
+    assert "submitInFlight" in view
+    assert "resetSubmitGuard()" in view
+
+    window = _swift_function_body(
+        source,
+        "private final class SummonFieldWindow: NSWindow",
+        "private enum SummonDestination")
+    # The key-equivalent path: ⌘Return may reach the window before the field.
+    assert "override func performKeyEquivalent(with event: NSEvent) -> Bool" in window
+    assert "event.modifierFlags.contains(.command)" in window
+    assert "event.keyCode == 36" in window
+    assert "onCommandReturn?()" in window
+
+    opened = _swift_function_body(source, "private func openSummonField()",
+                                  "private func closeSummonField(")
+    assert "window.onCommandReturn" in opened
+    assert "emitSubmit(destination: .new)" in opened
+    assert "submitSummonText(text, destination: destination)" in opened
+
+    submit = _swift_function_body(source, "private func submitSummonText(",
+                                  "private func cancelSummonField(")
+    # The payload names the destination and the journal records it.
+    assert '"destination": destination.rawValue' in submit
+    assert "destination: SummonDestination" in submit
+    assert "ask-submit:\\(text.count)chars:\\(destination.rawValue)" in submit

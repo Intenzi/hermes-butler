@@ -23,7 +23,7 @@
 //
 //  Event lines the renderer writes to stdout (never a request response):
 //    {"op":"launcher_click"}
-//    {"op":"summon_text","text":"...","id":"a1b2c3d4"}
+//    {"op":"summon_text","text":"...","id":"a1b2c3d4","destination":"recent"}
 //
 //  The legacy {"op":"claim_click"} (text-less) event is no longer emitted by
 //  this renderer; the engine still accepts it for older companion binaries.
@@ -1382,6 +1382,10 @@ private final class SummonFieldWindow: NSWindow, NSWindowDelegate {
     /// Called when the panel loses key focus (click elsewhere, another app, or
     /// a Space switch). The controller closes the field without emitting.
     var onResignKey: (() -> Void)?
+    /// ⌘Return can arrive as a key equivalent before the field editor ever
+    /// turns it into `insertNewline:`. This is the second delivery path; the
+    /// view's own guard makes the two paths emit exactly one request.
+    var onCommandReturn: (() -> Void)?
 
     override var canBecomeKey: Bool {
         return true
@@ -1391,23 +1395,51 @@ private final class SummonFieldWindow: NSWindow, NSWindowDelegate {
         return false
     }
 
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command),
+           (event.keyCode == 36 || event.keyCode == 76) {
+            onCommandReturn?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
     func windowDidResignKey(_ notification: Notification) {
         onResignKey?()
     }
 }
 
+/// Which Butler chat a typed request goes to. The modifier held at Return time
+/// is the whole choice: per-send, never persisted.
+private enum SummonDestination: String {
+    case recent
+    case new
+}
+
 /// The typing box that appears beside the pet. Same dark fill and indigo border
 /// as the claim chip, one single-line `NSTextField`, Enter/Return to send and
-/// Escape to cancel.
+/// Escape to cancel. The destination is chosen inside the field: a muted
+/// `⌘↵ new` hint sits at its right edge, so ↵ continues the most recent Butler
+/// chat and ⌘↵ starts a fresh one without any second UI.
 private final class SummonFieldView: NSView, NSTextFieldDelegate {
     static let fieldWidth: CGFloat = 280.0
     static let fieldHeight: CGFloat = 34.0
     private static let inset: CGFloat = 12.0
     private static let textHeight: CGFloat = 22.0
+    /// Room reserved at the right of the pill for the inline destination hint.
+    private static let hintWidth: CGFloat = 58.0
+    private static let hintGap: CGFloat = 6.0
+    private static let hintHeight: CGFloat = 14.0
 
     let field = NSTextField(frame: .zero)
-    var onSubmit: ((String) -> Void)?
+    /// The discoverable half of the ⌘↵ choice: a muted, right-aligned label.
+    /// A label is never editable or focusable, so it cannot steal the caret.
+    let hint = NSTextField(labelWithString: "⌘↵ new")
+    var onSubmit: ((String, SummonDestination) -> Void)?
     var onCancel: (() -> Void)?
+    /// One Return press can arrive twice (key equivalent, then command
+    /// selector). The first delivery wins; a double send is a bug.
+    private var submitInFlight = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -1430,6 +1462,21 @@ private final class SummonFieldView: NSView, NSTextFieldDelegate {
         field.delegate = self
         field.setAccessibilityLabel("Ask the butler")
         addSubview(field)
+
+        // Muted ~55% white at 10.5 pt: visible when looked for, never competing
+        // with the placeholder.
+        hint.font = NSFont.systemFont(ofSize: 10.5)
+        hint.textColor = NSColor.white.withAlphaComponent(0.55)
+        hint.alignment = .right
+        hint.isEditable = false
+        hint.isSelectable = false
+        hint.isBezeled = false
+        hint.isBordered = false
+        hint.drawsBackground = false
+        hint.focusRingType = .none
+        hint.refusesFirstResponder = true
+        hint.setAccessibilityLabel("Command-Return starts a new Butler chat")
+        addSubview(hint)
     }
 
     @available(*, unavailable)
@@ -1443,9 +1490,16 @@ private final class SummonFieldView: NSView, NSTextFieldDelegate {
 
     override func layout() {
         super.layout()
+        let hintX = bounds.width - SummonFieldView.inset - SummonFieldView.hintWidth
+        hint.frame = NSRect(x: hintX,
+                            y: (bounds.height - SummonFieldView.hintHeight) / 2.0,
+                            width: SummonFieldView.hintWidth,
+                            height: SummonFieldView.hintHeight)
+        // The input keeps its placeholder but yields room to the hint.
+        let inputWidth = hintX - SummonFieldView.hintGap - SummonFieldView.inset
         field.frame = NSRect(x: SummonFieldView.inset,
                              y: (bounds.height - SummonFieldView.textHeight) / 2.0,
-                             width: max(0.0, bounds.width - SummonFieldView.inset * 2.0),
+                             width: max(0.0, inputWidth),
                              height: SummonFieldView.textHeight)
     }
 
@@ -1466,6 +1520,28 @@ private final class SummonFieldView: NSView, NSTextFieldDelegate {
         path.stroke()
     }
 
+    /// Emit at most one request per Return press. The first delivery wins, so a
+    /// ⌘Return that reached us both as a key equivalent and as a command
+    /// selector still sends exactly once.
+    @discardableResult
+    func emitSubmit(destination: SummonDestination) -> Bool {
+        guard !submitInFlight else {
+            return true
+        }
+        submitInFlight = true
+        onSubmit?(field.stringValue, destination)
+        return true
+    }
+
+    /// A fresh field (or new text) means the next Return is a new press.
+    private func resetSubmitGuard() {
+        submitInFlight = false
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        resetSubmitGuard()
+    }
+
     /// Return/Enter sends, Escape cancels. `doCommandBy` is the only place a
     /// single-line field reports those keys before they beep or end editing.
     func control(_ control: NSControl,
@@ -1473,7 +1549,10 @@ private final class SummonFieldView: NSView, NSTextFieldDelegate {
                  doCommandBy commandSelector: Selector) -> Bool {
         if commandSelector == #selector(NSResponder.insertNewline(_:))
             || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
-            onSubmit?(field.stringValue)
+            // The selector does not carry the modifier; the event that produced
+            // it does. ↵ continues the newest chat, ⌘↵ starts a fresh one.
+            let commandHeld = NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
+            emitSubmit(destination: commandHeld ? .new : .recent)
             return true
         }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
@@ -2776,11 +2855,16 @@ private final class OverlayController {
         let view = SummonFieldView(frame: NSRect(origin: .zero,
                                                  size: appKitFrame.size))
         view.autoresizingMask = [.width, .height]
-        view.onSubmit = { [weak self] text in
-            self?.submitSummonText(text)
+        view.onSubmit = { [weak self] text, destination in
+            self?.submitSummonText(text, destination: destination)
         }
         view.onCancel = { [weak self] in
             self?.cancelSummonField()
+        }
+        // The key-equivalent path for ⌘Return. The view's guard makes sure a
+        // press reported twice still emits one request.
+        window.onCommandReturn = { [weak view] in
+            _ = view?.emitSubmit(destination: .new)
         }
         window.contentView = view
 
@@ -2827,7 +2911,8 @@ private final class OverlayController {
         }
     }
 
-    private func submitSummonText(_ raw: String) {
+    private func submitSummonText(_ raw: String,
+                                  destination: SummonDestination) {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // Empty text is a cancel, not an empty request on the wire.
         guard !text.isEmpty else {
@@ -2837,7 +2922,8 @@ private final class OverlayController {
         let payload: [String: Any] = [
             "op": "summon_text",
             "text": text,
-            "id": String(format: "%08x", arc4random())
+            "id": String(format: "%08x", arc4random()),
+            "destination": destination.rawValue
         ]
         // Build the line with JSONSerialization: a quote or newline in the
         // request must never break the stdout protocol.
@@ -2854,7 +2940,7 @@ private final class OverlayController {
         // dashboard API merges it into /state and the desktop acks it.
         appendSummonSpool(line)
         FileHandle.standardOutput.write(Data((line + "\n").utf8))
-        chipJournal("ask-submit:\(text.count)chars")
+        chipJournal("ask-submit:\(text.count)chars:\(destination.rawValue)")
         closeSummonField(journal: nil)
     }
 

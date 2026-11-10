@@ -454,6 +454,31 @@ async function focusSession(row) {
 }
 
 /**
+ * Label a freshly minted id as the one "Butler" chat: release the display
+ * title from every prior titled chat, then claim it for the new id.
+ *
+ * `session.create` with a title is title-as-identity on the gateway (it
+ * resolves the EXISTING chat instead of minting one), so a new chat is always
+ * created untitled and titled only afterwards. Renames are cosmetic: ids
+ * route, titles label, and a refused rename never blocks a send.
+ */
+async function claimButlerTitle(target, runtimeId, previousSessions = []) {
+  const previous = asArray(previousSessions)
+    .slice()
+    .sort((a, b) => sessionStartedAt(a) - sessionStartedAt(b))
+  for (let index = 0; index < previous.length; index += 1) {
+    const oldId = sessionTargetId(previous[index])
+    if (!oldId || oldId === target) continue
+    await renameButlerTitle(oldId, previousButlerTitle(index))
+  }
+  if (runtimeId) {
+    // The untitled chat is still a valid destination if this fails; the title
+    // is cosmetic, the id is the route.
+    await renameButlerTitle(runtimeId, BUTLER_TITLE)
+  }
+}
+
+/**
  * Mint a genuinely new chat, then label it.
  *
  * `session.create` with a `title` is title-as-identity on the gateway: it
@@ -488,16 +513,7 @@ async function createButlerSession(previousSessions = []) {
   }
   // Free 'Butler' from every prior titled chat before claiming it. A failed
   // rename is not a send failure: the fresh id still owns the route.
-  for (let index = 0; index < previous.length; index += 1) {
-    const oldId = sessionTargetId(previous[index])
-    if (!oldId || oldId === target) continue
-    await renameButlerTitle(oldId, previousButlerTitle(index))
-  }
-  if (runtimeId) {
-    // The untitled chat is still a valid destination if this fails; the title
-    // is cosmetic, the id is the route.
-    await renameButlerTitle(runtimeId, BUTLER_TITLE)
-  }
+  await claimButlerTitle(target, runtimeId, previous)
   let lastError = null
   if (host && typeof host.openSession === 'function') {
     try {
@@ -889,13 +905,38 @@ function startClaimConfigPolling(ctx) {
   }
 }
 
-/** The Butler chat id an in-place chip send should target. Never focuses a window. */
-async function resolveChipSendTarget() {
+/**
+ * The Butler chat id an in-place chip send should target. Never focuses a
+ * window: the id is the whole answer, and that is the point of the field.
+ *
+ * "recent" is today's behaviour — the newest exact "Butler" chat, created only
+ * when none exists. "new" ALWAYS mints a fresh chat and never falls back to an
+ * existing one: when creation fails the caller reports `session_create_failed`
+ * and nothing is sent.
+ */
+async function resolveChipSendTarget(destination = 'recent') {
+  const wantsNew = destination === 'new'
+  if (!host || typeof host.request !== 'function') return null
   try {
+    if (wantsNew) {
+      // Mint untitled first, exactly like createButlerSession: a titled create
+      // would hand back the existing Butler chat instead of a fresh one.
+      const previous = await listButlerSessions()
+      const created = await host.request('session.create', {})
+      const runtimeId = asText(created && created.session_id)
+      const storedId = asText(created && created.stored_session_id) || runtimeId
+      const target = storedId || runtimeId
+      if (!target) return null
+      if (previous.some(row => sessionTargetId(row) === target)) {
+        // Defensive: an untitled create must never answer with a titled chat.
+        return null
+      }
+      await claimButlerTitle(target, runtimeId, previous)
+      return target
+    }
     const existing = mostRecentSession(await listButlerSessions())
     const existingId = sessionTargetId(existing)
     if (existingId) return existingId
-    if (!host || typeof host.request !== 'function') return null
     const created = await host.request('session.create', {})
     const id = asText(created && (created.session_id || created.stored_session_id || created.id))
     if (!id) return null
@@ -908,17 +949,17 @@ async function resolveChipSendTarget() {
     }
     return id
   } catch (err) {
-    // Creation/routing failed: report no_session rather than a half-send.
+    // Creation/routing failed: report no session rather than a half-send.
     return null
   }
 }
 
-function notifyChipSendSuccess() {
+function notifyChipSendSuccess(destination = 'recent') {
   try {
     host && host.notify && host.notify({
       kind: 'success',
       title: 'Butler',
-      message: 'Sent to Butler'
+      message: destination === 'new' ? 'Started a new Butler chat' : 'Sent to Butler'
     })
   } catch (err) {
     // A missing toast surface must not break the send.
@@ -939,16 +980,22 @@ function notifyChipSendFailure(result) {
   }
 }
 
-async function sendPendingSummonText(text) {
-  const target = await resolveChipSendTarget()
-  if (!target) return { ok: false, reason: 'no_session' }
+async function sendPendingSummonText(text, destination = 'recent') {
+  const target = await resolveChipSendTarget(destination)
+  if (!target) {
+    // "new" was asked for: never report a send that did not happen.
+    return {
+      ok: false,
+      reason: destination === 'new' ? 'session_create_failed' : 'no_session'
+    }
+  }
   try {
     const response = await rest('/summon/send', {
       method: 'POST',
       body: { text, session_id: target }
     })
     if (response && response.ok === true) {
-      return { ok: true, session_id: target }
+      return { ok: true, session_id: target, destination }
     }
     return {
       ok: false,
@@ -977,8 +1024,9 @@ function ackSummonPending(pendingId) {
  *
  * A row WITH text is the local ask field: the text is posted straight to the
  * Butler chat and the row acked — the bar never opens and Hermes is never
- * raised. A row WITHOUT text is the legacy chip/marker click, which keeps
- * opening the bar exactly as before.
+ * raised. Its `destination` ("new" or the default "recent") picks the chat.
+ * A row WITHOUT text is the legacy chip/marker click, which keeps opening the
+ * bar exactly as before.
  *
  * This runs at module scope because the SummonBar hook is unmounted on hosts
  * that never painted the titlebar slot (the live failure: the row sat for 12 s).
@@ -1003,12 +1051,15 @@ function pollSummonPending() {
         ackSummonPending(pendingId)
         return true
       }
+      // The ask field chooses per send: only an exact "new" mints a chat.
+      const destination = asText(pending && pending.destination) === 'new'
+        ? 'new' : 'recent'
       // Send in place. A failed send still acks: the text was typed once, and
       // retrying silently is worse than telling the user exactly why it failed.
-      return sendPendingSummonText(text)
+      return sendPendingSummonText(text, destination)
         .then(result => {
           if (result && result.ok) {
-            notifyChipSendSuccess()
+            notifyChipSendSuccess(destination)
           } else {
             notifyChipSendFailure(result)
           }

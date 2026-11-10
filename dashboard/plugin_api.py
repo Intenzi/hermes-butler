@@ -368,10 +368,14 @@ def _spool_pending() -> dict[str, Any] | None:
             continue
         if isinstance(row, dict) and row.get("id") and isinstance(row.get("text"), str):
             if row["text"].strip():
+                # Same contract as the engine's pipe event: only an exact
+                # "new" asks for a fresh chat; anything else is the default.
+                destination = "new" if row.get("destination") == "new" else "recent"
                 return {
                     "origin": "chip",
                     "id": str(row["id"]),
                     "text": row["text"],
+                    "destination": destination,
                     "at": row.get("at"),
                 }
     return None

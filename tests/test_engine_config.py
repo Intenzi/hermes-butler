@@ -92,6 +92,30 @@ def test_summon_text_sets_a_text_pending_row_for_the_desktop(
     assert snap["summon_pending"] == pending
 
 
+def test_summon_text_carries_the_ask_field_destination(
+        tmp_path: Path) -> None:
+    """⌘↵ asks for a fresh chat; every other value means the newest one."""
+    engine.init(tmp_path)
+    engine._summon_pending = None
+
+    engine._on_overlay_event(
+        {"op": "summon_text", "text": "start fresh", "id": "new1",
+         "destination": "new"})
+    assert engine.summon_pending()["destination"] == "new"
+    snap = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert snap["summon_pending"]["destination"] == "new"
+
+    # A missing or unknown value is the safe default, never an error.
+    engine._on_overlay_event(
+        {"op": "summon_text", "text": "continue", "id": "recent1"})
+    assert engine.summon_pending()["destination"] == "recent"
+
+    engine._on_overlay_event(
+        {"op": "summon_text", "text": "bogus", "id": "recent2",
+         "destination": "somewhere"})
+    assert engine.summon_pending()["destination"] == "recent"
+
+
 def test_summon_text_without_text_writes_no_row(tmp_path: Path) -> None:
     engine.init(tmp_path)
     engine._summon_pending = None
