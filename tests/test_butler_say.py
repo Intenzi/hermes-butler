@@ -78,7 +78,7 @@ def test_register_installs_butler_say_with_a_required_text_schema(tmp_path: Path
     assert tool["schema"]["required"] == ["text"]
     assert tool["schema"]["properties"]["text"]["type"] == "string"
     assert tool["toolset"] == "butler"
-    # The six-tool set stays discoverable after adding the answer tool.
+    # The tool set stays discoverable after adding the answer and watch tools.
     assert [row["name"] for row in ctx.tools] == [
         "butler_guide_start",
         "butler_guide_status",
@@ -86,6 +86,9 @@ def test_register_installs_butler_say_with_a_required_text_schema(tmp_path: Path
         "butler_look",
         "butler_say",
         "butler_stop",
+        "butler_watch_start",
+        "butler_watch_status",
+        "butler_watch_stop",
     ]
 
 

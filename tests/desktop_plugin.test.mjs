@@ -25,7 +25,7 @@ const INTERNALS = [
   'openFreshButlerSession', 'openButlerSession', 'createButlerSession', 'listButlerSessions',
   'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey', 'dismissSummonBar',
   'startSummonPendingPolling', 'pollSummonPending',
-  'petSpeechBeat', 'speakButlerAnswer'
+  'petSpeechBeat', 'speakButlerAnswer', 'petStatusLine', 'watchStatusLine'
 ]
 
 function makeDocument({
@@ -1147,6 +1147,32 @@ test('session key namespaces follow the gateway default-profile rule', async () 
     'agent:main:local:dm:local-abc')
   assert.equal(env.api.expectedSummonSessionKey('work', 'local-def'),
     'agent:work:local:dm:local-def')
+  env.dispose()
+})
+
+test('an active watch rides the pet line as a count, and the hit once fired', async () => {
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument()
+  })
+
+  assert.equal(env.api.petStatusLine({ watch: { app: 'Slack', events: 3 } }),
+    '⏲ Watch · Slack · 3 changes')
+  assert.equal(env.api.petStatusLine({ watch: { app: 'Slack', events: 1 } }),
+    '⏲ Watch · Slack · 1 change')
+  assert.equal(env.api.petStatusLine({
+    watch: { app: 'Slack', events: 9, hit: { label: 'Export complete' } }
+  }), '⏲ Watch · hit: Export complete')
+  // A stopped watch (app quit) is no longer a live status line.
+  assert.ok(!env.api.petStatusLine({
+    watch: { app: 'Slack', events: 9, stopped: { reason: 'app-quit' } }
+  }), 'a stopped watch drops the pet line')
+  // A live guide instruction outranks the ambient watch line.
+  assert.equal(env.api.petStatusLine({
+    status: 'running', instruction: 'Click Export',
+    watch: { app: 'Slack', events: 2 }
+  }), 'Click Export')
+  // No watch, no line: the ordinary idle/guide path is unchanged.
+  assert.ok(!env.api.petStatusLine({}))
   env.dispose()
 })
 

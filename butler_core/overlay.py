@@ -11,6 +11,8 @@ Protocol: one JSON line per op on stdin -
   {"op":"pet","frames_dir":"...","scale":0.33,"pet_enabled":true}
   {"op":"claim_chip","enabled":true}
   {"op":"claim_chip","enabled":true,"sprite_w":63,"sprite_h":69,"pad_bottom":24}
+  {"op":"watch_start","app":"Slack","until":"Export complete"}
+  {"op":"watch_stop"}
   {"op":"launcher"}
   {"op":"done"}
   {"op":"idle"}
@@ -22,6 +24,13 @@ The companion writes one event line on clickable mini-windows:
   {"op":"summon_text","text":"...","id":"a1b2c3d4"}
   {"op":"look_text","text":"...","id":"a1b2c3d4","destination":"recent",
    "target":{"app":"Preview","role":"Button","label":"Export","box":[1,2,3,4]}}
+
+Ambient WATCH lines (passive AX observation; never a click):
+  {"op":"watch-started","app":"Slack","until":"Export complete","pid":123}
+  {"op":"watch-event","seq":7,"at":...,"kind":"focus","app":"Slack",
+   "role":"AXTextArea","label":"message input","window":"general — Slack"}
+  {"op":"watch-hit","app":"Slack","until":"Export complete","label":"Export complete"}
+  {"op":"watch-stopped","events":12,"reason":"app-quit"}
 """
 import json
 import os
@@ -433,8 +442,8 @@ class Overlay:
     def _handle_message(self, message):
         if not isinstance(message, dict):
             return
-        if message.get("op") in ("claim_click", "launcher_click",
-                                 "summon_text", "look_text"):
+        op = message.get("op")
+        if op in ("claim_click", "launcher_click", "summon_text", "look_text"):
             callback = self.on_event
             journal_click("pipe-%s cb=%s" % (
                 message.get("op"), "set" if callable(callback) else "none"))
@@ -444,7 +453,32 @@ class Overlay:
                 except Exception:  # noqa: BLE001 - a click must never kill the pipe
                     pass
             return
+        # Ambient watch lines are unsolicited too, but they must never land in
+        # the request inbox: `watch_start` waits for its own ack, and a stream
+        # of focus/value events would starve it. They go straight to the
+        # engine's ring instead (no journal: an event is not a click).
+        if op in ("watch-event", "watch-hit", "watch-stopped"):
+            callback = self.on_event
+            if callable(callback):
+                try:
+                    callback(message)
+                except Exception:  # noqa: BLE001 - a bad event must not kill the pipe
+                    pass
+            return
         self._inbox.put(message)
+
+    def send(self, op):
+        """Fire-and-forget op: no reply is expected, nothing is awaited.
+
+        Used by the ambient watch's stop: the companion answers a stop with an
+        unsolicited `watch-stopped` line (routed to the event callback, not the
+        request inbox), so a `request()` here would sit out its whole timeout.
+        Never raises.
+        """
+        try:
+            self._send(op)
+        except Exception:  # noqa: BLE001
+            pass
 
     def request(self, op, timeout=5.0):
         """Send one op and return its single JSON response line, or None.

@@ -1161,6 +1161,53 @@ private func writeAXResponse(_ response: [String: Any]) {
     FileHandle.standardOutput.write(Data([0x0a]))
 }
 
+// MARK: - Ambient WATCH transport
+
+/// One JSON object per line for the watch protocol: `watch-event`, `watch-hit`,
+/// `watch-stopped`, and the synchronous `watch_start` reply.
+private func writeWatchLine(_ payload: [String: Any]) {
+    guard JSONSerialization.isValidJSONObject(payload),
+          let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
+        logStderr("butler-overlay: watch line encode failed")
+        return
+    }
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data([0x0a]))
+}
+
+/// A start rejection, carrying the producer's token when it sent one so a
+/// timed-out start's late reply can never answer a later watch_start.
+private func watchFailure(_ code: String, token: String?) -> [String: Any] {
+    var payload: [String: Any] = ["watch_error": code]
+    if let token = token {
+        payload["token"] = token
+    }
+    return payload
+}
+
+/// Coalescing contract: at most 4 watch-event lines per second, and an
+/// identical event (same kind/role/label/window/value) inside 150 ms is a
+/// duplicate. Both gates sit AFTER the condition check, so a real
+/// "Export complete" can never be rate-limited away.
+private let watchMaxEventsPerSecond = 4
+private let watchDuplicateWindow: TimeInterval = 0.15
+private let watchRateWindow: TimeInterval = 1.0
+private let watchLabelLimit = 120
+private let watchLivenessInterval: TimeInterval = 2.0
+
+/// C trampoline for the watched app, mirroring `petAXObserverCallback`: the
+/// controller is the refcon on every `AXObserverAddNotification`. The element
+/// is only valid during the call, so the work hops to the main queue.
+private let watchAXObserverCallback: AXObserverCallback = { _, element, notification, refcon in
+    guard let refcon = refcon else {
+        return
+    }
+    let controller = Unmanaged<OverlayController>
+        .fromOpaque(refcon)
+        .takeUnretainedValue()
+    controller.watchAXNotificationFired(notification as String, element: element)
+}
+
 // MARK: - Parsed commands
 
 private struct RingSpec {
@@ -1175,6 +1222,15 @@ private struct PetSpec {
     let framesDir: String
     let scale: CGFloat
     let enabled: Bool
+}
+
+/// One ambient watch request: an app to observe and an optional condition.
+private struct WatchStartSpec {
+    let app: String
+    let until: String?
+    /// Producer-side start token, echoed on every line this watch emits so a
+    /// late line from the REPLACED watch can never be mistaken for the new one.
+    let token: String?
 }
 
 private struct ClaimChipSpec {
@@ -1195,6 +1251,8 @@ private enum OverlayCommand {
     case chip(Int)
     case pet(PetSpec)
     case claimChip(ClaimChipSpec)
+    case watchStart(WatchStartSpec)
+    case watchStop
     case launcher
     case done
     case axtrusted(prompt: Bool)
@@ -1356,6 +1414,39 @@ private func parseCommand(line: String) -> OverlayCommand? {
                                         spriteW: spriteW,
                                         spriteH: spriteH,
                                         padBottom: padBottom))
+
+    case "watch_start":
+        guard let rawApp = stringValue(object["app"]) else {
+            logMalformedOnce(line: line, reason: "watch_start has an invalid app")
+            return nil
+        }
+        let app = rawApp.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !app.isEmpty else {
+            logMalformedOnce(line: line, reason: "watch_start has a blank app")
+            return nil
+        }
+        var until: String?
+        if let rawUntil = object["until"], !(rawUntil is NSNull) {
+            guard let text = stringValue(rawUntil) else {
+                logMalformedOnce(line: line, reason: "watch_start has an invalid until")
+                return nil
+            }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            until = trimmed.isEmpty ? nil : trimmed
+        }
+        var token: String?
+        if let rawToken = object["token"], !(rawToken is NSNull) {
+            guard let text = stringValue(rawToken) else {
+                logMalformedOnce(line: line, reason: "watch_start has an invalid token")
+                return nil
+            }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            token = trimmed.isEmpty ? nil : trimmed
+        }
+        return .watchStart(WatchStartSpec(app: app, until: until, token: token))
+
+    case "watch_stop":
+        return .watchStop
 
     case "launcher":
         return .launcher
@@ -2633,6 +2724,45 @@ private final class OverlayController {
     /// bubble is nearby, so preferring the previous origin keeps the chip from
     /// hopping between the two when both are on screen.
     private var lastPetFrame: CGRect?
+    // MARK: Ambient watch state
+    //
+    // v1 runs ONE passive watch at a time. The observer lives on the watched
+    // app element (lifecycle), on every top-level window (title / destroyed /
+    // moved) and on the focused control (value / title / selection). Every
+    // callback is turned into one JSON line on stdout; nothing here clicks,
+    // types or brings an app forward.
+    /// Same C trampoline pattern as `petObserver`: one observer per watched pid.
+    private var watchObserver: AXObserver?
+    /// The exact app element the notifications were installed on. Kept so the
+    /// app-quit check compares the SAME wrapper (never a freshly fabricated
+    /// one) and so removal uses the element that was registered.
+    private var watchRootElement: AXUIElement?
+    /// Echoed on every line this watch emits; the producer ignores lines whose
+    /// token does not match the watch it currently has installed.
+    private var watchToken: String?
+    private var watchedPid: pid_t?
+    private var watchAppName: String?
+    /// The condition to announce once ("" is never stored; nil means none).
+    private var watchUntil: String?
+    /// False after the condition fired, so one hit is announced per arm.
+    private var watchHitArmed = false
+    private var watchSeq = 0
+    private var watchEventCount = 0
+    /// CFHash -> window element, so stop can remove each window's notifications.
+    private var observedWatchWindows: [Int: AXUIElement] = [:]
+    /// Titles read at attach time, so a destroyed window can still be named.
+    private var watchWindowTitles: [Int: String] = [:]
+    /// The focused control. Re-installed and re-seeded on every focus change.
+    private var watchFocusedElement: AXUIElement?
+    /// Last readable string value per observed element (CFHash key), so a
+    /// value event can carry old/new. Bounded by the controls actually focused.
+    private var watchLastValues: [String: String] = [:]
+    /// Event coalescer: at most `watchMaxEventsPerSecond` lines per second.
+    private var watchEmitTimes: [Date] = []
+    /// Duplicate gate: same signature within `watchDuplicateWindow` is dropped.
+    private var watchLastSignatureAt: [String: Date] = [:]
+    /// Required clean stop path: a watch must not survive the watched app.
+    private var watchLivenessTimer: Timer?
     private var stdinThread: Thread?
     private var activeRing: RingSpec?
     private var observerTokens: [(NotificationCenter, NSObjectProtocol)] = []
@@ -2763,6 +2893,11 @@ private final class OverlayController {
         case .claimChip(let spec):
             cancelPendingExit()
             setClaimChip(spec)
+        case .watchStart(let spec):
+            cancelPendingExit()
+            startWatch(spec)
+        case .watchStop:
+            stopWatch(reason: "stopped", emit: true)
         case .launcher:
             cancelPendingExit()
             showLauncher()
@@ -3221,6 +3356,596 @@ private final class OverlayController {
             self.applyClaimChipFrame(petWindow: frame,
                                      primaryHeight: primaryHeight)
         }
+    }
+
+    // MARK: Ambient WATCH
+
+    /// Resolve a running app by localized name: exact, then a UNIQUE prefix,
+    /// then a unique substring. Ambiguity resolves to nothing: watching a
+    /// guessed app is worse than asking the agent to retry. Regular (Dock)
+    /// apps win ties over background helpers with similar names.
+    private func findWatchApp(named name: String) -> NSRunningApplication? {
+        let needle = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else {
+            return nil
+        }
+        let ownPid = ProcessInfo.processInfo.processIdentifier
+        let candidates = NSWorkspace.shared.runningApplications.filter { app in
+            guard !app.isTerminated, app.processIdentifier != ownPid,
+                  let localized = app.localizedName, !localized.isEmpty else {
+                return false
+            }
+            return true
+        }
+        func nameLower(_ app: NSRunningApplication) -> String {
+            return (app.localizedName ?? "").lowercased()
+        }
+        func uniquePick(_ matches: [NSRunningApplication]) -> NSRunningApplication? {
+            if matches.count == 1 {
+                return matches[0]
+            }
+            let regular = matches.filter { $0.activationPolicy == .regular }
+            return regular.count == 1 ? regular[0] : nil
+        }
+        let exact = candidates.filter { nameLower($0) == needle }
+        if let pick = uniquePick(exact) {
+            return pick
+        }
+        let prefixed = candidates.filter { nameLower($0).hasPrefix(needle) }
+        if let pick = uniquePick(prefixed) {
+            return pick
+        }
+        let containing = candidates.filter { nameLower($0).contains(needle) }
+        return uniquePick(containing)
+    }
+
+    /// Start the single active watch: resolve, install, reply on the same line
+    /// protocol. A failed resolution answers `{"watch_error": ...}` instead of
+    /// emitting events, so the caller never has to guess.
+    private func startWatch(_ spec: WatchStartSpec) {
+        guard !isShuttingDown else {
+            return
+        }
+        guard AXIsProcessTrusted() else {
+            writeWatchLine(watchFailure("app-not-trusted", token: spec.token))
+            return
+        }
+        guard let app = findWatchApp(named: spec.app) else {
+            writeWatchLine(watchFailure("app-not-running", token: spec.token))
+            return
+        }
+        let pid = app.processIdentifier
+        func failureCode() -> String {
+            // The contract names only two failures. Trust was already true at
+            // the top, so a create/attach refusal points at the app, not TCC;
+            // report not-trusted only if trust itself changed under us.
+            return AXIsProcessTrusted() ? "app-not-running" : "app-not-trusted"
+        }
+
+        // Build the NEW observer and its app-element notifications BEFORE
+        // touching the running watch: a rejected start (app gone, AX refusing
+        // the source) must leave the previous watch exactly as it was.
+        var observer: AXObserver?
+        let created = AXObserverCreate(pid, watchAXObserverCallback, &observer)
+        guard created == .success, let newObserver = observer else {
+            writeWatchLine(watchFailure(failureCode(), token: spec.token))
+            return
+        }
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        let root = AXUIElementCreateApplication(pid)
+        var registered = 0
+        for name in [kAXFocusedUIElementChangedNotification,
+                     kAXWindowCreatedNotification,
+                     kAXWindowMiniaturizedNotification,
+                     kAXWindowDeminiaturizedNotification,
+                     kAXApplicationActivatedNotification,
+                     kAXApplicationDeactivatedNotification,
+                     kAXUIElementDestroyedNotification] {
+            let error = AXObserverAddNotification(newObserver, root, name as CFString, refcon)
+            if error == .success || error == .notificationAlreadyRegistered {
+                registered += 1
+            }
+        }
+        guard registered > 0 else {
+            // Nothing could be installed: the app element is unusable, so this
+            // is a failed START, not a live watch with a dead observer.
+            writeWatchLine(watchFailure(failureCode(), token: spec.token))
+            return
+        }
+
+        // Only now replace the running watch. Replacement is silent on purpose:
+        // the producer asked for the new watch on the same pipe and owns the
+        // replacement bookkeeping; a stray stop line would land on the NEW row.
+        stopWatch(reason: "replaced", emit: false)
+
+        watchAppName = app.localizedName ?? spec.app
+        watchedPid = pid
+        watchUntil = spec.until
+        watchHitArmed = spec.until != nil
+        watchSeq = 0
+        watchEventCount = 0
+        watchRootElement = root
+        watchToken = spec.token
+        watchEmitTimes.removeAll()
+        watchLastSignatureAt.removeAll()
+        watchLastValues.removeAll()
+        watchWindowTitles.removeAll()
+        watchObserver = newObserver
+
+        CFRunLoopAddSource(CFRunLoopGetCurrent(),
+                           AXObserverGetRunLoopSource(newObserver),
+                           .commonModes)
+        attachWatchWindowObservers()
+        attachWatchFocusedObservers()
+        startWatchLivenessTimer()
+        var started: [String: Any] = [
+            "op": "watch-started",
+            "app": watchAppName ?? spec.app,
+            "until": spec.until ?? NSNull(),
+            "pid": Int(pid),
+        ]
+        if let token = spec.token {
+            started["token"] = token
+        }
+        writeWatchLine(started)
+    }
+
+    /// Clear every in-memory watch field without emitting or touching the
+    /// observer (the observer teardown lives in `stopWatch`).
+    private func resetWatchState() {
+        watchedPid = nil
+        watchRootElement = nil
+        watchToken = nil
+        watchAppName = nil
+        watchUntil = nil
+        watchHitArmed = false
+        watchSeq = 0
+        watchEventCount = 0
+        observedWatchWindows.removeAll()
+        watchWindowTitles.removeAll()
+        watchFocusedElement = nil
+        watchLastValues.removeAll()
+        watchEmitTimes.removeAll()
+        watchLastSignatureAt.removeAll()
+        watchLivenessTimer?.invalidate()
+        watchLivenessTimer = nil
+    }
+
+    /// Remove every observer, notification and run-loop source the watch owns.
+    /// `watch_stop` emits `{"op":"watch-stopped","events":N}`; an app quit adds
+    /// `"reason":"app-quit"`.
+    private func stopWatch(reason: String, emit: Bool) {
+        let wasWatching = watchObserver != nil || watchedPid != nil
+        let events = watchEventCount
+        let token = watchToken
+        if let observer = watchObserver, let root = watchRootElement {
+            for name in [kAXFocusedUIElementChangedNotification,
+                         kAXWindowCreatedNotification,
+                         kAXWindowMiniaturizedNotification,
+                         kAXWindowDeminiaturizedNotification,
+                         kAXApplicationActivatedNotification,
+                         kAXApplicationDeactivatedNotification,
+                         kAXUIElementDestroyedNotification] {
+                _ = AXObserverRemoveNotification(observer, root, name as CFString)
+            }
+        }
+        if let observer = watchObserver {
+            // (focused and window removals below need the observer only)
+            if let focused = watchFocusedElement {
+                for name in [kAXValueChangedNotification,
+                             kAXTitleChangedNotification,
+                             kAXSelectedChildrenChangedNotification] {
+                    _ = AXObserverRemoveNotification(observer, focused, name as CFString)
+                }
+            }
+            for (_, window) in observedWatchWindows {
+                for name in [kAXTitleChangedNotification,
+                             kAXUIElementDestroyedNotification,
+                             kAXWindowMovedNotification] {
+                    _ = AXObserverRemoveNotification(observer, window, name as CFString)
+                }
+            }
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(),
+                                  AXObserverGetRunLoopSource(observer),
+                                  .commonModes)
+        }
+        watchObserver = nil
+        resetWatchState()
+        if emit {
+            var payload: [String: Any] = ["op": "watch-stopped", "events": events]
+            // The brief's plain stop is `{"op":"watch-stopped","events":N}`;
+            // only the involuntary stop explains itself.
+            if wasWatching && reason != "stopped" {
+                payload["reason"] = reason
+            }
+            if let token = token {
+                payload["token"] = token
+            }
+            writeWatchLine(payload)
+        }
+    }
+
+    /// A watch must not outlive the app it observes. AXUIElementDestroyed on
+    /// the app element covers the graceful path; this 2 s liveness tick covers
+    /// a crash/kill, where no notification is delivered at all.
+    private func startWatchLivenessTimer() {
+        watchLivenessTimer?.invalidate()
+        let timer = Timer(timeInterval: watchLivenessInterval, repeats: true) { [weak self] _ in
+            guard let self = self, !self.isShuttingDown, let pid = self.watchedPid else {
+                return
+            }
+            let app = NSRunningApplication(processIdentifier: pid)
+            if app == nil || app?.isTerminated == true {
+                self.stopWatch(reason: "app-quit", emit: true)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchLivenessTimer = timer
+    }
+
+    /// Observe every top-level window: title changes, destruction and moves.
+    /// Moves are installed (the contract names them) but dropped in the handler:
+    /// a drag streams them ~17 ms apart and they are not worth logging.
+    private func attachWatchWindowObservers() {
+        guard let observer = watchObserver, let pid = watchedPid else {
+            return
+        }
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        let root = AXUIElementCreateApplication(pid)
+        let windows = axWindowElements(of: root)
+        // Titles for windows that are no longer listed can never name a future
+        // event; keep the table bounded on a long watch.
+        let liveWindowKeys = Set(windows.map { Int(CFHash($0)) })
+        watchWindowTitles = watchWindowTitles.filter {
+            liveWindowKeys.contains($0.key)
+        }
+        for window in windows {
+            let key = Int(CFHash(window))
+            if let title = axNonEmpty(axWindowTitle(window)) {
+                watchWindowTitles[key] = title
+            }
+            guard observedWatchWindows[key] == nil else {
+                continue
+            }
+            var registered = false
+            for name in [kAXTitleChangedNotification,
+                         kAXUIElementDestroyedNotification,
+                         kAXWindowMovedNotification] {
+                let error = AXObserverAddNotification(observer, window, name as CFString, refcon)
+                if error == .success || error == .notificationAlreadyRegistered {
+                    registered = true
+                }
+            }
+            if registered {
+                observedWatchWindows[key] = window
+            }
+        }
+    }
+
+    /// Install value/title/selection observers on the FOCUSED control. Called
+    /// once at start and again on every AXFocusedUIElementChanged, moving the
+    /// notifications off the previous control so they don't pile up.
+    private func attachWatchFocusedObservers() {
+        guard let observer = watchObserver, let pid = watchedPid else {
+            return
+        }
+        let root = AXUIElementCreateApplication(pid)
+        guard let focused = axElement(from: copyAXAttribute(root, "AXFocusedUIElement")) else {
+            watchFocusedElement = nil
+            return
+        }
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        let key = Int(CFHash(focused))
+        if let previous = watchFocusedElement, Int(CFHash(previous)) != key {
+            for name in [kAXValueChangedNotification,
+                         kAXTitleChangedNotification,
+                         kAXSelectedChildrenChangedNotification] {
+                _ = AXObserverRemoveNotification(observer, previous, name as CFString)
+            }
+        }
+        watchFocusedElement = focused
+        // Only the current control's baselines are reachable: value/title/
+        // selection observers moved off the old one, so drop its entries rather
+        // than growing a dictionary for the life of a long watch.
+        let liveKeys: Set<String> = [String(key), "t:" + String(key),
+                                     "sel:" + String(key)]
+        watchLastValues = watchLastValues.filter { liveKeys.contains($0.key) }
+        for name in [kAXValueChangedNotification,
+                     kAXTitleChangedNotification,
+                     kAXSelectedChildrenChangedNotification] {
+            _ = AXObserverAddNotification(observer, focused, name as CFString, refcon)
+        }
+        // Seed the value baseline: the first AXValueChanged on this control can
+        // then report a readable old value instead of only the new one.
+        if watchLastValues[String(key)] == nil, let value = axWatchRawValueText(focused) {
+            watchLastValues[String(key)] = value
+        }
+    }
+
+    /// Entry point from the C callback (mirrors petAXNotificationFired).
+    fileprivate func watchAXNotificationFired(_ name: String, element: AXUIElement) {
+        DispatchQueue.main.async { [weak self] in
+            self?.processWatchAXNotification(name, element: element)
+        }
+    }
+
+    private func processWatchAXNotification(_ name: String, element: AXUIElement) {
+        guard watchObserver != nil, !isShuttingDown else {
+            return
+        }
+        // AXWindowMoved is the hot path of a drag: drop it before any AX read.
+        if name == kAXWindowMovedNotification {
+            return
+        }
+        // Cheap liveness gate on every event: a killed app delivers nothing.
+        if let pid = watchedPid {
+            let app = NSRunningApplication(processIdentifier: pid)
+            if app == nil || app?.isTerminated == true {
+                stopWatch(reason: "app-quit", emit: true)
+                return
+            }
+        }
+        switch name {
+        case kAXUIElementDestroyedNotification:
+            let key = Int(CFHash(element))
+            if let root = watchRootElement, CFEqual(element, root) {
+                stopWatch(reason: "app-quit", emit: true)
+                return
+            }
+            // Name it from the attach-time title: a destroyed element no longer
+            // answers AXTitle.
+            let title = watchWindowTitles[key] ?? axNonEmpty(axWindowTitle(element))
+            observedWatchWindows.removeValue(forKey: key)
+            emitWatchEvent(kind: "window-gone", role: "AXWindow", label: title,
+                           window: title)
+            attachWatchWindowObservers()
+        case kAXFocusedUIElementChangedNotification:
+            attachWatchFocusedObservers()
+            if let focused = watchFocusedElement {
+                emitWatchEvent(kind: "focus", role: watchRole(focused),
+                               label: watchLabel(focused),
+                               window: watchWindowLine(focused))
+            } else {
+                emitWatchEvent(kind: "focus", role: "AXApplication",
+                               label: watchAppName, window: watchFocusedWindowTitle())
+            }
+        case kAXWindowCreatedNotification:
+            // Resolve the new window BEFORE attaching: after the attach it is
+            // just another known window, and AXFocusedWindow can still point at
+            // the previous one this early.
+            let newWindow = watchUnobservedWindowElement()
+            attachWatchWindowObservers()
+            let title = newWindow.flatMap { axNonEmpty(axWindowTitle($0)) }
+                ?? watchFocusedWindowTitle()
+            emitWatchEvent(kind: "window-new", role: "AXWindow", label: title,
+                           window: title)
+        case kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification:
+            // Collapsing a window hides it (window-gone); restoring shows it.
+            let title = axNonEmpty(axWindowTitle(element))
+                ?? watchWindowTitles[Int(CFHash(element))]
+            let kind = name == kAXWindowMiniaturizedNotification
+                ? "window-gone" : "window-new"
+            emitWatchEvent(kind: kind, role: "AXWindow", label: title, window: title)
+        case kAXTitleChangedNotification:
+            let key = Int(CFHash(element))
+            let role = watchRole(element)
+            let title = axNonEmpty(axWindowTitle(element))
+            if let title = title {
+                watchWindowTitles[key] = title
+            }
+            if role == "AXWindow" {
+                let windowTitle = title ?? watchWindowTitles[key]
+                emitWatchEvent(kind: "window-title", role: role,
+                               label: windowTitle, window: windowTitle)
+            } else {
+                // A control's title change is content. The contract has no
+                // separate control-title kind, so it rides "value" (with the
+                // old title when we saw it).
+                let newValue = axWatchRawValueText(element) ?? title ?? ""
+                let stored = watchLastValues["t:" + String(key)]
+                watchLastValues["t:" + String(key)] = newValue
+                emitWatchEvent(kind: "value", role: role, label: watchLabel(element),
+                               window: watchWindowLine(element),
+                               old: stored, new: newValue)
+            }
+        case kAXValueChangedNotification:
+            let key = Int(CFHash(element))
+            let newValue = axWatchRawValueText(element)
+            let oldValue = watchLastValues[String(key)]
+            if let newValue = newValue {
+                watchLastValues[String(key)] = newValue
+            }
+            emitWatchEvent(kind: "value", role: watchRole(element),
+                           label: watchLabel(element),
+                           window: watchWindowLine(element),
+                           old: oldValue, new: newValue)
+        case kAXSelectedChildrenChangedNotification:
+            let key = Int(CFHash(element))
+            let newValue = watchSelectedText(element)
+            let oldValue = watchLastValues["sel:" + String(key)]
+            if let newValue = newValue {
+                watchLastValues["sel:" + String(key)] = newValue
+            }
+            emitWatchEvent(kind: "value", role: watchRole(element),
+                           label: watchLabel(element),
+                           window: watchWindowLine(element),
+                           old: oldValue, new: newValue)
+        case kAXApplicationActivatedNotification:
+            emitWatchEvent(kind: "activated", role: "AXApplication",
+                           label: watchAppName, window: watchFocusedWindowTitle())
+        case kAXApplicationDeactivatedNotification:
+            emitWatchEvent(kind: "deactivated", role: "AXApplication",
+                           label: watchAppName, window: watchFocusedWindowTitle())
+        default:
+            break
+        }
+    }
+
+    private func watchRole(_ element: AXUIElement) -> String {
+        return axNonEmpty(axString(element, "AXRole")) ?? "unknown"
+    }
+
+    /// AXTitle, else AXDescription, else AXValue — trimmed to 120 chars.
+    private func watchLabel(_ element: AXUIElement) -> String? {
+        if let title = axNonEmpty(axString(element, "AXTitle")) {
+            return String(title.prefix(watchLabelLimit))
+        }
+        if let description = axNonEmpty(axString(element, "AXDescription")) {
+            return String(description.prefix(watchLabelLimit))
+        }
+        return axWatchValueText(element)
+    }
+
+    /// AXValue as a readable string, trimmed. An empty string is still a
+    /// readable value (a field being cleared is a real change); nil means the
+    /// attribute is absent or not a string (numbers/ranges are not log-worthy).
+    private func axWatchRawValueText(_ element: AXUIElement) -> String? {
+        guard let raw = copyAXAttribute(element, "AXValue"),
+              let text = raw as? String else {
+            return nil
+        }
+        return String(text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .prefix(watchLabelLimit))
+    }
+
+    /// The value only counts when it is a readable NON-EMPTY string: a label
+    /// should never collapse to "". Value events use axWatchRawValueText.
+    private func axWatchValueText(_ element: AXUIElement) -> String? {
+        guard let text = axWatchRawValueText(element), !text.isEmpty else {
+            return nil
+        }
+        return text
+    }
+
+    /// The first top-level window not attached yet: on AXWindowCreated that is
+    /// the window that just appeared.
+    private func watchUnobservedWindowElement() -> AXUIElement? {
+        guard let pid = watchedPid else {
+            return nil
+        }
+        let root = AXUIElementCreateApplication(pid)
+        for window in axWindowElements(of: root)
+        where observedWatchWindows[Int(CFHash(window))] == nil {
+            return window
+        }
+        // A sheet/panel that AXWindows does not list: say "a window appeared"
+        // with no title rather than re-reporting an already-known window.
+        return nil
+    }
+
+    private func watchFocusedWindowElement() -> AXUIElement? {
+        guard let pid = watchedPid else {
+            return nil
+        }
+        let root = AXUIElementCreateApplication(pid)
+        if let window = axElement(from: copyAXAttribute(root, "AXFocusedWindow")) {
+            return window
+        }
+        return axWindowElements(of: root).first
+    }
+
+    private func watchFocusedWindowTitle() -> String? {
+        guard let window = watchFocusedWindowElement() else {
+            return nil
+        }
+        return axNonEmpty(axWindowTitle(window))
+    }
+
+    /// The window line for a control: its enclosing AXWindow title, falling
+    /// back to the app's focused window (Electron nests deeper than the 4-level
+    /// ancestor walk in `axEnclosingWindow`).
+    private func watchWindowLine(_ element: AXUIElement) -> String? {
+        if let title = axEnclosingWindow(element).window {
+            return title
+        }
+        return watchFocusedWindowTitle()
+    }
+
+    private func watchSelectedText(_ element: AXUIElement) -> String? {
+        if let text = axNonEmpty(axString(element, "AXSelectedText")) {
+            return String(text.prefix(watchLabelLimit))
+        }
+        guard let first = axElementList(element, attribute: "AXSelectedChildren").first else {
+            return nil
+        }
+        return watchLabel(first) ?? axWatchValueText(first)
+    }
+
+    /// Emit one watch event through the coalescer and check the condition.
+    ///
+    /// The condition runs BEFORE the 4/s + 150 ms gates: a genuine
+    /// "Export complete" must never be dropped because the app was noisy in the
+    /// same second. The hit is emitted once per arm (`watchHitArmed`), then the
+    /// watch keeps observing but stops matching until a new watch_start.
+    private func emitWatchEvent(kind: String, role: String?, label: String?,
+                                window: String?, old: String? = nil, new: String? = nil) {
+        guard watchObserver != nil, !isShuttingDown else {
+            return
+        }
+        let now = Date()
+
+        if watchHitArmed, let until = watchUntil, !until.isEmpty {
+            let needle = until.lowercased()
+            let labelText = (label ?? "").lowercased()
+            let valueText = (new ?? "").lowercased()
+            if labelText.contains(needle) || valueText.contains(needle) {
+                watchHitArmed = false
+                var hit: [String: Any] = [
+                    "op": "watch-hit",
+                    "app": watchAppName ?? "",
+                    "until": until,
+                    "label": label ?? "",
+                    "window": window ?? "",
+                    "at": now.timeIntervalSince1970,
+                ]
+                if let token = watchToken {
+                    hit["token"] = token
+                }
+                writeWatchLine(hit)
+            }
+        }
+
+        watchEmitTimes.removeAll { now.timeIntervalSince($0) > watchRateWindow }
+        guard watchEmitTimes.count < watchMaxEventsPerSecond else {
+            return
+        }
+        let signature = [kind, role ?? "", label ?? "", window ?? "", new ?? ""]
+            .joined(separator: "\u{1}")
+        if let last = watchLastSignatureAt[signature],
+           now.timeIntervalSince(last) < watchDuplicateWindow {
+            return
+        }
+        watchLastSignatureAt[signature] = now
+        // Keep the duplicate table bounded on a long watch.
+        if watchLastSignatureAt.count > 32 {
+            watchLastSignatureAt = watchLastSignatureAt.filter {
+                now.timeIntervalSince($0.value) <= 5.0
+            }
+        }
+        watchEmitTimes.append(now)
+        watchSeq += 1
+        watchEventCount += 1
+
+        var payload: [String: Any] = [
+            "op": "watch-event",
+            "seq": watchSeq,
+            "at": now.timeIntervalSince1970,
+            "kind": kind,
+            "app": watchAppName ?? "",
+            "role": role ?? "unknown",
+            "label": label ?? "",
+            "window": window ?? "",
+        ]
+        if let token = watchToken {
+            payload["token"] = token
+        }
+        // old/new when BOTH sides are readable strings (an empty string counts:
+        // clearing a field is a change worth showing).
+        if let old = old, let new = new {
+            payload["old"] = old
+            payload["new"] = new
+        }
+        writeWatchLine(payload)
     }
 
     /// Find the core Hermes pet pop-out. Identification is owner pid + shape
@@ -4706,7 +5431,11 @@ private final class OverlayController {
         let idleFor = ProcessInfo.processInfo.systemUptime - lastOpUptime
         guard idleFor >= watchdogIdleLimit,
               activeRing == nil,
-              petWindow == nil else {
+              petWindow == nil,
+              // An ambient watch is work: it may legitimately idle for hours
+              // between two changes, so the idle watchdog must not retire the
+              // observer (and silently end the watch) after 10 minutes.
+              watchObserver == nil else {
             return
         }
         shutdown()
@@ -4721,7 +5450,8 @@ private final class OverlayController {
     }
 
     private func scheduleExitAfterFarewell() {
-        guard !isShuttingDown, activeRing == nil, chipWindow == nil else {
+        guard !isShuttingDown, activeRing == nil, chipWindow == nil,
+              watchObserver == nil else {
             return
         }
         cancelPendingExit()
@@ -4731,7 +5461,8 @@ private final class OverlayController {
                   !self.isShuttingDown,
                   self.pendingExitGeneration == generation,
                   self.activeRing == nil,
-                  self.chipWindow == nil else {
+                  self.chipWindow == nil,
+                  self.watchObserver == nil else {
                 return
             }
             self.shutdown()
@@ -4758,6 +5489,9 @@ private final class OverlayController {
         claimChipTimer = nil
         claimChipTimerInterval = 0.0
         stopPetObservation()
+        // A watch holds an AXObserver + run-loop source; never leak them past
+        // shutdown (also covers SIGTERM and stdin EOF).
+        stopWatch(reason: "shutdown", emit: false)
         removeSummonHotKey()
         dismissLookCard()
         closeSummonField(journal: nil, restoreFocus: false)

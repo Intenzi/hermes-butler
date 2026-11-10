@@ -4,10 +4,13 @@ State lives under the plugin data dir:
   guides/<id>.json   one session
   state.json         snapshot for the desktop surface / plugin_api
   say.json           the agent's short on-screen answer (butler_say)
+  watch.jsonl        ambient watch event tail (bounded, 500 lines)
 
-Fail-closed: unattended runs are rejected at the tool layer (kwargs has no
-approval context), always. This module only writes its own data files (sessions,
-``say.json``); the poll thread refreshes them from live captures.
+Fail-closed: unattended GUIDE runs are rejected at the tool layer (kwargs has no
+approval context), always. WATCH is the exception by design: it only reads the
+Accessibility tree and writes its own log, so an unattended run cannot act on
+the screen. This module only writes its own data files (sessions, ``say.json``,
+``watch.jsonl``); the poll thread refreshes them from live captures.
 """
 import json
 import os
@@ -42,6 +45,14 @@ DEEP_MAX_ELEMENTS = 900
 DEEP_DEPTH = 24
 DEEP_CAPTURE_INTERVAL = 1.0  # seconds between deep walks, even if poll is faster
 
+# Ambient WATCH (passive Accessibility observation). The companion owns the AX
+# observer; this process only keeps a bounded tail for the agent and the desktop.
+WATCH_RING = 40          # in-memory ring of the newest events
+WATCH_STATE_RECENT = 12  # what state.json carries (newest last) for the desktop
+WATCH_JSONL_MAX = 500    # <plugin data dir>/watch.jsonl tail cap
+WATCH_STATUS_EVENTS = 10 # event lines watch_status() prints
+WATCH_REQUEST_TIMEOUT = 5.0
+
 _lock = threading.Lock()
 _last_deep_capture_at = None  # monotonic timestamp of the last deep walk
 _session = None           # latest guide dict
@@ -49,6 +60,14 @@ _thread = None
 _stop_flag = False
 _summon_pending = None    # companion chip click waiting for the desktop bar
 _claim_chip_enabled = False
+_watch = None             # the one active watch row (v1 is single-watch)
+_watch_ring = []          # newest WATCH_RING events, oldest first
+# Re-entrant: the stdout reader mutates the row, a status poll snapshots it,
+# and _write_state takes it again from inside those paths.
+_watch_lock = threading.RLock()
+# One start at a time: two overlapping starts could otherwise nest provisional
+# rows and resurrect a start that already failed.
+_watch_start_lock = threading.Lock()
 
 
 def init(data_dir):
@@ -211,14 +230,15 @@ def _normalize_steps(args_steps):
     return steps
 
 
-def _write_state(clear_summon=False):
+def _write_state(clear_summon=False, clear_watch=False):
     """Publish the shared snapshot. Never raises.
 
     Two processes host this engine: the agent runtime (guides) and the plugin
     API that owns the companion (the summon row from a chip click). Each owns
     part of ``state.json``, so a write merges the other owner's block instead of
     dropping it — otherwise a click silently erases a running guide, and a guide
-    poll erases a click the desktop has not consumed yet.
+    poll erases a click the desktop has not consumed yet. The ambient ``watch``
+    block merges the same way (stop_watch clears it explicitly).
     """
     if not DATA_DIR:
         return
@@ -226,6 +246,10 @@ def _write_state(clear_summon=False):
     snap = {}
     if _summon_pending is not None:
         snap["summon_pending"] = dict(_summon_pending)
+    with _watch_lock:
+        watch_snap = _watch_snapshot()
+    if watch_snap is not None:
+        snap["watch"] = watch_snap
     if _session is not None:
         snap.update({
             "guide": _session,
@@ -244,6 +268,11 @@ def _write_state(clear_summon=False):
             if not clear_summon and _summon_pending is None \
                     and "summon_pending" in existing:
                 snap["summon_pending"] = existing["summon_pending"]
+            # A guide poll in the agent process must not erase a watch row the
+            # plugin API process published (and vice versa); only stop_watch
+            # clears it, via clear_watch.
+            if not clear_watch and watch_snap is None and "watch" in existing:
+                snap["watch"] = existing["watch"]
     except Exception:
         pass
     tmp = path + ".tmp"
@@ -271,6 +300,11 @@ def _on_overlay_event(event):
     if not isinstance(event, dict):
         return
     op = event.get("op")
+    if op in ("watch-event", "watch-hit", "watch-stopped"):
+        # Ambient watch lines are not summons: they feed the ring/state and the
+        # condition announcement, never the summon row.
+        _handle_watch_message(event)
+        return
     if op == "summon_text":
         text = event.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -393,6 +427,400 @@ def say(text):
         return {"ok": True, "shown": shown}
     except Exception as exc:  # noqa: BLE001 - the chat answer is primary
         return {"ok": False, "error": str(exc)}
+
+
+def _clear_watch_state():
+    """Drop the in-memory watch and its state row (call with the lock held)."""
+    global _watch
+    _watch = None
+    _watch_ring.clear()
+    _write_state(clear_watch=True)
+
+
+def _pid_alive(pid):
+    """True when *pid* is a live process, by the signal-0 probe. Never raises."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_state_watch_row():
+    """The watch row another process published in state.json, or None."""
+    if not DATA_DIR:
+        return None
+    try:
+        with open(os.path.join(str(DATA_DIR), "state.json"),
+                  encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        return None
+    row = state.get("watch") if isinstance(state, dict) else None
+    return row if isinstance(row, dict) else None
+
+
+def _foreign_owner_alive(owner):
+    """True when another LIVE process owns the row (never our own pid)."""
+    try:
+        owner = int(owner)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return owner != os.getpid() and _pid_alive(owner)
+
+
+def _watch_snapshot():
+    """Copy the watch row for state.json (call with ``_watch_lock`` held)."""
+    if _watch is None:
+        return None
+    row = dict(_watch)
+    row["recent"] = [dict(event) for event in (_watch.get("recent") or [])]
+    return row
+
+
+def _watch_event_row(event):
+    """Whitelist one companion event into the ring/state shape (JSON-safe)."""
+    row = {}
+    for key in ("seq", "at", "kind", "app", "role", "label", "window", "old", "new"):
+        value = event.get(key)
+        if value is not None:
+            row[key] = value
+    row.setdefault("at", time.time())
+    row.setdefault("kind", "unknown")
+    return row
+
+
+def _watch_clock(value):
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(float(value)))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "--:--:--"
+
+
+def _watch_event_line(event):
+    line = "%s %s %s" % (_watch_clock(event.get("at")),
+                         event.get("kind") or "?",
+                         event.get("role") or "?")
+    label = event.get("label")
+    if label:
+        line += ' "%s"' % label
+    window = event.get("window")
+    if window:
+        line += " — %s" % window
+    return line
+
+
+def _append_watch_jsonl(event):
+    """One JSON line per event in <plugin data dir>/watch.jsonl, tail-capped.
+
+    A watch can outlive the process that started it (gateway restart, agent
+    turn ends), so the file — not the in-memory ring — is the durable log. The
+    tail is rewritten once it grows past the cap; never raises.
+    """
+    if not DATA_DIR:
+        return
+    path = os.path.join(str(DATA_DIR), "watch.jsonl")
+    try:
+        line = json.dumps(event, ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        if len(lines) > WATCH_JSONL_MAX:
+            tail = lines[-WATCH_JSONL_MAX:]
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(tail) + "\n")
+            os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 - logging must never break the watch
+        pass
+
+
+def _handle_watch_message(event):
+    """Route one companion watch line into the ring, state row, and the pet.
+
+    Called from the companion's stdout reader thread. Never raises.
+    """
+    op = event.get("op")
+    with _watch_lock:
+        if _watch is None:
+            # A stale line from a companion the agent already stopped: drop it
+            # rather than resurrecting a row nobody asked for.
+            return
+        # A line from the watch this row replaced arrives AFTER the replacement
+        # was requested: its token never matches, so it can neither mark the new
+        # watch stopped nor count its events. (A tokenless line is an older
+        # companion and is accepted.)
+        token = event.get("token")
+        row_token = _watch.get("token")
+        if token is not None and token != row_token:
+            # (A tokenless line is an older companion and is still accepted;
+            # a tokened line against a tokenless row is foreign by construction.)
+            return
+        if op != "watch-stopped" and _watch.get("stopped"):
+            # A stopped watch is inert: a straggler already in the pipe must not
+            # count an event (or announce a hit) for a watch that is over.
+            return
+        if op == "watch-event":
+            row = _watch_event_row(event)
+            _watch_ring.append(row)
+            del _watch_ring[:-WATCH_RING]
+            _watch["events"] = int(_watch.get("events") or 0) + 1
+            recent = _watch.setdefault("recent", [])
+            recent.append(row)
+            del recent[:-WATCH_STATE_RECENT]
+            _append_watch_jsonl(row)
+            _write_state()
+            return
+        if op == "watch-hit":
+            if _watch.get("hit") is not None:
+                # One announcement per arm, even if a duplicate line arrives.
+                return
+            label = event.get("label") or event.get("until") or ""
+            _watch["hit"] = {
+                "label": label,
+                "window": event.get("window"),
+                "at": event.get("at") or time.time(),
+            }
+            # In place, with no model call and without waking the agent: the
+            # pet says it now, the agent reads watch_status on its next turn.
+            say("%s: %s appeared" % (_watch.get("app") or event.get("app") or "",
+                                     label))
+            _write_state()
+            return
+        if op == "watch-stopped":
+            _watch["stopped"] = {
+                "reason": event.get("reason") or "stopped",
+                "events": event.get("events") or _watch.get("events"),
+                "at": time.time(),
+                "token": event.get("token"),
+            }
+            _write_state()
+
+
+def _watch_start_failure(app, code):
+    """Map a companion rejection to an honest, exception-free tool result."""
+    if code == "app-not-running":
+        return {"error": "app-not-running", "app": app,
+                "note": "no running app matches %r" % app}
+    if code == "app-not-trusted":
+        return {"error": "app-not-trusted", "app": app,
+                "note": "Accessibility is not granted to the butler companion",
+                "fix": bp_capture.GRANT_FIX}
+    return {"error": code or "watch_start failed", "app": app}
+
+
+def start_watch(app, until=None):
+    """Observe one running app's Accessibility tree; never clicks or types.
+
+    Wholly passive: the companion attaches AX observers and streams change
+    lines, so this is safe in the background and needs no new TCC grant (the
+    companion is the existing single grant subject). One watch at a time in v1:
+    starting a second replaces the first. Never raises — a missing app or a
+    missing grant comes back as an error string. Every start carries a token
+    echoed by the companion, so a late line from a replaced watch is dropped.
+    """
+    with _watch_start_lock:
+        return _start_watch_locked(app, until)
+
+
+def _start_watch_locked(app, until):
+    global _watch
+    try:
+        name = str(app or "").strip()
+        if not name:
+            return {"error": "app is required"}
+        needle = until.strip() if isinstance(until, str) else None
+        if not needle:
+            needle = None
+        try:
+            ok, detail = _OVERLAY.start(show_pet=False)
+        except Exception as exc:  # noqa: BLE001 - transport must not raise
+            return {"error": "companion unavailable: %s" % exc, "app": name}
+        if not ok:
+            return {"error": "companion unavailable: %s" % detail, "app": name}
+        token = uuid.uuid4().hex[:12]
+        op = {"op": "watch_start", "app": name, "token": token}
+        if needle:
+            op["until"] = needle
+        # Install the provisional row BEFORE the round trip: events can start
+        # flowing the instant the companion attaches its observers. A rejected
+        # start RESTORES the row that was running before it — the companion
+        # validates the new app before it tears the old observers down.
+        with _watch_lock:
+            previous_row = _watch
+            previous_ring = list(_watch_ring)
+            _watch_ring.clear()
+            provisional = {
+                "app": name,
+                "until": needle,
+                "token": token,
+                "owner_pid": os.getpid(),
+                "started_at": time.time(),
+                "events": 0,
+                "hit": None,
+                "stopped": None,
+                "recent": [],
+            }
+            _watch = provisional
+
+        def restore_previous():
+            global _watch
+            with _watch_lock:
+                if _watch is not provisional:
+                    # A stop (or another start) took over while we waited:
+                    # never resurrect a row the user already ended.
+                    return
+                _watch = previous_row
+                _watch_ring[:] = previous_ring
+                _write_state()
+
+        try:
+            reply = _OVERLAY.request(op, timeout=WATCH_REQUEST_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - transport must not raise
+            restore_previous()
+            return {"error": str(exc), "app": name}
+        if not isinstance(reply, dict):
+            restore_previous()
+            return {"error": "companion did not answer watch_start", "app": name}
+        reply_token = reply.get("token")
+        if reply_token is not None and reply_token != token:
+            # A late reply to an EARLIER start (already timed out): it must not
+            # answer this one, in either direction.
+            restore_previous()
+            return {"error": "stale watch reply", "app": name}
+        failure = reply.get("watch_error")
+        if failure:
+            # The companion resolves and installs the NEW app before it drops
+            # the running watch, so a rejected start leaves the previous watch
+            # exactly as it was: put its row back (or publish no row at all).
+            restore_previous()
+            return _watch_start_failure(name, str(failure))
+        with _watch_lock:
+            if _watch is not provisional:
+                # A concurrent stop_watch landed while we waited for the ack.
+                return {"error": "watch start was cancelled", "app": name}
+            stopped = _watch.get("stopped")
+            if stopped is not None:
+                if stopped.get("token") == token:
+                    # This watch really did start and then stopped (the app quit
+                    # instantly). Keep the row: status reports the clean stop.
+                    started_at = _watch["started_at"]
+                    _write_state()
+                    return {"ok": True, "app": name, "until": needle,
+                            "started_at": started_at,
+                            "status": watch_status()}
+                # A stop line written BEFORE this watch was installed (an old
+                # watch quitting, a concurrent stop) must not mark the new row
+                # dead; the start did not take.
+                restore_previous()
+                return {"error": "watch start was superseded by a stop", "app": name}
+            started_at = _watch["started_at"]
+            _write_state()
+        return {"ok": True, "app": name, "until": needle,
+                "started_at": started_at, "status": watch_status()}
+    except Exception as exc:  # noqa: BLE001 - a handler must always answer
+        return {"error": str(exc)}
+
+
+def watch_status():
+    """Compact text block for the agent: header plus the last 10 events.
+
+    Falls back to the row in ``state.json`` when this process does not own a
+    live watch, so a gateway restart cannot turn an observable watch into a lie
+    ("no watch active" while the pet still carries the line).
+    """
+    external = False
+    with _watch_lock:
+        row = _watch_snapshot()
+        ring = [dict(event) for event in _watch_ring]
+        if row is None:
+            row = _read_state_watch_row()
+            external = row is not None
+    if row is None:
+        return "no watch active"
+    until = row.get("until")
+    hit = row.get("hit")
+    stopped = row.get("stopped")
+    lines = ["watching %s for %s · %d events · %s" % (
+        row.get("app") or "?", until or "any change",
+        int(row.get("events") or 0), "hit" if hit else "no hit")]
+    if hit:
+        suffix = (" — %s" % hit["window"]) if hit.get("window") else ""
+        lines.append("hit: %s%s at %s" % (hit.get("label") or "", suffix,
+                                          _watch_clock(hit.get("at"))))
+    source = ring if not external else (row.get("recent") or [])
+    for event in source[-WATCH_STATUS_EVENTS:]:
+        lines.append(_watch_event_line(event))
+    if stopped:
+        lines.append("stopped: %s" % (stopped.get("reason") or "stopped"))
+    if external:
+        owner = row.get("owner_pid")
+        if _foreign_owner_alive(owner):
+            lines.append("note: another butler process owns this watch (pid %s)"
+                         % owner)
+        else:
+            lines.append("note: stale row from a process that exited; "
+                         "butler_watch_stop clears it, watch.jsonl keeps the log")
+    return "\n".join(lines)
+
+
+def stop_watch():
+    """Stop the companion's watch and clear its state row.
+
+    When the row was published by another process (a gateway restart, a second
+    plugin host), this process cannot reach that process's companion: a live
+    owner is reported as "elsewhere", a dead one leaves a stale row this call
+    clears from the shared snapshot.
+    """
+    external = False
+    with _watch_lock:
+        row = _watch
+        if row is None:
+            row = _read_state_watch_row()
+            if row is None:
+                return {"status": "idle"}
+            external = True
+        try:
+            events = int(row.get("events") or 0)
+        except (TypeError, ValueError):
+            events = 0
+        app = row.get("app")
+        owner = row.get("owner_pid")
+    if external:
+        if _foreign_owner_alive(owner):
+            return {"status": "elsewhere", "app": app, "owner_pid": owner,
+                    "note": "another butler process owns this watch; "
+                            "stop it from that process"}
+        with _watch_lock:
+            _clear_watch_state()
+        return {"status": "cleared", "app": app, "events": events}
+    # Fire-and-forget: the companion answers a stop with an unsolicited
+    # `watch-stopped` line (routed to the event callback), so request() here
+    # would always burn its whole timeout. Only ask a live companion: request()
+    # would otherwise spawn one just to stop a watch nobody is running.
+    try:
+        if _OVERLAY.is_running():
+            send = getattr(_OVERLAY, "send", None)
+            if callable(send):
+                send({"op": "watch_stop"})
+            else:  # test doubles that only speak the request dialect
+                _OVERLAY.request({"op": "watch_stop"}, timeout=WATCH_REQUEST_TIMEOUT)
+    except Exception:  # noqa: BLE001 - a dead pipe must not keep a stale row
+        pass
+    with _watch_lock:
+        _clear_watch_state()
+    return {"status": "stopped", "app": app, "events": events}
 
 
 def set_claim_chip(enabled):

@@ -1,7 +1,8 @@
 """Butler — Hermes plugin.
 
 Tools: butler_guide_start, butler_guide_status, butler_capture, butler_look,
-butler_say, butler_stop.
+butler_say, butler_stop, butler_watch_start, butler_watch_status,
+butler_watch_stop.
 Slash command: /butler <request> — inject the request into this chat as a real
 agent turn that plans and starts a guide.
 CLI: hermes butler capture|status|doctor.
@@ -103,6 +104,25 @@ STOP_SCHEMA = {
     "properties": {"reason": {"type": "string", "description": "Why the guide ended."}},
 }
 
+WATCH_START_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "app": {
+            "type": "string",
+            "description": "Running app to watch by localized name (case-insensitive prefix is fine).",
+        },
+        "until": {
+            "type": "string",
+            "description": "Optional condition: announce once when a label, title or value contains this text (case-insensitive).",
+        },
+    },
+    "required": ["app"],
+}
+
+WATCH_STATUS_SCHEMA = {"type": "object", "properties": {}}
+
+WATCH_STOP_SCHEMA = {"type": "object", "properties": {}}
+
 BUTLER_SLASH_NAME = "butler"
 BUTLER_SLASH_ARGS_HINT = "<request>"
 BUTLER_SLASH_HELP = (
@@ -179,6 +199,49 @@ def tool_say(args, **kwargs):
         return _out(bp_engine.say(args.get("text") or ""))
     except Exception as exc:  # noqa: BLE001
         logger.exception("butler_say failed")
+        return _out({"error": str(exc)})
+
+
+def tool_watch_start(args, **kwargs):
+    """Start a passive Accessibility watch on one app.
+
+    Reads the app's AX notifications over time and keeps a bounded, human
+    readable tail (butler_watch_status) plus an optional one-shot condition
+    (``until``) announced by the pet. Unattended-safe: it never clicks, types,
+    or brings an app forward, and it needs no new TCC grant (the existing
+    companion is the single Accessibility subject). One watch at a time.
+    """
+    try:
+        return _out(bp_engine.start_watch(args.get("app") or "",
+                                          args.get("until") or None))
+    except Exception as exc:  # noqa: BLE001 - handlers must never raise
+        logger.exception("butler_watch_start failed")
+        return _out({"error": str(exc)})
+
+
+def tool_watch_status(args, **kwargs):
+    """Read the active watch's compact text log (header plus the last 10 events).
+
+    Unattended-safe: read-only, and it works from another app while the watch
+    keeps running in the background. Also useful after an announcement: the
+    pet says "hit"; this says what changed and when.
+    """
+    try:
+        return _out({"status": bp_engine.watch_status()})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("butler_watch_status failed")
+        return _out({"error": str(exc)})
+
+
+def tool_watch_stop(args, **kwargs):
+    """Stop the active watch and clear its state row (its JSONL tail stays).
+
+    Unattended-safe: it only detaches the observers; nothing on screen changes.
+    """
+    try:
+        return _out(bp_engine.stop_watch())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("butler_watch_stop failed")
         return _out({"error": str(exc)})
 
 
@@ -292,6 +355,12 @@ def register(ctx):
                       handler=tool_say, description="Show a one-or-two-sentence answer beside the user's pointer, on the pet itself.", emoji="💬")
     ctx.register_tool(name="butler_stop", toolset="butler", schema=STOP_SCHEMA,
                       handler=tool_stop, description="End the active butler guide.", emoji="🎩")
+    ctx.register_tool(name="butler_watch_start", toolset="butler", schema=WATCH_START_SCHEMA,
+                      handler=tool_watch_start, description="Watch one app's Accessibility tree in the background: a bounded change log, and one announcement when your condition shows up.", emoji="⏲")
+    ctx.register_tool(name="butler_watch_status", toolset="butler", schema=WATCH_STATUS_SCHEMA,
+                      handler=tool_watch_status, description="Read the active watch: how many changes, whether the condition hit, and the last 10 events.", emoji="⏲")
+    ctx.register_tool(name="butler_watch_stop", toolset="butler", schema=WATCH_STOP_SCHEMA,
+                      handler=tool_watch_stop, description="Stop the active watch and clear its state row.", emoji="⏲")
     ctx.register_command(
         BUTLER_SLASH_NAME,
         handler=lambda raw, _ctx=ctx: _handle_butler_slash(_ctx, raw),
@@ -324,4 +393,4 @@ def register(ctx):
                            description="Butler plugin dev conventions: flat step keys, restart batching, verify-dsh-rule, checklist shape, TCC scope, card etiquette. Load for any butler board or code work.")
     except Exception:
         logger.exception("butler:conventions skill registration failed")
-    logger.info("Butler plugin registered: 6 tools, /butler (injected turn), CLI 'butler', 2 skills")
+    logger.info("Butler plugin registered: 9 tools, /butler (injected turn), CLI 'butler', 2 skills")

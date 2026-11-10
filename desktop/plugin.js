@@ -1991,8 +1991,37 @@ function petStatusLine(cur) {
       ? `Capture failed: ${note}`
       : 'Capture failed — butler could not read the screen'
   }
+  // A live guide instruction outranks an ambient watch; with no guide running,
+  // the watch is the status the pet carries while the user is in another app.
+  if (!instruction) {
+    const watchLine = watchStatusLine(cur && cur.watch)
+    if (watchLine) return watchLine
+  }
   // Live step: speak the current instruction (restored by user request).
   return instruction
+}
+
+/**
+ * The ambient WATCH line the pet carries while a watch is active.
+ *
+ * WATCH is passive and runs while the user is in another app, so its only
+ * surface is the shared pet speech beat: the change count while observing, and
+ * the hit label once the condition fired. No new window and no new channel.
+ * A stopped watch (app quit) drops the line; the state row keeps the details.
+ */
+function watchStatusLine(watch) {
+  const row = watch && typeof watch === 'object' ? watch : null
+  // `stopped` is an object in the state row ({"reason","events","at"}), never a
+  // string; test its shape, not its stringification ("[object Object]").
+  const stopped = row && row.stopped && typeof row.stopped === 'object' ? row.stopped : null
+  if (!row || stopped) return null
+  const hit = row.hit && typeof row.hit === 'object' ? row.hit : null
+  const hitLabel = asText(hit && hit.label)
+  if (hitLabel) return `⏲ Watch · hit: ${hitLabel}`
+  const app = asText(row.app)
+  if (!app) return null
+  const changes = asNumber(row.events)
+  return `⏲ Watch · ${app} · ${changes} ${changes === 1 ? 'change' : 'changes'}`
 }
 
 /**
@@ -2093,7 +2122,13 @@ function ButlerApp() {
   // Pet speech is evaluated on its own 2 s clock so a stale React feed cannot
   // pin the last line on screen. `say` is the agent's on-screen answer; the
   // beat speaks it once, ahead of the guide status line, for its ttl.
-  const stateRef = useRef({ status: null, note: null, instruction: null, currentStep: 0, total: 0, verified: 0, say: null })
+  // The ambient watch row (if any) rides the same snapshot; the pet beat
+  // speaks its change count / hit label, nothing else.
+  const rawWatch = data && data.watch
+  const watch = rawWatch && typeof rawWatch === 'object' && Object.keys(rawWatch).length > 0
+    ? rawWatch
+    : null
+  const stateRef = useRef({ status: null, note: null, instruction: null, currentStep: 0, total: 0, verified: 0, say: null, watch: null })
   stateRef.current = {
     status,
     note: asText(state.note),
@@ -2101,7 +2136,8 @@ function ButlerApp() {
     currentStep,
     total: steps.length,
     verified: verifications.length,
-    say: answer
+    say: answer,
+    watch
   }
   useEffect(() => {
     const beat = () => { petSpeechBeat(stateRef.current) }

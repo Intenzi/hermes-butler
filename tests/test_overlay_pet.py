@@ -345,6 +345,41 @@ def test_reader_dispatches_click_events_and_queues_ax_responses() -> None:
     assert reply == {"trusted": True, "count": 0}
 
 
+def test_watch_event_stream_never_starves_the_start_ack() -> None:
+    """Watch lines are unsolicited: only the ack may reach the request inbox.
+
+    If focus/value events queued behind an ack, every `watch_start` would read
+    the wrong line (or time out). The reader must hand events to on_event and
+    leave the inbox for the one-shot reply.
+    """
+    controller = overlay.Overlay()
+    seen = []
+    controller.on_event = seen.append
+
+    controller._handle_message({"op": "watch-event", "seq": 1})
+    controller._handle_message({"op": "watch-hit", "label": "done"})
+    controller._handle_message({"op": "watch-stopped", "events": 2})
+    controller._handle_message({"op": "watch-started", "app": "Slack"})
+
+    assert [message["op"] for message in seen] == [
+        "watch-event", "watch-hit", "watch-stopped"]
+    ack = controller._inbox.get_nowait()
+    assert ack["op"] == "watch-started", "the ack is the only inbox row"
+    assert controller._inbox.empty()
+
+
+def test_watch_stop_is_fire_and_forget() -> None:
+    """The stop reply rides on_event, so the op must not wait on request()."""
+    proc = _FakeProc()
+    controller = overlay.Overlay()
+    controller.proc = proc
+
+    controller.send({"op": "watch_stop"})
+
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    assert [json.loads(line) for line in lines] == [{"op": "watch_stop"}]
+
+
 def test_companion_source_has_the_popout_claim_chip_contract() -> None:
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
@@ -1134,3 +1169,165 @@ def test_look_never_answers_with_our_own_window() -> None:
     drop = _swift_function_body(source, "private func endLookDrag(at screenPoint: NSPoint)",
                                 "/// Read the drop point")
     assert "resolveLookDrop(" in drop
+
+
+def test_watch_observes_the_app_windows_and_focused_control() -> None:
+    """WATCH is an AXObserver over the watched app, never a screen capture.
+
+    The brief names the exact notification set. ``kAXWindowTitleChangedNotification``
+    is not exposed by this SDK's AXNotificationConstants.h, so windows carry
+    ``kAXTitleChangedNotification`` — the notification apps actually post when a
+    window title changes.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    # Wire contract: two new stdin ops, both parsed, both dispatched.
+    assert 'case "watch_start"' in source
+    assert 'case "watch_stop"' in source
+    assert "return .watchStart(" in source
+    assert "return .watchStop" in source
+    assert "case .watchStart(let spec):" in source
+    assert "startWatch(spec)" in source
+    assert 'stopWatch(reason: "stopped", emit: true)' in source
+
+    install = _swift_function_body(source, "private func startWatch(",
+                                   "private func resetWatchState()")
+    assert "AXObserverCreate(pid, watchAXObserverCallback" in install
+    assert "AXIsProcessTrusted()" in install
+    assert 'watchFailure("app-not-running", token: spec.token)' in install
+    assert 'watchFailure("app-not-trusted", token: spec.token)' in install
+    assert '"op": "watch-started"' in install
+    assert "findWatchApp(named: spec.app)" in install
+    # Main run loop, same as the claim chip's observer.
+    assert "CFRunLoopAddSource" in install
+    # The NEW observer is validated before the RUNNING watch is torn down: a
+    # rejected start must not kill a watch that is still working.
+    teardown_at = install.find('stopWatch(reason: "replaced", emit: false)')
+    assert teardown_at != -1
+    assert teardown_at > install.find("guard registered > 0 else")
+    assert "watchRootElement = root" in install
+
+    # App element notifications (lifecycle).
+    for notification in (
+        "kAXFocusedUIElementChangedNotification",
+        "kAXWindowCreatedNotification",
+        "kAXWindowMiniaturizedNotification",
+        "kAXWindowDeminiaturizedNotification",
+        "kAXApplicationActivatedNotification",
+        "kAXApplicationDeactivatedNotification",
+        "kAXUIElementDestroyedNotification",
+    ):
+        assert notification in install, f"app observer missing {notification}"
+
+    # Per-window notifications: title, destroyed, moved (moved is installed but
+    # dropped in the handler).
+    windows = _swift_function_body(source,
+                                   "private func attachWatchWindowObservers()",
+                                   "private func attachWatchFocusedObservers()")
+    assert "kAXTitleChangedNotification" in windows
+    assert "kAXUIElementDestroyedNotification" in windows
+    assert "kAXWindowMovedNotification" in windows
+    assert "axWindowElements(of: root)" in windows
+    assert "observedWatchWindows[key] = window" in windows
+
+    # Focused control: value / title / selection, re-installed on focus change.
+    focused = _swift_function_body(source,
+                                   "private func attachWatchFocusedObservers()",
+                                   "fileprivate func watchAXNotificationFired")
+    assert "AXFocusedUIElement" in focused
+    for notification in ("kAXValueChangedNotification",
+                         "kAXTitleChangedNotification",
+                         "kAXSelectedChildrenChangedNotification"):
+        assert notification in focused
+    assert "AXObserverRemoveNotification(observer, previous" in focused
+    process = _swift_function_body(source,
+                                   "private func processWatchAXNotification(",
+                                   "private func watchRole(")
+    assert "case kAXFocusedUIElementChangedNotification:" in process
+    assert "attachWatchFocusedObservers()" in process
+    assert "if name == kAXWindowMovedNotification" in process, (
+        "the move hot path must be dropped before any AX read")
+
+    # Every kind in the contract is produced.
+    for kind in ("focus", "window-new", "window-gone", "window-title", "value",
+                 "activated", "deactivated"):
+        assert '"%s"' % kind in process or 'kind: "%s"' % kind in process
+
+
+def test_watch_coalesces_events_and_announces_a_hit_once() -> None:
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert "private let watchMaxEventsPerSecond = 4" in source
+    assert "private let watchDuplicateWindow: TimeInterval = 0.15" in source
+    assert "private let watchRateWindow: TimeInterval = 1.0" in source
+
+    emit = _swift_function_body(source, "private func emitWatchEvent(",
+                                "/// Find the core Hermes pet pop-out.")
+    # The condition check runs BEFORE the rate/duplicate gates.
+    assert emit.find('"op": "watch-hit"') < emit.find("watchEmitTimes.removeAll")
+    assert "if watchHitArmed, let until = watchUntil" in emit
+    assert "watchHitArmed = false" in emit
+    assert "labelText.contains(needle) || valueText.contains(needle)" in emit
+    assert "watchEmitTimes.count < watchMaxEventsPerSecond" in emit
+    assert "now.timeIntervalSince(last) < watchDuplicateWindow" in emit
+    # old/new only when both sides are readable strings (empty counts as a
+    # readable value: clearing a field is a change).
+    assert "if let old = old, let new = new {" in emit
+    assert "private func axWatchRawValueText(" in source
+
+    # Labels are title -> description -> value, trimmed to 120.
+    label = _swift_function_body(source, "private func watchLabel(",
+                                 "private func axWatchValueText(")
+    assert "AXTitle" in label and "AXDescription" in label
+    assert "axWatchValueText(element)" in label
+    assert "private let watchLabelLimit = 120" in source
+
+    # "stop matching until re-armed": only a new watch_start re-arms.
+    start = _swift_function_body(source, "private func startWatch(",
+                                 "private func resetWatchState()")
+    assert "watchHitArmed = spec.until != nil" in start
+
+
+def test_watch_stop_removes_every_observer_and_the_run_loop_source() -> None:
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    stop = _swift_function_body(source,
+                                "private func stopWatch(reason: String, emit: Bool)",
+                                "/// A watch must not outlive the app it observes.")
+    assert "AXObserverRemoveNotification(observer, root" in stop
+    assert "watchRootElement" in stop, "removal uses the element registered on"
+    assert "AXObserverRemoveNotification(observer, focused" in stop
+    assert "AXObserverRemoveNotification(observer, window" in stop
+    assert "CFRunLoopRemoveSource" in stop
+    assert "watchObserver = nil" in stop
+    assert "resetWatchState()" in stop
+    reset = _swift_function_body(source, "private func resetWatchState()",
+                                 "private func stopWatch(")
+    assert "watchLivenessTimer?.invalidate()" in reset, (
+        "the liveness timer is a resource too")
+    assert '"op": "watch-stopped"' in stop
+    assert '"events": events' in stop
+
+    # App quit is a clean stop with a reason, from either path.
+    process = _swift_function_body(source,
+                                   "private func processWatchAXNotification(",
+                                   "private func watchRole(")
+    assert 'stopWatch(reason: "app-quit", emit: true)' in process
+    assert "CFEqual(element, root)" in process, (
+        "app-quit identity uses the stored root wrapper, never a fresh one")
+    liveness = _swift_function_body(source, "private func startWatchLivenessTimer()",
+                                    "private func attachWatchWindowObservers()")
+    assert "NSRunningApplication(processIdentifier: pid)" in liveness
+    assert 'stopWatch(reason: "app-quit", emit: true)' in liveness
+
+    # The idle watchdog and the farewell exit must not retire a live watch.
+    watchdog = _swift_function_body(source, "private func watchdogFired()",
+                                    "/// Invalidate any scheduled post-farewell exit.")
+    assert "watchObserver == nil" in watchdog
+    assert "watchObserver == nil" in _swift_function_body(
+        source, "private func scheduleExitAfterFarewell()",
+        "// MARK: Teardown")
+
+    shutdown = _swift_function_body(source, "func shutdown() {",
+                                    "// MARK: - Application delegate")
+    assert 'stopWatch(reason: "shutdown", emit: false)' in shutdown
