@@ -34,6 +34,11 @@ GUIDE_START_SCHEMA = {
     "type": "object",
     "properties": {
         "title": {"type": "string", "description": "Short guide title, e.g. 'Fix DNS'."},
+        "replace": {
+            "type": "boolean",
+            "default": False,
+            "description": "Take over from a guide that is already active by stopping it first.",
+        },
         "steps": {
             "type": "array",
             "minItems": 1,
@@ -344,7 +349,7 @@ def register(ctx):
     global _PLUGIN_CONTEXT
     _PLUGIN_CONTEXT = ctx
     ctx.register_tool(name="butler_guide_start", toolset="butler", schema=GUIDE_START_SCHEMA,
-                      handler=tool_guide_start, description="Walk the user through a plan: steps shown on screen, verified from the OS layer.", emoji="🎩")
+                      handler=tool_guide_start, description="Walk the user through a plan: steps shown on screen, verified from the OS layer. Pass replace=true to take over a guide that is already active.", emoji="🎩")
     ctx.register_tool(name="butler_guide_status", toolset="butler", schema=GUIDE_STATUS_SCHEMA,
                       handler=tool_guide_status, description="Current butler guide progress and last verification results.", emoji="🎩")
     ctx.register_tool(name="butler_capture", toolset="butler", schema=CAPTURE_SCHEMA,

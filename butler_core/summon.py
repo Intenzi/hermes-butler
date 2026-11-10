@@ -13,7 +13,9 @@ SUMMON_FRAMING_TEMPLATE = (
     "[butler summon] {text}\n\n"
     "Treat the request above as a butler guidance task: plan a follow-mode guide "
     "(butler:follow skill) and start it with butler_guide_start; if it is too vague "
-    "to ground one first step, ask exactly ONE short clarifying question and wait."
+    "to ground one first step, ask exactly ONE short clarifying question and wait. "
+    "Only one guide runs at a time: if a guide is already active, stop it with "
+    "butler_stop or pass replace=true — never leave two running."
 )
 
 #: The slash command returns only this small acknowledgement. The real answer is
@@ -30,7 +32,9 @@ LOOK_FRAMING_TEMPLATE = (
     "line of at most 90 characters (a dozen words — the pet bubble truncates "
     "past 120) giving the short answer, so the user "
     "sees it beside their pointer instead of opening the chat. Keep the full "
-    "explanation for the chat."
+    "explanation for the chat. Only one guide runs at a time: if a guide is "
+    "already active, stop it with butler_stop or pass replace=true — never leave "
+    "two running."
 )
 
 #: The two pieces the desktop's LOOK row already carries (lookPendingText):

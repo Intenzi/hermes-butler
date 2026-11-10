@@ -26,6 +26,11 @@ _OVERLAY = bp_overlay.Overlay()
 DATA_DIR = None
 DEFAULT_POLL = 1.5
 DEFAULT_TIMEOUT = 120.0
+#: A stalled guide stops itself after this long without a verification. The
+#: note is stable (no elapsed counter), so the pet stops repeating a changing
+#: line; this deadline turns the silence into a clean stop instead of leaving
+#: an unverified guide alive forever.
+DEFAULT_STALL_AUTO_STOP = 180.0
 DEFAULT_PET_CLICK_CLAIM = True
 ERROR_STREAK_NOTE = 3  # consecutive poll errors before the note surfaces
 #: The host truncates every plugin line at PET_MESSAGE_MAX_CHARS = 120, so a
@@ -105,6 +110,16 @@ def poll_seconds():
 
 def step_timeout():
     return float(_cfg().get("step_timeout_seconds", DEFAULT_TIMEOUT))
+
+
+def stall_auto_stop_seconds():
+    """How long a stalled guide may stay stalled before it stops itself."""
+    return float(_cfg().get("stall_auto_stop_seconds", DEFAULT_STALL_AUTO_STOP))
+
+
+#: Back-compat spelling for callers that follow step_timeout()'s short name.
+def stall_auto_stop():
+    return stall_auto_stop_seconds()
 
 
 def _evaluate_step(step, snap):
@@ -846,14 +861,15 @@ def set_claim_chip(enabled):
     return {"enabled": True, "running": True, "detail": str(detail)}
 
 
-def _save_session():
-    if not _session:
+def _save_session(session=None):
+    target = session if session is not None else _session
+    if not target:
         return
-    path = os.path.join(_guides_dir(), _session["id"] + ".json")
+    path = os.path.join(_guides_dir(), target["id"] + ".json")
     tmp = path + ".tmp"
     try:
         with open(tmp, "w") as f:
-            json.dump(_session, f, indent=1, ensure_ascii=False)
+            json.dump(target, f, indent=1, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception:
         pass
@@ -865,7 +881,7 @@ def _loop():
         time.sleep(poll)
         with _lock:
             s = _session
-            if not s or s.get("state", {}).get("status") != "running":
+            if not s or s.get("state", {}).get("status") not in ("running", "stalled"):
                 continue
             try:
                 _poll_once(s)
@@ -884,6 +900,52 @@ def _loop():
             s["poll_errors"] = 0
             _save_session()
             _write_state()
+
+
+def _abandon_stalled(s, idx):
+    """Stop a guide that stayed stalled past the auto-stop deadline.
+
+    Mirrors ``guide_stop``: finalise the session, persist it to history, idle
+    the overlay, and leave exactly one pet line. The session row stays in
+    ``_session`` so ``butler_guide_status`` can report the terminal
+    ``abandoned`` status; the poll loop exits via ``_stop_flag``.
+    """
+    global _stop_flag
+    reason = "step %d was never verified" % (idx + 1)
+    s["state"]["status"] = "abandoned"
+    s["state"]["note"] = reason
+    s["state"].pop("stalled_at", None)
+    s["reason"] = reason
+    s["current_box"] = None
+    s["current_label"] = None
+    s["overlay"] = "idle"
+    _save_session(s)
+    _OVERLAY.idle()
+    _write_state()
+    say("Guide stopped — step %d never verified" % (idx + 1))
+    _stop_flag = True
+
+
+def _supersede_active(reason="replaced by a new guide"):
+    """Archive the running guide as ``superseded`` and reset its overlay.
+
+    Returns the archived session row, or None when no guide was active. The
+    caller is responsible for installing the replacement session.
+    """
+    active = _session
+    if not active:
+        return None
+    active["state"]["status"] = "superseded"
+    active["state"]["note"] = reason
+    active["state"].pop("stalled_at", None)
+    active["reason"] = reason
+    active["current_box"] = None
+    active["current_label"] = None
+    active["overlay"] = "idle"
+    _save_session(active)
+    _OVERLAY.idle()
+    say("Replaced the previous guide")
+    return active
 
 
 def _poll_once(s):
@@ -939,6 +1001,10 @@ def _poll_once(s):
             s["overlay"] = "waiting"
             _OVERLAY.idle()
     if verdict["verified"]:
+        # A stalled guide that verifies before the deadline clears the stall.
+        s["state"]["status"] = "running"
+        s["state"]["note"] = None
+        s["state"].pop("stalled_at", None)
         s["verifications"].append({"step": idx, "reason": verdict["reason"],
                                    "verified_at": time.time()})
         idx += 1
@@ -963,9 +1029,22 @@ def _poll_once(s):
     opened_at = s["state"].get("step_opened_at") or s.get("started_at") or time.time()
     held = time.time() - opened_at
     if held > step_timeout():
+        now = time.time()
+        # Stable note: never carry the elapsed number, or the pet's status line
+        # changes every tick and the speech dedupe can never suppress it.
+        note = "step %d unverified — expect=%s" % (idx + 1, verdict["reason"])
+        stalled_at = s["state"].get("stalled_at")
+        if stalled_at is None:
+            # The stall began when the step passed its timeout; deriving it
+            # from the step timer (not from this poll tick) means a guide that
+            # was stalled while nobody polled still stops on the next tick.
+            stalled_at = opened_at + step_timeout()
+            s["state"]["stalled_at"] = stalled_at
         s["state"]["status"] = "stalled"
-        s["state"]["note"] = ("step %d unverified for %.0fs; expect=%s" % (
-            idx + 1, step_timeout(), verdict["reason"]))
+        if now - stalled_at >= stall_auto_stop_seconds():
+            _abandon_stalled(s, idx)
+            return
+        s["state"]["note"] = note
 
 
 def guide_start(args, unattended=False):
@@ -974,13 +1053,23 @@ def guide_start(args, unattended=False):
                 "refusal": "unattended_run"}
     global _session, _thread, _stop_flag
     with _lock:
-        if _session and _session.get("state", {}).get("status") in ("running", "stalled"):
+        active = (_session
+                  if _session and _session.get("state", {}).get("status")
+                  in ("running", "stalled") else None)
+        replace = _as_bool(args.get("replace"))
+        if active and not replace:
             return {"error": "a guide is already active",
-                    "active": _session["id"], "step": _session["state"]["idx"] + 1}
+                    "active": _session["id"], "step": _session["state"]["idx"] + 1,
+                    "hint": "a guide is already active — pass replace=true to "
+                            "take over, or butler_stop first"}
         steps = _normalize_steps(args.get("steps") or [])
         if not steps:
             return {"error": "guide start rejected: no verifiable steps "
                              "(each step needs say + find.label or an expect key)"}
+        replaced_id = None
+        if active and replace:
+            old = _supersede_active()
+            replaced_id = old["id"] if old else None
         guide = {
             "id": uuid.uuid4().hex[:10],
             "title": args.get("title") or "Guide",
@@ -1050,6 +1139,7 @@ def guide_start(args, unattended=False):
                 "step": {"idx": 1, "say": guide["state"]["say"]},
                 "overlay": guide["overlay"],
                 "note": guide["state"].get("note"),
+                "replaced": replaced_id,
                 "total_steps": len(steps)}
 
 
@@ -1069,6 +1159,7 @@ def guide_stop(reason="stopped"):
             return {"status": "idle"}
         _session["state"]["status"] = "stopped"
         _session["state"]["note"] = reason
+        _session["reason"] = reason
         _session["current_box"] = None
         stopped = dict(_session)
         _OVERLAY.quit()

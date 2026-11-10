@@ -505,7 +505,7 @@ def _history_entry(data: dict[str, Any], fallback_id: str) -> dict[str, Any]:
     steps = data.get("steps") if isinstance(data.get("steps"), list) else []
     verifications = (data.get("verifications")
                      if isinstance(data.get("verifications"), list) else [])
-    return {
+    entry = {
         "id": str(data.get("id") or fallback_id),
         "title": data.get("title") or "Guide",
         "status": state.get("status") or data.get("status") or "unknown",
@@ -513,6 +513,14 @@ def _history_entry(data: dict[str, Any], fallback_id: str) -> dict[str, Any]:
         "verifications": verifications,
         "started_at": data.get("started_at"),
     }
+    # Terminal rows keep their reason (stopped / superseded / abandoned), so
+    # history can explain why a guide ended. Only terminal rows: a running or
+    # stalled guide's state.note is a transient instruction, not an ending.
+    if entry["status"] in ("stopped", "superseded", "abandoned"):
+        reason = data.get("reason") or state.get("note")
+        if isinstance(reason, str) and reason.strip():
+            entry["reason"] = reason.strip()
+    return entry
 
 
 def _read_history() -> list[dict[str, Any]]:
