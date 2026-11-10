@@ -802,65 +802,156 @@ def test_summon_works_outside_hermes_without_raising_the_window() -> None:
     assert "emitSummon" not in click
 
 
-def test_look_hot_key_hit_tests_the_cursor_and_asks_about_that_element() -> None:
-    """⌘⇧L is a second door: point at a control, then type the question."""
+def test_look_is_a_pointer_drag_not_a_hot_key() -> None:
+    """LOOK is press-and-drag the hat, never a chord.
+
+    A press under the threshold still opens the ask field; movement past it
+    turns the same press into a pointer read-out, so the key path is gone end
+    to end.
+    """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
-    # A second, distinguishable Carbon hot key (id 2 = ⌘⇧L, id 1 stays ⌘⇧A).
-    assert "EventHotKeyID(signature: OSType(0x42544C52), id: 2)" in source
-    assert "kVK_ANSI_L" in source
-    assert "GetEventParameter" in source
-    assert "kEventParamDirectObject" in source
-    assert "typeEventHotKeyID" in source
-    install = _swift_function_body(source, "private func installLookHotKey()",
-                                   "private func removeSummonHotKey()")
-    assert "RegisterEventHotKey" in install
-    assert '"look-hotkey-installed"' in install
-    assert '"look-hotkey-failed:' in install
+    # The chord, its Carbon id and its journal lines are gone for good.
+    assert "kVK_ANSI_L" not in source
+    assert "lookHotKeyFired" not in source
+    assert "installLookHotKey" not in source
+    assert "look-hotkey-installed" not in source
+    assert "look-hotkey-failed" not in source
+    assert "EventHotKeyID(signature: OSType(0x42544C52), id: 2)" not in source
 
-    # Hit-test the element under the cursor with the system-wide AX API.
-    assert "AXUIElementCreateSystemWide()" in source
-    assert "AXUIElementCopyElementAtPosition(" in source
-    assert "NSEvent.mouseLocation" in source
-    assert "AXUIElementGetPid(" in source
-    assert "AXEnabled" in source
-    assert "AXDocument" in source
-    assert "AXURL" in source
-    # The failed hit-test still opens LOOK, labelled with the frontmost app, and
-    # an element with no readable parts falls back to its enclosing window.
-    assert '"Window: " + (frontmost ?? "unknown")' in source
-    assert '"Window: " + (enclosing.window ?? app ?? frontmost ?? "unknown")' in source
+    chip_view = _swift_function_body(source,
+                                     "private final class ClaimChipView: NSView {",
+                                     "// MARK: - Pointer LOOK card")
+    assert "static let dragThreshold: CGFloat = 4.0" in chip_view
+    assert "👀" in chip_view, "the drag state draws the eye glyph"
 
-    # The one-line context: role without AX, quoted label, app name.
-    assert "lookContext" in source
-    assert "contextLine" in source
-    assert "func configureForLook(context:" in source
-    assert "Ask about this…" in source
-    assert "contextLabel.lineBreakMode = .byTruncatingTail" in source
-    assert "NSFont.systemFont(ofSize: 10.5)" in source
-    assert "static let lookFieldHeight: CGFloat = 52.0" in source
+    down = _swift_function_body(
+        chip_view, "override func mouseDown(with event: NSEvent) {",
+        "override func mouseDragged(with event: NSEvent) {")
+    dragged = _swift_function_body(
+        chip_view, "override func mouseDragged(with event: NSEvent) {",
+        "override func mouseUp(with event: NSEvent) {")
+    up = _swift_function_body(
+        chip_view, "override func mouseUp(with event: NSEvent) {",
+        "override func draw(")
 
-    # The wire payload and its journal trail.
-    submit = _swift_function_body(source, "private func submitLookText(",
-                                  "private func appendSummonSpool(")
-    assert '"look_text"' in submit
-    assert '"target": target.payload' in submit
-    assert "JSONSerialization.data(withJSONObject: payload" in submit
-    assert "FileHandle.standardOutput.write" in submit
-    assert "appendSummonSpool(line)" in submit
-    assert '"look-submit:' in submit
-    assert '"look-open"' in source
-    assert '"look-cancel"' in source
+    # A plain press latches placement off but does not open anything yet.
+    assert "pressStart" in down
+    assert "onPressBegan?(point)" in down
+    assert "onClick?()" not in down
+    # Movement past the 4 pt threshold promotes the press to a drag.
+    assert "movement > ClaimChipView.dragThreshold" in dragged
+    assert "onDragBegan?(start)" in dragged
+    assert "onDragMoved?(point)" in dragged
+    # Release without movement is the click that still opens the ask field.
+    assert "onDragEnded?(point)" in up
+    assert "onClick?()" in up
+    # A lost mouseUp must not pin placement forever.
+    assert "recoverLostPressIfNeeded()" in source
+    assert "NSEvent.pressedMouseButtons == 0" in source
+    assert "func cancelPendingPress()" in chip_view
 
-    # ⌘⇧L opens LOOK mode, never the plain ask path; ⌘⇧A still does.
-    look = _swift_function_body(source, "private func lookHotKeyFired()",
-                                "// MARK: Pet double")
-    assert "openLookField()" in look
-    assert "openSummonField()" not in look
-    opened = _swift_function_body(source, "private func openLookField()",
-                                  "private func submitSummonText(")
-    assert "axLookTargetUnderCursor()" in opened
-    assert "openSummonField()" in opened
+
+def test_look_card_is_a_non_activating_pointer_readout() -> None:
+    """The drop shows a 320 pt card that never takes focus and never emits."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    window = _swift_function_body(
+        source,
+        "private final class LookCardWindow: NSPanel {",
+        "private final class LookCardView: NSView {")
+    assert "override var canBecomeKey: Bool" in window
+    assert "return false" in window
+    assert "override var canBecomeMain: Bool" in window
+    assert "autoDismissInterval: TimeInterval = 6.0" in window
+
+    card = _swift_function_body(
+        source,
+        "private final class LookCardView: NSView {",
+        "// MARK: - In-place ask field")
+    assert "static let cardWidth: CGFloat = 320.0" in card
+    assert "static let maxLines = 5" in card
+    assert ".byTruncatingTail" in card
+    assert "maximumNumberOfLines = 1" in card
+    # No buttons, no footer, no chat link: nothing to click or type.
+    assert "NSButton" not in window + card
+
+    # Dismissal paths: click monitors, Esc (keyCode 53), the 6 s timer, hat.
+    controller = _swift_function_body(
+        source, "private func presentLookCard(",
+        "// MARK: In-place ask field")
+    assert "NSEvent.addLocalMonitorForEvents" in controller
+    assert "NSEvent.addGlobalMonitorForEvents" in controller
+    assert "keyCode == escape" in controller
+    assert "let escape: UInt16 = 53" in controller
+    assert "dismissLookCard()" in controller
+    assert "RunLoop.main.add(timer, forMode: .common)" in controller
+    assert "dismissLookCard()" in _swift_function_body(
+        source, "private func claimChipClicked() {",
+        "// MARK: Pointer LOOK gesture")
+
+    end = _swift_function_body(
+        source, "private func endLookDrag(at screenPoint: NSPoint) {",
+        "private func lookCardFrame(")
+    present = _swift_function_body(
+        source, "private func presentLookCard(",
+        "private func installLookCardMonitors()")
+    for body in (end, present, window, card):
+        assert "summon_text" not in body
+        assert "look_text" not in body
+        assert "openSummonField()" not in body
+    assert "lookElementDescriptor(at: point)" in end
+
+    # Anchored away from the pointer so the card never covers it.
+    frame = _swift_function_body(
+        source, "private func lookCardFrame(at point: CGPoint,",
+        "private func presentLookCard(")
+    assert "point.x + gap" in frame
+    assert "point.y + gap" in frame
+    assert "point.x - gap - size.width" in frame
+    assert "point.y - gap - size.height" in frame
+
+
+def test_look_resolution_walks_children_then_parents_and_falls_back_honestly() -> None:
+    """Chromium/Electron returns a bare AXGroup: descend, then ascend, then say
+    'Window · <app>' instead of printing Group alone.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert "private func lookElementDescriptor(at point: CGPoint) -> LookDescriptor" in source
+    helper = _swift_function_body(
+        source,
+        "private func lookElementDescriptor(at point: CGPoint) -> LookDescriptor {",
+        "/// Hit-test the cursor and compose the LOOK context")
+    assert "axElementUnderCursor(point)" in helper
+    # The hit-test must use the drop point, not the live cursor.
+    hit = _swift_function_body(
+        source, "private func axElementUnderCursor(", "private func axRoleName(")
+    assert "Float(point.x)" in hit
+    assert "Float(point.y)" in hit
+    assert "cursorQuartzPoint()" not in hit
+    assert '"AXChildren"' in helper
+    assert '"AXParent"' in helper
+    assert "labelledDescendant(hit, levels: 2)" in helper
+    assert "labelledAncestor(hit, levels: 4)" in helper
+    # The measured defect: an unnamed container resolves to its window/app.
+    assert "isWindowFallback: true" in helper
+    assert '"Window"' in helper
+
+    descriptor = _swift_function_body(
+        source, "private struct LookDescriptor {",
+        "private let axContainerRoles")
+    # Hard cap, state line and the string-only value line.
+    assert "prefix(5)" in descriptor
+    assert '"disabled"' in descriptor
+    assert 'Value: ' in descriptor
+    assert "isWindowFallback" in descriptor
+
+    # The retained typed path now resolves through the same helper.
+    target = _swift_function_body(
+        source, "private func axLookTargetUnderCursor()",
+        "private func walkAX(")
+    assert "lookElementDescriptor(at: point)" in target
 
 
 def test_summon_field_is_a_local_in_place_text_entry() -> None:

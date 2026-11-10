@@ -29,9 +29,13 @@
 //               "window":"receipt.pdf","doc":"file:///...","enabled":true,
 //               "box":[x,y,w,h]}}
 //
-//  Two global Carbon hot keys: ⌘⇧A opens the plain ask field, ⌘⇧L hit-tests the
-//  element under the cursor (AXUIElementCopyElementAtPosition on the system-wide
-//  element) and opens the same field in LOOK mode with that element as context.
+//  One global Carbon hot key: ⌘⇧A opens the plain ask field.
+//
+//  LOOK is a pointer gesture, not a key: press and drag the hat, release over
+//  anything, and a small non-activating card appears next to the pointer with
+//  what the Accessibility layer knows about that element
+//  (AXUIElementCopyElementAtPosition on the system-wide element). It never
+//  focuses Hermes, never takes keyboard focus and never emits a request.
 //
 //  The legacy {"op":"claim_click"} (text-less) event is no longer emitted by
 //  this renderer; the engine still accepts it for older companion binaries.
@@ -409,7 +413,7 @@ private func readAXFields(_ element: AXUIElement) -> AXFields {
 
 // MARK: - LOOK hit-test (element under the cursor)
 
-/// One element the ⌘⇧L door is asking about. Every field is optional: an
+/// One element a typed LOOK request can name. Every field is optional: an
 /// attribute the OS refused to read is simply absent from the wire payload
 /// (and from the one-line context), never sent as a null.
 private struct LookTarget {
@@ -553,38 +557,243 @@ private func axBoxAttribute(_ element: AXUIElement) -> [Int]? {
             Int(dimensions.width.rounded()), Int(dimensions.height.rounded())]
 }
 
-/// Hit-test the cursor and compose the LOOK context + target. When AX has no
-/// element (or no screen height) it falls back to the frontmost app's window,
-/// so ⌘⇧L still opens instead of failing silently.
+// MARK: - Pointer LOOK descriptor
+
+/// What Accessibility actually knows about one point. The card and the retained
+/// typed LOOK path both read this one shape, so a future caller never invents a
+/// second resolution order.
+private struct LookDescriptor {
+    var role: String?
+    var label: String?
+    var app: String?
+    var window: String?
+    var doc: String?
+    var enabled: Bool?
+    var value: String?
+    var box: [Int]?
+    /// True when AX could not name the element under the pointer and the honest
+    /// answer is the window/app it belongs to.
+    var isWindowFallback = false
+
+    /// 1..5 card rows, in draw order. More than five is ellipsised by the card.
+    var lines: [String] {
+        var rows: [String] = []
+        if isWindowFallback {
+            rows.append("Window \u{00B7} " + (axNonEmpty(app) ?? "frontmost app"))
+            if let window = axNonEmpty(window), window != axNonEmpty(app) {
+                rows.append(window)
+            }
+        } else {
+            if let role = axNonEmpty(role) {
+                if let label = axNonEmpty(label) {
+                    rows.append("\(role) \u{00B7} \u{201C}\(label)\u{201D}")
+                } else {
+                    rows.append(role)
+                }
+            } else if let label = axNonEmpty(label) {
+                rows.append("\u{201C}\(label)\u{201D}")
+            }
+            if let app = axNonEmpty(app) {
+                var row = app
+                if let window = axNonEmpty(window) {
+                    row += " \u{00B7} " + window
+                }
+                if let doc = axNonEmpty(doc) {
+                    row += " \u{2014} " + doc
+                }
+                rows.append(row)
+            } else if let window = axNonEmpty(window) {
+                rows.append(window)
+            }
+            if enabled == false {
+                rows.append("disabled")
+            }
+            // Static text carries its words in AXValue, so the label row can
+            // already be that same string: do not spend a second line on it.
+            if let value = axNonEmpty(value),
+               value != axNonEmpty(label) {
+                rows.append("Value: \u{201C}\(value)\u{201D}")
+            }
+        }
+        return Array(rows.prefix(5))
+    }
+
+    /// `Button · "Export" — Preview`, used by the retained one-line typed path.
+    var contextLine: String {
+        let rows = lines
+        guard let first = rows.first else { return "" }
+        if !isWindowFallback, rows.count > 1, let app = axNonEmpty(app) {
+            return first + " \u{2014} " + app
+        }
+        return first
+    }
+}
+
+/// Container roles describe *where* a control lives, not the control itself.
+/// A Chromium/Electron button hit-test comes back as a bare `AXGroup` with no
+/// label (measured on the Hermes window at (98,46)), so an unlabelled container
+/// must never end the search.
+private let axContainerRoles: Set<String> = [
+    "AXGroup", "AXPane", "AXScrollArea", "AXSplitGroup", "AXLayoutArea",
+    "AXLayoutItem", "AXUnknown", "AXGenericElement", "AXList", "AXTable",
+    "AXRow", "AXColumn", "AXOutline", "AXCanvas", "AXWebArea", "AXImage",
+    "AXStaticText", "AXHeading",
+]
+
+/// Text in AXValue is only a read-out line for string values; numbers and
+/// ranges are not worth showing on a glance card.
+private func axValueString(_ element: AXUIElement) -> String? {
+    guard let raw = copyAXAttribute(element, "AXValue"),
+          let text = raw as? String,
+          let trimmed = axNonEmpty(text) else {
+        return nil
+    }
+    return String(trimmed.prefix(120))
+}
+
+/// The label a human would read: title, then description, then (for static
+/// text, which carries its words in AXValue) the value itself.
+private func axLookLabel(_ element: AXUIElement) -> String? {
+    if let title = axNonEmpty(axString(element, "AXTitle")) {
+        return title
+    }
+    if let description = axNonEmpty(axString(element, "AXDescription")) {
+        return description
+    }
+    let role = axString(element, "AXRole") ?? ""
+    if role == "AXStaticText" || role == "AXHeading" {
+        return axValueString(element)
+    }
+    return nil
+}
+
+private func axElementList(_ element: AXUIElement, attribute: String) -> [AXUIElement] {
+    guard let raw = copyAXAttribute(element, attribute) as? [Any] else {
+        return []
+    }
+    return raw.compactMap { axElement(from: $0) }
+}
+
+/// Resolve the Accessibility element at a Quartz point into the card read-out.
+///
+/// The order fixes the measured Chromium/Electron defect:
+///   1. the hit element when it has a label or a meaningful (non-container) role;
+///   2. down up to 2 `AXChildren` levels for a labelled child whose box
+///      contains the point;
+///   3. up to 4 `AXParent` levels for the first labelled ancestor;
+///   4. `Window · <frontmost app>`, never a bare `Group`.
+private func lookElementDescriptor(at point: CGPoint) -> LookDescriptor {
+    let frontmost = axNonEmpty(NSWorkspace.shared.frontmostApplication?.localizedName)
+    guard let hit = axElementUnderCursor(point) else {
+        return LookDescriptor(role: nil, label: nil, app: frontmost,
+                              window: nil, doc: nil, enabled: nil, value: nil,
+                              box: nil, isWindowFallback: true)
+    }
+
+    func boxContains(_ element: AXUIElement) -> Bool {
+        guard let box = axBoxAttribute(element), box.count == 4 else {
+            return false
+        }
+        let rect = CGRect(x: CGFloat(box[0]), y: CGFloat(box[1]),
+                          width: CGFloat(box[2]), height: CGFloat(box[3]))
+        return rect.contains(point)
+    }
+
+    func labelledDescendant(_ element: AXUIElement, levels: Int) -> AXUIElement? {
+        guard levels > 0 else { return nil }
+        let children = axElementList(element, attribute: "AXChildren")
+        for child in children
+        where axNonEmpty(axLookLabel(child)) != nil && boxContains(child) {
+            return child
+        }
+        for child in children {
+            if let found = labelledDescendant(child, levels: levels - 1) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    func labelledAncestor(_ element: AXUIElement, levels: Int) -> AXUIElement? {
+        var current = element
+        for _ in 0..<levels {
+            guard let parent = axElement(from: copyAXAttribute(current, "AXParent")) else {
+                return nil
+            }
+            if axNonEmpty(axLookLabel(parent)) != nil {
+                return parent
+            }
+            current = parent
+        }
+        return nil
+    }
+
+    let hitRoleRaw = axString(hit, "AXRole")
+    let hitLabel = axNonEmpty(axLookLabel(hit))
+    let hitIsContainer = hitRoleRaw == nil || axContainerRoles.contains(hitRoleRaw ?? "")
+    var chosen = hit
+    if hitLabel == nil && hitIsContainer {
+        if let child = labelledDescendant(hit, levels: 2) {
+            chosen = child
+        } else if let parent = labelledAncestor(hit, levels: 4) {
+            chosen = parent
+        } else {
+            // Nothing named under the pointer: say which window this is instead
+            // of leaking "Group" as if it were the answer.
+            var pid: pid_t = 0
+            var app = frontmost
+            if AXUIElementGetPid(hit, &pid) == .success, pid > 0 {
+                app = axNonEmpty(NSRunningApplication(processIdentifier: pid)?.localizedName)
+                    ?? app
+            }
+            let enclosing = axEnclosingWindow(hit)
+            return LookDescriptor(role: "Window", label: nil, app: app,
+                                  window: enclosing.window, doc: enclosing.doc,
+                                  enabled: nil, value: nil,
+                                  box: axBoxAttribute(hit),
+                                  isWindowFallback: true)
+        }
+    }
+
+    var pid: pid_t = 0
+    var app = frontmost
+    if AXUIElementGetPid(chosen, &pid) == .success, pid > 0 {
+        app = axNonEmpty(NSRunningApplication(processIdentifier: pid)?.localizedName) ?? app
+    }
+    let enclosing = axEnclosingWindow(chosen)
+    return LookDescriptor(role: axRoleName(axString(chosen, "AXRole")),
+                          label: axNonEmpty(axLookLabel(chosen)),
+                          app: app,
+                          window: enclosing.window,
+                          doc: enclosing.doc,
+                          enabled: axEnabledAttribute(chosen),
+                          value: axValueString(chosen),
+                          box: axBoxAttribute(chosen))
+}
+
+/// Hit-test the cursor and compose the LOOK context + target for the retained
+/// typed path. Resolution lives in `lookElementDescriptor` so both doors share
+/// one path.
 private func axLookTargetUnderCursor() -> (context: String, target: LookTarget) {
     let frontmost = axNonEmpty(NSWorkspace.shared.frontmostApplication?.localizedName)
-    guard let point = cursorQuartzPoint(),
-          let element = axElementUnderCursor(point) else {
+    guard let point = cursorQuartzPoint() else {
         return ("Window: " + (frontmost ?? "unknown"),
                 LookTarget(app: frontmost))
     }
-    let fields = readAXFields(element)
-    let role = axRoleName(fields.role == "unknown" ? nil : fields.role)
-    let label = axNonEmpty(fields.label)
-    var app: String?
-    var pid: pid_t = 0
-    if AXUIElementGetPid(element, &pid) == .success, pid > 0 {
-        app = axNonEmpty(NSRunningApplication(processIdentifier: pid)?.localizedName)
+    let descriptor = lookElementDescriptor(at: point)
+    let target = LookTarget(app: descriptor.app,
+                            role: descriptor.role,
+                            label: descriptor.label,
+                            window: descriptor.window,
+                            doc: descriptor.doc,
+                            enabled: descriptor.enabled,
+                            box: descriptor.box)
+    let context = target.contextLine
+    if !context.isEmpty {
+        return (context, target)
     }
-    if app == nil { app = frontmost }
-    let enclosing = axEnclosingWindow(element)
-    let target = LookTarget(app: app,
-                            role: role,
-                            label: label,
-                            window: enclosing.window,
-                            doc: enclosing.doc,
-                            enabled: axEnabledAttribute(element),
-                            box: axBoxAttribute(element))
-    var context = target.contextLine
-    if context.isEmpty {
-        context = "Window: " + (enclosing.window ?? app ?? frontmost ?? "unknown")
-    }
-    return (context, target)
+    return ("Window: " + (descriptor.window ?? descriptor.app ?? frontmost ?? "unknown"),
+            target)
 }
 
 private func walkAX(_ element: AXUIElement,
@@ -1435,13 +1644,46 @@ private final class ClaimChipWindow: NSWindow {
 private final class ClaimChipView: NSView {
     /// The whole chip is one emoji: small enough to read as a hat on the pet.
     private static let glyph = "🎩"
+    /// While dragging, the hat becomes eyes so "I am reading the pointer" is
+    /// visible without a tooltip or a separate mode indicator.
+    private static let lookGlyph = "👀"
     private static let glyphFont = NSFont.systemFont(ofSize: 13.0)
+    private static let lookGlyphFont = NSFont.systemFont(ofSize: 14.0)
+    /// A press shorter than this (in points) is a click; more is a LOOK drag.
+    static let dragThreshold: CGFloat = 4.0
     /// Hover state drives both the pointing-hand cursor and a brighter chip, so
     /// "this is clickable" survives even when AppKit will not swap the cursor
     /// for a background (inactive) app's window.
     private var hovering = false
     private var hoverTracking: NSTrackingArea?
+    /// True from the first moved point until mouseUp; the controller then drops
+    /// the read-out card at the release point.
+    private(set) var lookMode = false
+    private var pressStart: NSPoint?
+    private var dragging = false
     var onClick: (() -> Void)?
+    /// Fires on mouseDown, before a drag exists, so the placement timer stops
+    /// the moment the user grabs the hat.
+    var onPressBegan: ((NSPoint) -> Void)?
+    var onDragBegan: ((NSPoint) -> Void)?
+    var onDragMoved: ((NSPoint) -> Void)?
+    var onDragEnded: ((NSPoint) -> Void)?
+
+    /// Global AppKit space (bottom-left origin), independent of the hat window
+    /// moving under the cursor during the drag.
+    private func screenPoint(for event: NSEvent) -> NSPoint {
+        guard let window = window else { return NSEvent.mouseLocation }
+        return window.convertPoint(toScreen: event.locationInWindow)
+    }
+
+    /// The controller calls this when a press lost its mouseUp (window hidden
+    /// or reordered mid-gesture) so a later hover does not carry stale state.
+    func cancelPendingPress() {
+        pressStart = nil
+        dragging = false
+        lookMode = false
+        needsDisplay = true
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -1515,10 +1757,51 @@ private final class ClaimChipView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        chipJournal("click")
-        onClick?()
+        // Decide press-vs-drag on release: a click still opens the ask field,
+        // movement past `dragThreshold` turns the same press into LOOK.
+        let point = screenPoint(for: event)
+        pressStart = point
+        dragging = false
+        onPressBegan?(point)
+        chipJournal("press")
     }
 
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = pressStart else { return }
+        let point = screenPoint(for: event)
+        let dx = point.x - start.x
+        let dy = point.y - start.y
+        let movement = (dx * dx + dy * dy).squareRoot()
+        if !dragging && movement > ClaimChipView.dragThreshold {
+            dragging = true
+            lookMode = true
+            needsDisplay = true
+            onDragBegan?(start)
+            chipJournal("drag-begin")
+        }
+        if dragging {
+            onDragMoved?(point)
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        // A mouseUp without our press (window hid/reordered mid-gesture) must
+        // not toggle the ask field from nowhere.
+        guard pressStart != nil else { return }
+        let point = screenPoint(for: event)
+        let wasDragging = dragging
+        dragging = false
+        pressStart = nil
+        if wasDragging {
+            lookMode = false
+            needsDisplay = true
+            onDragEnded?(point)
+            chipJournal("drag-end")
+        } else {
+            chipJournal("click")
+            onClick?()
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -1546,18 +1829,110 @@ private final class ClaimChipView: NSView {
         path.lineWidth = 1.0
         path.stroke()
 
+        let glyph = lookMode ? ClaimChipView.lookGlyph : ClaimChipView.glyph
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: ClaimChipView.glyphFont,
+            .font: lookMode ? ClaimChipView.lookGlyphFont : ClaimChipView.glyphFont,
             .foregroundColor: NSColor.white
         ]
-        let glyphSize = (ClaimChipView.glyph as NSString)
-            .size(withAttributes: attributes)
+        let glyphSize = (glyph as NSString).size(withAttributes: attributes)
         let glyphRect = NSRect(x: (bounds.width - glyphSize.width) / 2.0,
                                y: (bounds.height - glyphSize.height) / 2.0,
                                width: glyphSize.width,
                                height: glyphSize.height)
-        (ClaimChipView.glyph as NSString).draw(in: glyphRect,
-                                              withAttributes: attributes)
+        (glyph as NSString).draw(in: glyphRect, withAttributes: attributes)
+    }
+}
+
+// MARK: - Pointer LOOK card
+
+/// The read-out panel. It must NEVER become key: the user's app keeps typing
+/// focus while the card is on screen, and a click anywhere simply dismisses it.
+private final class LookCardWindow: NSPanel {
+    /// The card is a glance, not a document: it goes away on its own.
+    static let autoDismissInterval: TimeInterval = 6.0
+
+    override var canBecomeKey: Bool {
+        return false
+    }
+
+    override var canBecomeMain: Bool {
+        return false
+    }
+}
+
+/// A small fixed-width card of up to five lines. No buttons, no footer, no chat
+/// link: it only reports what Accessibility returned for the drop point.
+private final class LookCardView: NSView {
+    static let cardWidth: CGFloat = 320.0
+    static let maxLines = 5
+    private static let horizontalInset: CGFloat = 14.0
+    private static let verticalInset: CGFloat = 9.0
+    private static let lineHeight: CGFloat = 16.0
+    private static let lineGap: CGFloat = 2.0
+    private static let firstLineFont = NSFont.systemFont(ofSize: 12.5,
+                                                        weight: .semibold)
+    private static let bodyFont = NSFont.systemFont(ofSize: 11.5)
+
+    static func height(for lines: [String]) -> CGFloat {
+        let count = max(1, min(lines.count, maxLines))
+        return verticalInset * 2.0 + CGFloat(count) * lineHeight
+            + CGFloat(max(0, count - 1)) * lineGap
+    }
+
+    init(frame: NSRect, lines: [String]) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        for (index, line) in lines.prefix(LookCardView.maxLines).enumerated() {
+            let label = NSTextField(labelWithString: line)
+            label.font = index == 0 ? LookCardView.firstLineFont
+                                    : LookCardView.bodyFont
+            label.textColor = index == 0
+                ? NSColor.white
+                : NSColor(white: 0.78, alpha: 1.0)
+            // The hard cap is enforced here: one visual line per row, tail
+            // ellipsis, never a wrapped second line that grows the card.
+            label.lineBreakMode = .byTruncatingTail
+            label.maximumNumberOfLines = 1
+            label.isSelectable = false
+            label.refusesFirstResponder = true
+            label.frame = NSRect(x: LookCardView.horizontalInset,
+                                 y: LookCardView.verticalInset
+                                    + CGFloat(index) * (LookCardView.lineHeight
+                                                        + LookCardView.lineGap),
+                                 width: max(0.0, frame.width
+                                            - LookCardView.horizontalInset * 2.0),
+                                 height: LookCardView.lineHeight)
+            addSubview(label)
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override var isFlipped: Bool {
+        return true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let background = bounds.insetBy(dx: 1.0, dy: 1.0)
+        let path = NSBezierPath(roundedRect: background,
+                                xRadius: 10.0,
+                                yRadius: 10.0)
+        NSColor(red: 22.0 / 255.0,
+                green: 23.0 / 255.0,
+                blue: 30.0 / 255.0,
+                alpha: 0.96).setFill()
+        path.fill()
+        NSColor(red: 122.0 / 255.0,
+                green: 134.0 / 255.0,
+                blue: 255.0 / 255.0,
+                alpha: 0.55).setStroke()
+        path.lineWidth = 1.0
+        path.stroke()
     }
 }
 
@@ -2164,6 +2539,15 @@ private final class OverlayController {
     private var claimChipSpriteSize: CGSize?
     private var claimChipPadBottom: CGFloat = ClaimChipSpec.defaultPadBottom
     private let claimChipGap: CGFloat = 10.0
+    /// True between "drag begins" and mouseUp: the placement timer must not
+    /// snap the hat out from under the cursor while the user is aiming.
+    private var claimChipDragging = false
+    private var claimChipDragOffset = NSPoint.zero
+    /// The pointer read-out panel and every way it can disappear.
+    private var lookCardWindow: NSPanel?
+    private var lookCardTimer: Timer?
+    private var lookCardMonitors: [Any] = []
+    private var lookCardGeneration = 0
     /// The local ask field. It takes key focus itself and never activates
     /// Hermes: the whole point of this door is that the request is typed and
     /// sent next to the pet, with the user's current app restored afterwards.
@@ -2174,8 +2558,8 @@ private final class OverlayController {
     /// activated itself), re-activated once the field closes.
     private var summonFieldReturnApp: NSRunningApplication?
     private let summonFieldGap: CGFloat = 8.0
-    /// Set by the ⌘⇧L door just before `openSummonField()` raises the same box
-    /// in LOOK mode; consumed and cleared by that call.
+    /// Set by the retained typed LOOK path just before `openSummonField()`
+    /// raises the same box in LOOK mode; consumed and cleared by that call.
     private var pendingLookContext: String?
     private var pendingLookTarget: LookTarget?
     /// The element the open field is asking about, or nil for the plain door.
@@ -2254,8 +2638,6 @@ private final class OverlayController {
     /// extra TCC grant.
     private var summonHotKeyRef: EventHotKeyRef?
     private var summonHotKeyHandler: EventHandlerRef?
-    /// The second door: ⌘⇧L hit-tests the cursor and opens LOOK mode.
-    private var lookHotKeyRef: EventHotKeyRef?
     private var watchdogTimer: Timer?
     private var lastOpUptime: TimeInterval = 0.0
 
@@ -2275,7 +2657,6 @@ private final class OverlayController {
         lastOpUptime = ProcessInfo.processInfo.systemUptime
         observeEnvironment()
         installSummonHotKey()
-        installLookHotKey()
         startWatchdog()
         let thread = Thread { [weak self] in
             self?.readStdin()
@@ -2935,6 +3316,9 @@ private final class OverlayController {
         // stale across sleep/wake, gets observed again. No-op when the
         // observer is unavailable, so the fallback poll stays pure.
         attachPetWindowObservers()
+        recoverLostPressIfNeeded()
+        // The drag owns the frame until mouseUp; the timer must stay out of it.
+        guard !claimChipDragging else { return }
         guard claimChipEnabled, !isShuttingDown,
               let primaryHeight = primaryScreenHeight() else {
             hideClaimChip()
@@ -2952,6 +3336,8 @@ private final class OverlayController {
     /// feeds it the polled anchor; the AX move/resize path feeds it the frame
     /// straight off the observed element, so a drag costs no enumeration.
     private func applyClaimChipFrame(petWindow: CGRect, primaryHeight: CGFloat) {
+        recoverLostPressIfNeeded()
+        guard !claimChipDragging else { return }
         guard claimChipEnabled, !isShuttingDown else {
             hideClaimChip()
             return
@@ -3003,6 +3389,18 @@ private final class OverlayController {
         view.onClick = { [weak self] in
             self?.claimChipClicked()
         }
+        view.onPressBegan = { [weak self] point in
+            self?.beginChipPress(at: point)
+        }
+        view.onDragBegan = { [weak self] point in
+            self?.beginLookDrag(at: point)
+        }
+        view.onDragMoved = { [weak self] point in
+            self?.moveLookDrag(to: point)
+        }
+        view.onDragEnded = { [weak self] point in
+            self?.endLookDrag(at: point)
+        }
         window.contentView = view
         claimChipWindow = window
         claimChipView = view
@@ -3025,11 +3423,221 @@ private final class OverlayController {
     /// The chip is the local door: it opens (or closes) the in-place ask field
     /// and never raises Hermes. The request is typed and sent right here.
     private func claimChipClicked() {
+        // The press latched placement off; a plain click is not a drag.
+        claimChipDragging = false
+        // Using the hat again puts any read-out away first.
+        dismissLookCard()
         guard claimChipEnabled else {
             chipJournal("click-skipped:disabled")
             return
         }
         toggleSummonField()
+    }
+
+    // MARK: Pointer LOOK gesture
+
+    /// A press latches placement off until mouseUp. If the window was hidden
+    /// or reordered mid-gesture the mouseUp never reaches the view; the
+    /// physical button is up, so release the latch rather than pin the hat
+    /// forever.
+    private func recoverLostPressIfNeeded() {
+        guard claimChipDragging, NSEvent.pressedMouseButtons == 0 else {
+            return
+        }
+        claimChipDragging = false
+        claimChipView?.cancelPendingPress()
+        chipJournal("look-press-recovered")
+    }
+
+    /// mouseDown latches placement off immediately. Without this the slow
+    /// reconciliation tick could snap the hat between press and the first moved
+    /// point, so the very first drag move would start from a shifted frame.
+    private func beginChipPress(at screenPoint: NSPoint) {
+        dismissLookCard()
+        guard let window = claimChipWindow else { return }
+        claimChipDragging = true
+        claimChipDragOffset = NSPoint(x: window.frame.minX - screenPoint.x,
+                                      y: window.frame.minY - screenPoint.y)
+    }
+
+    /// The press crossed `dragThreshold`: the grab is already latched.
+    private func beginLookDrag(at screenPoint: NSPoint) {
+        if !claimChipDragging, let window = claimChipWindow {
+            claimChipDragging = true
+            claimChipDragOffset = NSPoint(x: window.frame.minX - screenPoint.x,
+                                          y: window.frame.minY - screenPoint.y)
+        }
+        chipJournal("look-drag-begin")
+    }
+
+    private func moveLookDrag(to screenPoint: NSPoint) {
+        guard claimChipDragging, let window = claimChipWindow else { return }
+        window.setFrameOrigin(NSPoint(x: screenPoint.x + claimChipDragOffset.x,
+                                      y: screenPoint.y + claimChipDragOffset.y))
+    }
+
+    /// Release: put the hat back, then hit-test the drop point and raise the
+    /// read-out. Nothing here activates the app, focuses Hermes or types.
+    private func endLookDrag(at screenPoint: NSPoint) {
+        guard claimChipDragging else { return }
+        claimChipDragging = false
+        chipJournal("look-drop")
+        guard let primaryHeight = primaryScreenHeight(),
+              screenPoint.x.isFinite, screenPoint.y.isFinite else {
+            positionClaimChip()
+            claimChipWindow?.orderFrontRegardless()
+            return
+        }
+        // The hat is sitting exactly under the cursor at mouseUp. Take it off
+        // screen BEFORE the hit-test or AX would answer with our own chip.
+        claimChipWindow?.orderOut(nil)
+        let point = CGPoint(x: screenPoint.x,
+                            y: primaryHeight - screenPoint.y)
+        let descriptor = lookElementDescriptor(at: point)
+        positionClaimChip()
+        claimChipWindow?.orderFrontRegardless()
+        presentLookCard(descriptor, at: point, primaryHeight: primaryHeight)
+    }
+
+    /// Place the card next to the drop point, flipped/clamped so it never sits
+    /// under the pointer and always stays on the screen that owns it.
+    private func lookCardFrame(at point: CGPoint,
+                               size: CGSize,
+                               primaryHeight: CGFloat) -> CGRect? {
+        let anchor = CGRect(x: point.x, y: point.y, width: 1.0, height: 1.0)
+        guard let screen = screenContaining(anchor,
+                                            primaryHeight: primaryHeight) else {
+            return nil
+        }
+        let visible = quartzRect(fromAppKit: screen.visibleFrame,
+                                 primaryHeight: primaryHeight)
+        let gap: CGFloat = 16.0
+        var frame = CGRect(x: point.x + gap, y: point.y + gap,
+                           width: size.width, height: size.height)
+        if frame.maxX > visible.maxX - 4.0 {
+            frame.origin.x = point.x - gap - size.width
+        }
+        if frame.maxY > visible.maxY - 4.0 {
+            frame.origin.y = point.y - gap - size.height
+        }
+        frame.origin.x = min(max(frame.origin.x, visible.minX + 4.0),
+                             visible.maxX - frame.width - 4.0)
+        frame.origin.y = min(max(frame.origin.y, visible.minY + 4.0),
+                             visible.maxY - frame.height - 4.0)
+        return frame
+    }
+
+    private func presentLookCard(_ descriptor: LookDescriptor,
+                                 at point: CGPoint,
+                                 primaryHeight: CGFloat) {
+        dismissLookCard()
+        let lines = Array(descriptor.lines.prefix(LookCardView.maxLines))
+        guard !lines.isEmpty else { return }
+        let size = CGSize(width: LookCardView.cardWidth,
+                          height: LookCardView.height(for: lines))
+        guard let frame = lookCardFrame(at: point, size: size,
+                                        primaryHeight: primaryHeight) else {
+            return
+        }
+        let appKitFrame = appKitRect(fromQuartz: frame,
+                                     primaryHeight: primaryHeight)
+        // Non-activating and click-through: the app under the pointer keeps its
+        // keyboard focus, and a click only dismisses the card.
+        let window = LookCardWindow(contentRect: appKitFrame,
+                                    styleMask: [.borderless, .nonactivatingPanel],
+                                    backing: .buffered,
+                                    defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.level = .statusBar
+        window.collectionBehavior = [.canJoinAllSpaces,
+                                     .stationary,
+                                     .fullScreenAuxiliary,
+                                     .ignoresCycle]
+        window.ignoresMouseEvents = true
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
+        window.isReleasedWhenClosed = false
+        window.acceptsMouseMovedEvents = false
+        window.hidesOnDeactivate = false
+
+        let view = LookCardView(frame: NSRect(origin: .zero,
+                                              size: appKitFrame.size),
+                                lines: lines)
+        view.autoresizingMask = [.width, .height]
+        window.contentView = view
+        lookCardWindow = window
+        window.orderFrontRegardless()
+
+        lookCardGeneration += 1
+        let generation = lookCardGeneration
+        let timer = Timer(timeInterval: LookCardWindow.autoDismissInterval,
+                          repeats: false) { [weak self] _ in
+            guard let self = self, self.lookCardGeneration == generation else {
+                return
+            }
+            self.dismissLookCard()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        lookCardTimer = timer
+        installLookCardMonitors()
+        chipJournal("look-card")
+    }
+
+    /// Any click, Esc, the 6 s timer, or the hat being used again all land here
+    /// so no event monitor or timer can outlive the card.
+    private func dismissLookCard() {
+        lookCardGeneration += 1
+        lookCardTimer?.invalidate()
+        lookCardTimer = nil
+        for monitor in lookCardMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        lookCardMonitors.removeAll()
+        if let window = lookCardWindow {
+            window.orderOut(nil)
+            window.close()
+        }
+        lookCardWindow = nil
+    }
+
+    private func installLookCardMonitors() {
+        let mouse: NSEvent.EventTypeMask = [.leftMouseDown,
+                                            .rightMouseDown,
+                                            .otherMouseDown]
+        if let localMouse = NSEvent.addLocalMonitorForEvents(matching: mouse,
+                                                             handler: { [weak self] event in
+            self?.dismissLookCard()
+            return event
+        }) {
+            lookCardMonitors.append(localMouse)
+        }
+        if let globalMouse = NSEvent.addGlobalMonitorForEvents(matching: mouse,
+                                                               handler: { [weak self] _ in
+            self?.dismissLookCard()
+        }) {
+            lookCardMonitors.append(globalMouse)
+        }
+        // Esc is the only key that dismisses; every other key is left alone so
+        // the user keeps typing in their own app.
+        let escape: UInt16 = 53
+        let keyHandler: (NSEvent) -> Void = { [weak self] event in
+            if event.keyCode == escape {
+                self?.dismissLookCard()
+            }
+        }
+        if let localKey = NSEvent.addLocalMonitorForEvents(matching: .keyDown,
+                                                           handler: { event in
+            keyHandler(event)
+            return event
+        }) {
+            lookCardMonitors.append(localKey)
+        }
+        if let globalKey = NSEvent.addGlobalMonitorForEvents(matching: .keyDown,
+                                                             handler: keyHandler) {
+            lookCardMonitors.append(globalKey)
+        }
     }
 
     // MARK: In-place ask field
@@ -3199,8 +3807,10 @@ private final class OverlayController {
         }
     }
 
-    /// ⌘⇧L: hit-test the cursor once, then raise the SAME ask box in LOOK mode.
-    /// The element is captured now, before the field steals focus.
+    /// Typed LOOK path: hit-test the cursor once, then raise the SAME ask box
+    /// in LOOK mode. The pointer gesture uses the card instead; both resolve
+    /// through `lookElementDescriptor(at:)`. The element is captured now,
+    /// before the field steals focus.
     private func openLookField() {
         guard !isShuttingDown, !summonFieldOpen else {
             return
@@ -3331,9 +3941,8 @@ private final class OverlayController {
 
     // MARK: System-wide summon hot key
 
-    /// One Carbon handler for both doors. The event carries the hot key id, so
-    /// id 1 (⌘⇧A sum) and id 2 (⌘⇧L look) stay distinguishable without a
-    /// second event target.
+    /// One Carbon handler for the single remaining global chord, ⌘⇧A. LOOK is
+    /// a pointer gesture and registers nothing.
     private func installHotKeyHandlerIfNeeded() -> Bool {
         if summonHotKeyHandler != nil {
             return true
@@ -3358,13 +3967,8 @@ private final class OverlayController {
             let controller = Unmanaged<OverlayController>
                 .fromOpaque(userData)
                 .takeUnretainedValue()
-            switch hotKeyID.id {
-            case 1:
+            if hotKeyID.id == 1 {
                 controller.summonHotKeyFired()
-            case 2:
-                controller.lookHotKeyFired()
-            default:
-                break
             }
             return noErr
         }
@@ -3408,37 +4012,7 @@ private final class OverlayController {
         chipJournal("hotkey-installed")
     }
 
-    /// The second door: ⌘⇧L asks about the thing under the cursor. Reuses the
-    /// shared handler, registers its own id 2 and its own failure journal so a
-    /// chord stolen by another app is diagnosable.
-    private func installLookHotKey() {
-        guard lookHotKeyRef == nil else {
-            return
-        }
-        guard installHotKeyHandlerIfNeeded() else {
-            chipJournal("look-hotkey-failed:no-handler")
-            return
-        }
-        let hotKeyID = EventHotKeyID(signature: OSType(0x42544C52), id: 2)  // 'BTLR'
-        let status = RegisterEventHotKey(UInt32(kVK_ANSI_L),
-                                         UInt32(cmdKey | shiftKey),
-                                         hotKeyID,
-                                         GetApplicationEventTarget(),
-                                         0,
-                                         &lookHotKeyRef)
-        if status != noErr {
-            lookHotKeyRef = nil
-            chipJournal("look-hotkey-failed:\(status)")
-            return
-        }
-        chipJournal("look-hotkey-installed")
-    }
-
     private func removeSummonHotKey() {
-        if let lookRef = lookHotKeyRef {
-            UnregisterEventHotKey(lookRef)
-        }
-        lookHotKeyRef = nil
         if let ref = summonHotKeyRef {
             UnregisterEventHotKey(ref)
         }
@@ -3466,21 +4040,6 @@ private final class OverlayController {
         // itself whenever the companion is not running.
         chipJournal("hotkey-fired")
         openSummonField()
-    }
-
-    /// ⌘⇧L: the LOOK door. A second press cancels the open field, exactly like
-    /// ⌘⇧A; otherwise it hit-tests the cursor and opens the context box.
-    private func lookHotKeyFired() {
-        guard !isShuttingDown else {
-            return
-        }
-        if summonFieldOpen {
-            let event = summonFieldLookTarget != nil ? "look-cancel" : "ask-cancel"
-            closeSummonField(journal: event)
-            return
-        }
-        chipJournal("look-open")
-        openLookField()
     }
 
     // MARK: Pet double
@@ -4093,6 +4652,7 @@ private final class OverlayController {
         claimChipTimerInterval = 0.0
         stopPetObservation()
         removeSummonHotKey()
+        dismissLookCard()
         closeSummonField(journal: nil, restoreFocus: false)
         hideClaimChip()
         petTimer?.invalidate()
