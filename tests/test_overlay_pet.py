@@ -769,9 +769,10 @@ def test_summon_works_outside_hermes_without_raising_the_window() -> None:
 
     hot = _swift_function_body(source, "private func summonHotKeyFired()",
                                "// MARK: Pet double")
-    # Frontmost Hermes keeps its own keybind; elsewhere the hot key toggles the
-    # local field and a second press closes it.
-    assert "app.isActive" in hot
+    # A Carbon hot key swallows the chord system-wide, so stepping aside when
+    # Hermes is frontmost made Cmd+Shift+A DEAD in-app. It always opens the
+    # local field; a second press closes it.
+    assert "isActive" not in hot
     assert "summonFieldOpen" in hot
     assert "openSummonField()" in hot
     assert "closeSummonField(journal: \"ask-cancel\")" in hot

@@ -2956,12 +2956,12 @@ private final class OverlayController {
             closeSummonField(journal: "ask-cancel")
             return
         }
-        if let pid = hermesPid(),
-           let app = NSRunningApplication(processIdentifier: pid),
-           app.isActive {
-            // Hermes owns the keyboard: its own keybind opens the bar.
-            return
-        }
+        // A registered Carbon hot key SWALLOWS the chord system-wide, so the
+        // in-app keybind never sees it while the companion is running. Opening
+        // the field unconditionally is therefore the only correct behaviour:
+        // stepping aside here made ⌘⇧A dead inside Hermes. The in-app bar
+        // remains reachable from the titlebar launcher, and from the keybind
+        // itself whenever the companion is not running.
         chipJournal("hotkey-fired")
         openSummonField()
     }
