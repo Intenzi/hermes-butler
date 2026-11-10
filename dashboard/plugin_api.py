@@ -371,13 +371,23 @@ def _spool_pending() -> dict[str, Any] | None:
                 # Same contract as the engine's pipe event: only an exact
                 # "new" asks for a fresh chat; anything else is the default.
                 destination = "new" if row.get("destination") == "new" else "recent"
-                return {
-                    "origin": "chip",
+                # The ask field writes origin "chip" implicitly; the ⌘⇧L door
+                # stamps origin "look" (or is recognisable by its op) and
+                # carries the hit-tested element. Both pass through unchanged so
+                # the desktop can tell them apart.
+                origin = row.get("origin")
+                if not isinstance(origin, str) or not origin.strip():
+                    origin = "look" if row.get("op") == "look_text" else "chip"
+                pending = {
+                    "origin": origin,
                     "id": str(row["id"]),
                     "text": row["text"],
                     "destination": destination,
                     "at": row.get("at"),
                 }
+                if "target" in row:
+                    pending["target"] = row["target"]
+                return pending
     return None
 
 

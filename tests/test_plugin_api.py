@@ -598,3 +598,55 @@ def test_the_spooled_destination_survives_the_state_row(client: TestClient) -> N
         encoding="utf-8",
     )
     assert client.get("/state").json()["summon_pending"]["destination"] == "recent"
+
+
+def test_a_look_spool_row_keeps_its_origin_and_target(
+        client: TestClient) -> None:
+    """The ⌘⇧L row is the same spool contract plus the hit-tested element."""
+    spool = bp_paths.plugin_data_dir("butler") / "summon-spool.jsonl"
+    target = {
+        "app": "Preview",
+        "role": "Button",
+        "label": "Export",
+        "window": "receipt.pdf",
+        "doc": "file:///tmp/receipt.pdf",
+        "enabled": True,
+        "box": [10, 20, 30, 40],
+    }
+    spool.write_text(
+        json.dumps({
+            "op": "look_text",
+            "origin": "look",
+            "text": "what does this export?",
+            "id": "look1234",
+            "destination": "recent",
+            "target": target,
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    pending = client.get("/state").json()["summon_pending"]
+    assert pending["origin"] == "look"
+    assert pending["id"] == "look1234"
+    assert pending["text"] == "what does this export?"
+    assert pending["target"] == target
+    assert pending["destination"] == "recent"
+
+    # Acking removes exactly that row, same as the ask field.
+    assert client.post("/summon/ack", json={"id": "look1234"}).json()["cleared"] is True
+    assert "summon_pending" not in client.get("/state").json()
+
+    # The companion's actual wire line carries no origin key; the op is enough
+    # to keep the row a LOOK row instead of mislabelling it as a chip send.
+    spool.write_text(
+        json.dumps({
+            "op": "look_text",
+            "text": "and this?",
+            "id": "look5678",
+            "target": target,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    inferred = client.get("/state").json()["summon_pending"]
+    assert inferred["origin"] == "look"
+    assert inferred["target"] == target

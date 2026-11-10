@@ -116,6 +116,44 @@ def test_summon_text_carries_the_ask_field_destination(
     assert engine.summon_pending()["destination"] == "recent"
 
 
+def test_look_text_sets_a_look_pending_row_with_the_target_intact(
+        tmp_path: Path) -> None:
+    """⌘⇧L carries the hit-tested element with the question."""
+    engine.init(tmp_path)
+    engine._summon_pending = None
+    target = {
+        "app": "Preview",
+        "role": "Button",
+        "label": "Export",
+        "window": "receipt.pdf",
+        "doc": "file:///tmp/receipt.pdf",
+        "enabled": True,
+        "box": [10, 20, 30, 40],
+    }
+
+    engine._on_overlay_event({
+        "op": "look_text",
+        "text": "what does this export?",
+        "id": "look1",
+        "destination": "new",
+        "target": target,
+    })
+
+    pending = engine.summon_pending()
+    assert pending["origin"] == "look"
+    assert pending["id"] == "look1"
+    assert pending["text"] == "what does this export?"
+    assert pending["target"] == target
+    assert pending["destination"] == "new"
+    assert pending["at"]
+    snap = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert snap["summon_pending"] == pending
+
+    # An empty question is still a cancel, never an empty turn.
+    engine._on_overlay_event({"op": "look_text", "text": "  ", "id": "look2"})
+    assert engine.summon_pending()["id"] == "look1"
+
+
 def test_summon_text_without_text_writes_no_row(tmp_path: Path) -> None:
     engine.init(tmp_path)
     engine._summon_pending = None

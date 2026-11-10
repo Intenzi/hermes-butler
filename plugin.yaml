@@ -11,6 +11,7 @@ provides_tools:
   - butler_guide_start
   - butler_guide_status
   - butler_capture
+  - butler_look
   - butler_stop
 provides_hooks: []
 config_schema:

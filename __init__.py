@@ -1,6 +1,7 @@
 """Butler — Hermes plugin.
 
-Tools: butler_guide_start, butler_guide_status, butler_capture, butler_stop.
+Tools: butler_guide_start, butler_guide_status, butler_capture, butler_look,
+butler_stop.
 Slash command: /butler <request> — inject the request into this chat as a real
 agent turn that plans and starts a guide.
 CLI: hermes butler capture|status|doctor.
@@ -78,6 +79,14 @@ CAPTURE_SCHEMA = {
     },
 }
 
+LOOK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target": {"type": "string", "description": "App name substring to re-capture for a LOOK question."},
+    },
+    "required": ["target"],
+}
+
 STOP_SCHEMA = {
     "type": "object",
     "properties": {"reason": {"type": "string", "description": "Why the guide ended."}},
@@ -123,6 +132,28 @@ def tool_capture(args, **kwargs):
         return _out(result)
     except Exception as exc:  # noqa: BLE001
         logger.exception("butler_capture failed")
+        return _out({"error": str(exc)})
+
+
+def tool_look(args, **kwargs):
+    """Live capture of the app a LOOK question named.
+
+    A thin wrapper over ``butler_capture``'s capture path: the agent uses it to
+    answer the question with fresh neighbours of the control under the cursor,
+    instead of making the user repeat what they were looking at. Unattended runs
+    fail closed exactly like ``butler_capture`` (the AX trust check refuses).
+    """
+    try:
+        result = bp_capture.capture(
+            target=(args.get("target") or None),
+            max_elements=int(args.get("max") or 150),
+            depth=int(args.get("depth") or 10),
+        )
+        if result.get("trusted") is False:
+            result["refusal"] = "accessibility_grant_missing; interactive runs only, unattended runs fail closed"
+        return _out(result)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("butler_look failed")
         return _out({"error": str(exc)})
 
 
@@ -230,6 +261,8 @@ def register(ctx):
                       handler=tool_guide_status, description="Current butler guide progress and last verification results.", emoji="🎩")
     ctx.register_tool(name="butler_capture", toolset="butler", schema=CAPTURE_SCHEMA,
                       handler=tool_capture, description="Element list (roles, labels, boxes) of a focused or named app's screen.", emoji="👁")
+    ctx.register_tool(name="butler_look", toolset="butler", schema=LOOK_SCHEMA,
+                      handler=tool_look, description="Fresh element list of the app a LOOK question named, so the agent can answer about the control under the cursor.", emoji="👁")
     ctx.register_tool(name="butler_stop", toolset="butler", schema=STOP_SCHEMA,
                       handler=tool_stop, description="End the active butler guide.", emoji="🎩")
     ctx.register_command(
@@ -264,4 +297,4 @@ def register(ctx):
                            description="Butler plugin dev conventions: flat step keys, restart batching, verify-dsh-rule, checklist shape, TCC scope, card etiquette. Load for any butler board or code work.")
     except Exception:
         logger.exception("butler:conventions skill registration failed")
-    logger.info("Butler plugin registered: 4 tools, /butler (injected turn), CLI 'butler', 2 skills")
+    logger.info("Butler plugin registered: 5 tools, /butler (injected turn), CLI 'butler', 2 skills")

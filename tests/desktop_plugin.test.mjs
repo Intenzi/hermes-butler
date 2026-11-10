@@ -1341,6 +1341,107 @@ test('a text pending row sends to the newest Butler chat and never opens the bar
     env.dispose()
   })
 
+test('a look row frames the control and the question, never opens the bar', async () => {
+  const statePayload = {
+    summon_pending: {
+      id: 'pending-look',
+      origin: 'look',
+      text: 'what does this export?',
+      destination: 'recent',
+      target: {
+        app: 'Preview',
+        role: 'Button',
+        label: 'Export',
+        window: 'receipt.pdf',
+        doc: 'file:///tmp/receipt.pdf',
+        enabled: true,
+        box: [10, 20, 30, 40]
+      }
+    }
+  }
+  const calls = []
+  const notifications = []
+  const rest = async (requestPath, opts) => {
+    calls.push({ path: requestPath, opts })
+    if (requestPath === '/state') return statePayload
+    if (requestPath === '/summon/send') return { ok: true, session: opts.body.session_id }
+    if (requestPath === '/summon/ack') return { ok: true, cleared: true }
+    return {}
+  }
+  const host = defaultHost({
+    request: async method => {
+      if (method === 'session.list') {
+        return [{ id: 'butler-chat', title: 'Butler', created_at: 900 }]
+      }
+      throw new Error(`unexpected request ${method}`)
+    },
+    notify: payload => notifications.push(payload)
+  })
+  const env = await loadPlugin({ host, rest, document: makeDocument() })
+  const events = []
+  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
+  const seqBefore = events.at(-1).petClickSeq
+  const barBefore = events.at(-1).open
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  const sends = calls.filter(call => call.path === '/summon/send')
+  assert.equal(sends.length, 1)
+  const injected = sends[0].opts.body.text
+  assert.equal(sends[0].opts.body.session_id, 'butler-chat')
+  assert.match(injected, /^\[butler look\] /)
+  assert.ok(injected.includes('App: Preview'), 'the app is named')
+  assert.ok(injected.includes('Window: receipt.pdf'), 'the window is named')
+  assert.ok(
+    injected.includes('Control: Button "Export" (enabled) at 10,20,30,40'),
+    'the control renders role, label, enabled state and box')
+  assert.ok(injected.includes('\nQuestion: what does this export?'), 'the question is asked')
+  assert.equal(events.at(-1).open, barBefore, 'a look row never opens the bar')
+  assert.equal(events.at(-1).petClickSeq, seqBefore)
+  assert.deepEqual(
+    calls.filter(call => call.path === '/summon/ack').map(call => call.opts.body.id),
+    ['pending-look'])
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].message, 'Asked about that control')
+
+  unsubscribe()
+  env.dispose()
+})
+
+test('a look row omits parts the companion could not read', async () => {
+  const statePayload = {
+    summon_pending: {
+      id: 'pending-look-thin',
+      origin: 'look',
+      text: 'what now?',
+      target: { app: 'Finder' }
+    }
+  }
+  const calls = []
+  const rest = async (requestPath, opts) => {
+    calls.push({ path: requestPath, opts })
+    if (requestPath === '/state') return statePayload
+    if (requestPath === '/summon/send') return { ok: true, session: opts.body.session_id }
+    if (requestPath === '/summon/ack') return { ok: true, cleared: true }
+    return {}
+  }
+  const host = defaultHost({
+    request: async method => {
+      if (method === 'session.list') {
+        return [{ id: 'butler-chat', title: 'Butler', created_at: 900 }]
+      }
+      throw new Error(`unexpected request ${method}`)
+    }
+  })
+  const env = await loadPlugin({ host, rest, document: makeDocument() })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  const injected = calls.find(call => call.path === '/summon/send').opts.body.text
+  assert.equal(injected, '[butler look] App: Finder\nQuestion: what now?')
+  env.dispose()
+})
+
 test('a destination:"new" row mints a fresh chat and posts to that id', async () => {
   const statePayload = {
     summon_pending: {
