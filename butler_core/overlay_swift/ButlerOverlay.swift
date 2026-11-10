@@ -5099,7 +5099,17 @@ private final class OverlayController {
         // keep focus — restoring here would steal it, the very coercion this
         // door removes.
         if restoreFocus && !isShuttingDown {
-            restoreFrontmostApp(returnApp)
+            // Re-activating the previous app on the SAME run-loop turn as the
+            // Return keyDown makes macOS hand that still-held key to the app we
+            // just activated: the user's Enter fires in their app too, even
+            // though our field was active and key (journal: ask-focus active=1
+            // key=1). Let the keystroke finish first.
+            let pending = returnApp
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
+                guard let self = self, !self.isShuttingDown else { return }
+                self.restoreFrontmostApp(pending)
+                chipJournal("ask-restore-delayed")
+            }
         }
     }
 
@@ -5146,7 +5156,10 @@ private final class OverlayController {
         // dashboard API merges it into /state and the desktop acks it.
         appendSummonSpool(line)
         FileHandle.standardOutput.write(Data((line + "\n").utf8))
-        chipJournal("ask-submit:\(text.count)chars:\(destination.rawValue)")
+        // Name the app we are about to reactivate: if the user reports Return
+        // firing there too, the journal says where, without a guess.
+        let previousAppName = summonFieldReturnApp?.localizedName ?? "none"
+        chipJournal("ask-submit:\(text.count)chars:\(destination.rawValue):back=\(previousAppName)")
         closeSummonField(journal: nil)
     }
 
