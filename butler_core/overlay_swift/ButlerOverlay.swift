@@ -3488,6 +3488,20 @@ private final class OverlayController {
             started["token"] = token
         }
         writeWatchLine(started)
+        // Baseline: describe where the app is RIGHT NOW. A watch opened on a
+        // condition that is already true must fire immediately instead of
+        // waiting for the user to move something.
+        let baseline = axElement(from: copyAXAttribute(root, "AXFocusedUIElement"))
+            ?? axElement(from: copyAXAttribute(root, "AXFocusedWindow"))
+        if let element = baseline {
+            emitWatchEvent(kind: "focus",
+                           role: watchRole(element),
+                           label: watchLabel(element),
+                           window: watchWindowLine(element))
+        } else {
+            emitWatchEvent(kind: "focus", role: "AXApplication",
+                           label: watchAppName, window: watchFocusedWindowTitle())
+        }
     }
 
     /// Clear every in-memory watch field without emitting or touching the

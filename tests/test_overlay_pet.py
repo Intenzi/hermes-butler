@@ -1331,3 +1331,21 @@ def test_watch_stop_removes_every_observer_and_the_run_loop_source() -> None:
     shutdown = _swift_function_body(source, "func shutdown() {",
                                     "// MARK: - Application delegate")
     assert 'stopWatch(reason: "shutdown", emit: false)' in shutdown
+
+
+def test_watch_emits_a_baseline_event_on_start() -> None:
+    """A watch opened on a condition that is already true must fire at once.
+
+    Measured: start_watch("Finder","Finder") sat at "0 events · no hit" until
+    something in the app changed. The start now emits one focus event describing
+    the app's current focused element, so the hit fires immediately and the
+    status text has a first line to show.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    start = _swift_function_body(source, "private func startWatch(_ spec: WatchStartSpec)",
+                                 "/// Clear every in-memory watch field")
+    assert "writeWatchLine(started)" in start
+    baseline = start.split("writeWatchLine(started)", 1)[1]
+    assert "AXFocusedUIElement" in baseline
+    assert 'emitWatchEvent(kind: "focus"' in baseline
