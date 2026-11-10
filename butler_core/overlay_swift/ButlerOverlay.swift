@@ -3902,7 +3902,13 @@ private final class OverlayController {
             let needle = until.lowercased()
             let labelText = (label ?? "").lowercased()
             let valueText = (new ?? "").lowercased()
-            if labelText.contains(needle) || valueText.contains(needle) {
+            // A window title counts as a match: "tell me when Downloads shows
+            // up" is the window title, not a label on any control inside it.
+            // Measured miss: watch("Finder", until: "Downloads") sat at
+            // "no hit" while every event carried window "Downloads".
+            let windowText = (window ?? "").lowercased()
+            if labelText.contains(needle) || valueText.contains(needle)
+                || windowText.contains(needle) {
                 watchHitArmed = false
                 var hit: [String: Any] = [
                     "op": "watch-hit",

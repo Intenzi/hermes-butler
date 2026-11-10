@@ -1349,3 +1349,15 @@ def test_watch_emits_a_baseline_event_on_start() -> None:
     baseline = start.split("writeWatchLine(started)", 1)[1]
     assert "AXFocusedUIElement" in baseline
     assert 'emitWatchEvent(kind: "focus"' in baseline
+
+
+def test_watch_matches_on_the_window_title_too() -> None:
+    """Measured miss: watch("Finder", until: "Downloads") reported "no hit" while
+    every event carried window "Downloads" — the condition only looked at label
+    and value. The window title is the most common thing a user names.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+    emit = _swift_function_body(source, "private func emitWatchEvent(",
+                                "private func watchLine")
+    assert "windowText" in emit
+    assert "windowText.contains(needle)" in emit
