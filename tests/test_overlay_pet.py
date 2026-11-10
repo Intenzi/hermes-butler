@@ -1358,6 +1358,6 @@ def test_watch_matches_on_the_window_title_too() -> None:
     """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
     emit = _swift_function_body(source, "private func emitWatchEvent(",
-                                "private func watchLine")
+                                "/// Find the core Hermes pet pop-out")
     assert "windowText" in emit
     assert "windowText.contains(needle)" in emit
