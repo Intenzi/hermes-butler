@@ -1361,3 +1361,345 @@ def test_watch_matches_on_the_window_title_too() -> None:
                                 "/// Find the core Hermes pet pop-out")
     assert "windowText" in emit
     assert "windowText.contains(needle)" in emit
+
+
+# --- EYE MODE: right-click the hat → an eye that follows the pointer ----------
+
+def test_eye_follow_offset_and_cadence_never_sit_on_the_target() -> None:
+    """The eye hangs +16/+16 off the pointer and ticks ~15 Hz.
+
+    The offset must stay > 8 pt: the eye sits NEXT to the point being tested,
+    so the glyph/label can never be the element Accessibility answers with.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    spec = _swift_function_body(source, "private enum EyeModeSpec {",
+                                "/// Hard cap + tail ellipsis")
+    offset_lines = [line for line in spec.splitlines()
+                    if "static let offset" in line]
+    assert offset_lines, "the eye offset constant exists"
+    offset = float(offset_lines[0].split("=")[1].strip())
+    assert offset > 8.0, "the eye must never sit under the pointer"
+    assert "static let labelOffset: CGFloat = 38.0" in spec
+    assert "static let labelWidth: CGFloat = 220.0" in spec
+    assert "static let labelHeight: CGFloat = 18.0" in spec
+    # ~15 Hz follow, at most one AX hit-test per 100 ms, 6 pt movement gate.
+    assert "static let tickInterval: TimeInterval = 1.0 / 15.0" in spec
+    assert "static let hitTestInterval: TimeInterval = 0.1" in spec
+    assert "static let moveThreshold: CGFloat = 6.0" in spec
+
+    arm = _swift_function_body(source, "private func armEyeMode() {",
+                               "/// Esc, a second right-click")
+    # Never behind an open ask field: the field's open door disarms the eye.
+    assert "!summonFieldOpen" in arm
+    assert "Timer(timeInterval: EyeModeSpec.tickInterval" in arm
+    assert "repeats: true" in arm
+    assert "RunLoop.main.add(timer, forMode: .common)" in arm
+    assert 'chipJournal("eye-arm")' in arm
+    assert "installEyeMonitors()" in arm
+    assert "dismissLookCard()" in arm, "our own drop card is not part of the read path"
+    assert "eyeMode = true" in arm
+    assert "claimChipView?.eyeMode = true" in arm
+
+    disarm = _swift_function_body(source, "private func disarmEyeMode() {",
+                                  "/// The whole 15 Hz loop")
+    assert "eyeTickTimer?.invalidate()" in disarm
+    assert "removeEyeMonitors()" in disarm
+    assert "dismissEyeLabel()" in disarm
+    assert 'chipJournal("eye-disarm")' in disarm
+    # The hat returns to the pet.
+    assert "positionClaimChip()" in disarm
+    assert "claimChipView?.eyeMode = false" in disarm
+
+    # Both placement paths must yield the frame to the follow tick.
+    position = _swift_function_body(source, "private func positionClaimChip()",
+                                    "private func applyClaimChipFrame(")
+    assert "guard !eyeMode else { return }" in position
+    apply_body = _swift_function_body(source, "private func applyClaimChipFrame(",
+                                      "private func hideClaimChip(")
+    assert "guard !eyeMode else { return }" in apply_body
+
+
+def test_eye_hover_latches_over_our_own_windows_and_never_reads_our_own_pid() -> None:
+    """The target is captured at HOVER time, not by catching the user's click.
+
+    Our own windows win every AX hit-test (§8), so while the pointer is over the
+    eye/label/ask field the stored descriptor is kept — the latch that makes
+    click-the-eye answerable after the pointer travels. A hit that lands in our
+    own process is never stored.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    tick = _swift_function_body(source, "private func eyeTick() {",
+                                "/// True when the resolved element belongs to THIS process")
+    assert "NSEvent.mouseLocation" in tick
+    assert "lookElementDescriptor(at: quartz)" in tick
+    assert "EyeModeSpec.moveThreshold" in tick
+    assert "EyeModeSpec.hitTestInterval" in tick
+    assert "Date().timeIntervalSince(tested) < EyeModeSpec.hitTestInterval" in tick
+    # Pointer over one of our windows: keep the descriptor, take no hit-test.
+    assert "eyePointIsOurs(quartz, primaryHeight: primaryHeight)" in tick
+    own_branch = tick.split("if eyePointIsOurs(", 1)[1].split("eyeLatchAnnounced = false", 1)[0]
+    assert "latch" in own_branch, "the latch marker documents the stored descriptor"
+    assert "eyeLatchedDescriptor" in own_branch
+    assert 'chipJournal("eye-latch")' in own_branch
+    assert "lookElementDescriptor(at:" not in own_branch, "never hit-test our own window"
+    # A foreign hit is stored and journalled.
+    assert "eyeLatchedDescriptor = descriptor" in tick
+    assert 'chipJournal("eye-hover:"' in tick
+    # Our own pid is never trusted as the answer.
+    assert "eyeDescriptorIsSelf(descriptor)" in tick
+    assert "eyeLastTestedPoint = nil" in tick, "a self-hit is retried, not stored"
+
+    ours = _swift_function_body(
+        source, "private func eyePointIsOurs(",
+        "/// The exits are observed, never swallowed")
+    assert "claimChipWindow" in ours
+    assert "eyeLabelWindow" in ours
+    assert "summonFieldWindow" in ours
+    assert "frame.contains(quartz)" in ours
+
+    self_check = _swift_function_body(
+        source, "private func eyeDescriptorIsSelf(",
+        "/// True when a Quartz point lands inside one of THIS process's windows")
+    assert "descriptor.pid == ProcessInfo.processInfo.processIdentifier" in self_check
+    assert "lookDescriptorIsSelf(descriptor)" in self_check
+
+    # The pid is read at resolution time, not guessed from a name.
+    resolve = _swift_function_body(
+        source,
+        "private func lookElementDescriptor(at point: CGPoint) -> LookDescriptor {",
+        "/// True when the hit element belongs to THIS process.")
+    assert "AXUIElementGetPid(chosen, &pid)" in resolve
+    assert "pid: pid" in resolve
+
+
+def test_eye_label_is_click_through_capped_and_eleven_point() -> None:
+    """The label is a 220x18 dark pill of one 11 pt line, capped at 30 chars.
+
+    It is non-interactive on purpose: `ignoresMouseEvents = true` means the
+    click goes to the control, and only the EYE receives the ask.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    label = _swift_function_body(source, "private final class EyeLabelView: NSView {",
+                                 "// MARK: - Pet sprite sheet")
+    assert "NSFont.systemFont(ofSize: EyeModeSpec.labelFontSize)" in label
+    assert "static let labelFontSize: CGFloat = 11.0" in source
+    assert "maximumNumberOfLines = 1" in label
+    assert ".byTruncatingTail" in label
+    assert "NSButton" not in label
+    # The line shape: role · "label".
+    line = label.split("static func line(for descriptor: LookDescriptor)", 1)[1]
+    assert "\\u{00B7}" in line
+    assert "\\u{201C}" in line
+    assert "eyeLabelText(text)" in line
+
+    cap = _swift_function_body(source, "private func eyeLabelText(",
+                               "/// The read-out label's panel.")
+    assert "static let labelMaxCharacters = 30" in source
+    assert "text.count > limit" in cap
+    assert "prefix(limit - 1)" in cap
+    assert "\\u{2026}" in cap, "the cap ellipsises instead of cutting mid-word"
+
+    window = _swift_function_body(source, "private final class EyeLabelWindow: NSPanel {",
+                                  "private final class EyeLabelView: NSView {")
+    assert "return false" in window, "the label never becomes key"
+
+    ensure = _swift_function_body(source, "private func ensureEyeLabel() {",
+                                  "private func updateEyeLabel()")
+    assert "ignoresMouseEvents = true" in ensure
+    assert ".nonactivatingPanel" in ensure
+    assert ".statusBar" in ensure
+    assert "isMovable = false" in ensure
+
+    # Positioned at +16/+38 from the pointer, clamped to the visible frame.
+    place = _swift_function_body(source, "private func positionEyeLabel(",
+                                 "/// The label is created with the mode")
+    assert "quartz.x + EyeModeSpec.offset" in place
+    assert "quartz.y + EyeModeSpec.labelOffset" in place
+    assert "visible.minY + 4.0" in place
+    assert "visible.maxX - frame.width - 4.0" in place
+    # Near an edge the clamp must not leave the pill on the tested point.
+    assert "if frame.contains(quartz)" in place
+    assert "quartz.y - EyeModeSpec.labelOffset - size.height" in place
+
+    # The eye itself is clamped too, and flips if the clamp lands on the point.
+    follow = _swift_function_body(source, "private func eyeFollowFrame(",
+                                  "private func positionEyeWindow(")
+    assert "quartz.x + EyeModeSpec.offset" in follow
+    assert "quartz.y + EyeModeSpec.offset" in follow
+    assert "visible.maxX - size.width - 4.0" in follow
+    assert "if frame.contains(quartz)" in follow
+    assert "quartz.x - EyeModeSpec.offset - size.width" in follow
+
+
+def test_hat_right_click_menu_has_the_look_and_watch_doors() -> None:
+    """Right-clicking the hat opens the discoverability menu.
+
+    The three watch rows are prefilled into the SAME ask field, so they ride the
+    normal agent turn; the watch rows go disabled when no watch is active.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    menu = _swift_function_body(source, "private func presentHatMenu(",
+                                "/// The app a watch would attach to")
+    assert "NSMenu()" in menu
+    assert "NSMenuItem(title: title" in menu
+    assert '"Look at this…"' in menu
+    assert '"Watch \\(app)…"' in menu
+    assert '"What did the watch see?"' in menu
+    assert '"Stop watching"' in menu
+    assert "menu.popUp(positioning: nil, at: point, in: view)" in menu
+    assert "hatMenuTargets = targets" in menu, "menu action boxes outlive tracking"
+    # The watch doors are prefilled, not a new endpoint.
+    assert 'openSummonField(prefill: "watch \\(app) for ")' in menu
+    assert 'openSummonField(prefill: "what did the watch see?")' in menu
+    assert 'openSummonField(prefill: "stop watching")' in menu
+    assert "summon_text" not in menu
+    assert "look_text" not in menu
+    frontmost = _swift_function_body(source,
+                                     "private func hatMenuFrontmostAppName()",
+                                     "/// Is a watch active?")
+    # The frontmost app is the menu-bar owner, never this accessory helper.
+    assert "NSWorkspace.shared.menuBarOwningApplication" in frontmost
+    assert "app.processIdentifier != me" in frontmost
+    # No active watch → the two watch-reading rows are disabled honestly.
+    assert "watchActive" in menu
+    assert "isEnabled = enabled" in menu
+    assert "watchIsActive()" in menu
+
+    watch_state = _swift_function_body(source, "private func watchIsActive() -> Bool {",
+                                       "/// The `watch` row of the shared state")
+    # The engine writes "stopped": null while a watch runs, and JSON null is
+    # NSNull in Swift, not nil: both must count as active.
+    assert 'let stopped = row["stopped"]' in watch_state
+    assert "stopped == nil || stopped is NSNull" in watch_state
+    assert "watchObserver != nil" in watch_state
+    read = _swift_function_body(source, "private func readWatchStateRow()",
+                                "/// Clicking the eye asks about the latched target")
+    assert "state.json" in read
+    assert 'object["watch"]' in read
+
+    # The right-click reaches the controller from the chip view.
+    chip_view = _swift_function_body(source,
+                                     "private final class ClaimChipView: NSView {",
+                                     "// MARK: - Pointer LOOK card")
+    assert "override func rightMouseDown(with event: NSEvent)" in chip_view
+    assert "onRightClick?(point)" in chip_view
+    assert "var onRightClick: ((NSPoint) -> Void)?" in chip_view
+    wired = _swift_function_body(source, "private func applyClaimChipFrame(",
+                                 "private func hideClaimChip(")
+    assert "view.onRightClick" in wired
+    assert "claimChipRightClicked(at: point)" in wired
+
+    right = _swift_function_body(source, "private func claimChipRightClicked(at point: NSPoint) {",
+                                 "/// `Look at this…` arms the eye")
+    assert "disarmEyeMode()" in right, "a second right-click exits EYE MODE"
+    assert "presentHatMenu(at: point)" in right
+
+
+def test_eye_click_asks_from_the_latched_descriptor_and_journals_it() -> None:
+    """Clicking the eye asks about the captured target; the app's control never
+    fires because the click landed in OUR window. No latch → eye-miss only."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    ask = _swift_function_body(source, "private func answerEyeClick() {",
+                               "/// +16/+16 from the pointer")
+    assert "guard let descriptor = eyeLatchedDescriptor else" in ask
+    assert 'chipJournal("eye-miss")' in ask
+    assert 'chipJournal("eye-ask:"' in ask
+    assert "LookTarget(app: descriptor.app" in ask
+    assert "pendingLookContext" in ask
+    assert "pendingLookTarget" in ask
+    assert "openSummonField()" in ask
+    assert "openSummonField() disarms EYE MODE" in ask, "documented, not duplicated"
+
+    # EVERY door into the ask field leaves EYE MODE (the eye click, the menu,
+    # and cmd-shift-A), and the frame is taken first so the field opens where
+    # the eye was.
+    opened = _swift_function_body(source, "private func openSummonField(prefill: String?) {",
+                                  "private func closeSummonField(")
+    assert "disarmEyeMode()" in opened
+    assert opened.find("let appKitFrame = appKitRect") < opened.find("disarmEyeMode()")
+
+    click = _swift_function_body(source, "private func claimChipClicked() {",
+                                 "// MARK: Pointer LOOK gesture")
+    assert "if eyeMode {" in click
+    assert "answerEyeClick()" in click
+
+    # The journal names stay exactly the six eye events.
+    for event in ("eye-arm", "eye-disarm", "eye-hover:", "eye-latch",
+                  "eye-miss", "eye-ask:"):
+        assert f'chipJournal("{event}' in source, f"journal line {event} is missing"
+
+
+def test_eye_path_needs_no_event_tap_flags_or_input_monitoring() -> None:
+    """The eye must never ask for Input Monitoring: no tap, no flagsChanged.
+
+    Exits are observed with NSEvent monitors (the companion's existing
+    Accessibility trust covers those), never intercepted or swallowed.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    for forbidden in ("CGEventTap", "flagsChanged", "Input Monitoring",
+                      "kCGSessionEventTap"):
+        assert forbidden not in source, f"the eye path must not use {forbidden}"
+
+    # The eye never runs its own trust probe either: the companion's existing
+    # Accessibility grant is the single subject (§4).
+    eye_path = (_swift_function_body(source, "private func armEyeMode() {",
+                                     "/// Esc, a second right-click")
+                + _swift_function_body(source, "private func eyeTick() {",
+                                       "/// True when the resolved element belongs to THIS process")
+                + _swift_function_body(source, "private func installEyeMonitors() {",
+                                       "private func removeEyeMonitors()"))
+    assert "AXIsProcessTrustedWithOptions" not in eye_path
+
+    monitors = _swift_function_body(source, "private func installEyeMonitors() {",
+                                    "private func removeEyeMonitors()")
+    assert "NSEvent.addGlobalMonitorForEvents" in monitors
+    assert "NSEvent.addLocalMonitorForEvents" in monitors
+    assert "keyCode == escape" in monitors
+    assert "let escape: UInt16 = 53" in monitors
+    assert "NSEvent.removeMonitor" in source
+
+    # A click anywhere in another app is the documented "clicked outside" exit.
+    assert "self?.disarmEyeMode()" in monitors
+
+
+def test_eye_arm_survives_teardown_and_ask_field_prefill_is_caret_at_end() -> None:
+    """The eye's timer/monitors/label must die with the chip/shutdown, and the
+    prefilled watch rows keep their text editable with the caret at the end."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    disarm_chip = _swift_function_body(
+        source, "private func setClaimChip(_ spec: ClaimChipSpec)",
+        "// MARK: Pet AX observation")
+    assert "disarmEyeMode()" in disarm_chip
+
+    shutdown = _swift_function_body(source, "func shutdown() {",
+                                    "// MARK: - Application delegate")
+    assert "disarmEyeMode()" in shutdown
+
+    opened = _swift_function_body(source, "private func openSummonField(",
+                                  "private func closeSummonField(")
+    assert "private func openSummonField(prefill: String?) {" in source
+    assert "view.field.stringValue = prefill" in opened
+    assert "editor.selectedRange = NSRange(location: (prefill as NSString).length" in opened
+    assert "makeFirstResponder(view.field)" in opened
+
+
+def test_right_click_arms_the_eye_and_option_right_click_is_the_menu() -> None:
+    """The user's gesture is literally "right-click the hat -> an eye next to my
+    cursor". The menu (watch actions) moved behind Option-right-click so the
+    primary gesture is not a menu.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+    handler = _swift_function_body(source, "private func claimChipRightClicked(at point: NSPoint)",
+                                   "/// `Look at this…` arms the eye")
+    assert "modifierFlags.contains(.option)" in handler
+    assert "presentHatMenu(at: point)" in handler
+    assert "armEyeMode()" in handler
+    # A plain right-click must arm, not open the menu.
+    assert handler.index("armEyeMode()") > handler.index("presentHatMenu(at: point)")

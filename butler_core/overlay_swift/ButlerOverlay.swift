@@ -574,6 +574,10 @@ private struct LookDescriptor {
     /// True when AX could not name the element under the pointer and the honest
     /// answer is the window/app it belongs to.
     var isWindowFallback = false
+    /// Owning process of the resolved element. The EYE hover path uses it to
+    /// reject a hit that landed in our own process (§8), which a name
+    /// comparison alone can miss.
+    var pid: pid_t = 0
 
     /// 1..5 card rows, in draw order. More than five is ellipsised by the card.
     var lines: [String] {
@@ -751,7 +755,8 @@ private func lookElementDescriptor(at point: CGPoint) -> LookDescriptor {
                                   window: enclosing.window, doc: enclosing.doc,
                                   enabled: nil, value: nil,
                                   box: axBoxAttribute(hit),
-                                  isWindowFallback: true)
+                                  isWindowFallback: true,
+                                  pid: pid)
         }
     }
 
@@ -768,7 +773,8 @@ private func lookElementDescriptor(at point: CGPoint) -> LookDescriptor {
                           doc: enclosing.doc,
                           enabled: axEnabledAttribute(chosen),
                           value: axValueString(chosen),
-                          box: axBoxAttribute(chosen))
+                          box: axBoxAttribute(chosen),
+                          pid: pid)
 }
 
 /// True when the hit element belongs to THIS process.
@@ -1793,9 +1799,21 @@ private final class ClaimChipView: NSView {
     /// True from the first moved point until mouseUp; the controller then drops
     /// the read-out card at the release point.
     private(set) var lookMode = false
+    /// True while EYE MODE owns this view: the hat is detached from the pet and
+    /// follows the pointer as an eye. A press then asks about the captured
+    /// target — it is never a LOOK drag.
+    var eyeMode = false {
+        didSet {
+            guard eyeMode != oldValue else { return }
+            needsDisplay = true
+        }
+    }
     private var pressStart: NSPoint?
     private var dragging = false
     var onClick: (() -> Void)?
+    /// The hat's second door: a right-click opens the LOOK/watch menu (or, in
+    /// EYE MODE, ends the mode). The point is in this view's coordinates.
+    var onRightClick: ((NSPoint) -> Void)?
     /// Fires on mouseDown, before a drag exists, so the placement timer stops
     /// the moment the user grabs the hat.
     var onPressBegan: ((NSPoint) -> Void)?
@@ -1901,7 +1919,9 @@ private final class ClaimChipView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let start = pressStart else { return }
+        // In EYE MODE a press is a click on the eye, never a LOOK drag: the
+        // follow tick owns the frame, so a wobble must not turn it into one.
+        guard let start = pressStart, !eyeMode else { return }
         let point = screenPoint(for: event)
         let dx = point.x - start.x
         let dy = point.y - start.y
@@ -1916,6 +1936,15 @@ private final class ClaimChipView: NSView {
         if dragging {
             onDragMoved?(point)
         }
+    }
+
+    /// Right-click is the menu door (and the second right-click that leaves EYE
+    /// MODE). Acted on mouseDown so the menu tracks immediately.
+    override func rightMouseDown(with event: NSEvent) {
+        pressStart = nil
+        dragging = false
+        let point = convert(event.locationInWindow, from: nil)
+        onRightClick?(point)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -1963,9 +1992,11 @@ private final class ClaimChipView: NSView {
         path.lineWidth = 1.0
         path.stroke()
 
-        let glyph = lookMode ? ClaimChipView.lookGlyph : ClaimChipView.glyph
+        let glyph = (eyeMode || lookMode) ? ClaimChipView.lookGlyph
+                                          : ClaimChipView.glyph
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: lookMode ? ClaimChipView.lookGlyphFont : ClaimChipView.glyphFont,
+            .font: (eyeMode || lookMode) ? ClaimChipView.lookGlyphFont
+                                         : ClaimChipView.glyphFont,
             .foregroundColor: NSColor.white
         ]
         let glyphSize = (glyph as NSString).size(withAttributes: attributes)
@@ -2326,6 +2357,162 @@ private final class SummonFieldView: NSView, NSTextFieldDelegate {
             return true
         }
         return false
+    }
+}
+
+// MARK: - EYE MODE (right-click the hat → a pointer-following eye)
+
+/// Geometry and cadence for EYE MODE, fixed on purpose.
+///
+/// `offset` must stay > 8 pt: the eye and its read-out sit off the point under
+/// test, so hovering a control never makes the eye the element Accessibility
+/// answers with (the §8 self-hit class of defect).
+private enum EyeModeSpec {
+    static let offset: CGFloat = 16.0
+    /// The read-out label hangs below the eye, clear of the tested point.
+    static let labelOffset: CGFloat = 46.0
+    static let labelWidth: CGFloat = 220.0
+    static let labelHeight: CGFloat = 18.0
+    /// One row of 11 pt text plus air: the label never wraps or grows.
+    static let labelFontSize: CGFloat = 11.0
+    /// "Cap the text at 30 characters, ellipsise."
+    static let labelMaxCharacters = 30
+    /// ~15 Hz pointer follow: attached to the cursor, cheap enough to run while
+    /// the user works in another app.
+    static let tickInterval: TimeInterval = 1.0 / 15.0
+    /// At most one AX hit-test per 100 ms, whatever the tick does.
+    static let hitTestInterval: TimeInterval = 0.1
+    /// A pointer that moved less than this keeps the captured target: menus,
+    /// tooltips and the eye itself jitter by a point or two.
+    static let moveThreshold: CGFloat = 6.0
+}
+
+/// Hard cap + tail ellipsis for the live label line.
+private func eyeLabelText(_ text: String,
+                          limit: Int = EyeModeSpec.labelMaxCharacters) -> String {
+    guard limit > 1, text.count > limit else { return text }
+    return String(text.prefix(limit - 1)) + "\u{2026}"
+}
+
+/// The read-out label's panel. Like the LOOK card it must never take focus:
+/// the user's app keeps typing while the eye is up.
+private final class EyeLabelWindow: NSPanel {
+    override var canBecomeKey: Bool {
+        return false
+    }
+
+    override var canBecomeMain: Bool {
+        return false
+    }
+}
+
+/// A 220x18 dark pill with ONE 11 pt line: `Button · "Merge pull request"`.
+/// No buttons, no footer, no interaction — it is a glance, not a surface.
+private final class EyeLabelView: NSView {
+    private static let inset: CGFloat = 7.0
+    private static let textHeight: CGFloat = 14.0
+    private let label = NSTextField(labelWithString: "")
+
+    /// The descriptor as one live line: role plus its quoted label, capped.
+    /// An unnamed control still says WHERE it is (window, then app) instead of
+    /// printing a bare "Window" — the §8 "Group alone is never an answer" rule.
+    static func line(for descriptor: LookDescriptor) -> String {
+        var text: String
+        if let role = axNonEmpty(descriptor.role) {
+            if let label = axNonEmpty(descriptor.label) {
+                text = role + " \u{00B7} \u{201C}" + label + "\u{201D}"
+            } else if let window = axNonEmpty(descriptor.window) {
+                text = role + " \u{00B7} " + window
+            } else if let app = axNonEmpty(descriptor.app) {
+                text = role + " \u{00B7} " + app
+            } else {
+                text = role
+            }
+        } else if let label = axNonEmpty(descriptor.label) {
+            text = "\u{201C}" + label + "\u{201D}"
+        } else {
+            text = axNonEmpty(descriptor.window) ?? axNonEmpty(descriptor.app) ?? "\u{2026}"
+        }
+        return eyeLabelText(text)
+    }
+
+    var text: String = "" {
+        didSet {
+            guard text != oldValue else { return }
+            label.stringValue = text
+        }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        label.font = NSFont.systemFont(ofSize: EyeModeSpec.labelFontSize)
+        label.textColor = NSColor.white
+        // One visual line, tail ellipsis: the card never wraps or grows.
+        label.lineBreakMode = .byTruncatingTail
+        label.usesSingleLineMode = true
+        label.maximumNumberOfLines = 1
+        label.cell?.lineBreakMode = .byTruncatingTail
+        label.cell?.usesSingleLineMode = true
+        label.isEditable = false
+        label.isSelectable = false
+        label.isBezeled = false
+        label.isBordered = false
+        label.drawsBackground = false
+        label.focusRingType = .none
+        label.refusesFirstResponder = true
+        label.setAccessibilityLabel("Butler eye read-out")
+        addSubview(label)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override var isFlipped: Bool {
+        return true
+    }
+
+    override func layout() {
+        super.layout()
+        label.frame = NSRect(x: EyeLabelView.inset,
+                             y: (bounds.height - EyeLabelView.textHeight) / 2.0,
+                             width: max(0.0, bounds.width - EyeLabelView.inset * 2.0),
+                             height: EyeLabelView.textHeight)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let background = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: background, xRadius: 5.0, yRadius: 5.0)
+        NSColor(red: 22.0 / 255.0,
+                green: 23.0 / 255.0,
+                blue: 26.0 / 255.0,
+                alpha: 0.92).setFill()
+        path.fill()
+        NSColor(red: 122.0 / 255.0,
+                green: 134.0 / 255.0,
+                blue: 255.0 / 255.0,
+                alpha: 0.55).setStroke()
+        path.lineWidth = 1.0
+        path.stroke()
+    }
+}
+
+/// NSMenu needs an NSObject target/action pair and the controller is a plain
+/// class, so each item's action lives in one of these boxes (held strong by the
+/// controller for the life of the menu, since `NSMenuItem.target` is weak).
+private final class EyeMenuItemTarget: NSObject {
+    private let handler: () -> Void
+
+    init(_ handler: @escaping () -> Void) {
+        self.handler = handler
+    }
+
+    @objc func fire(_ sender: Any?) {
+        handler()
     }
 }
 
@@ -2704,6 +2891,30 @@ private final class OverlayController {
     private let lookAskWindow: TimeInterval = 90.0
     /// The element the open field is asking about, or nil for the plain door.
     private var summonFieldLookTarget: LookTarget?
+
+    // MARK: EYE MODE state
+    //
+    // Right-clicking the hat detaches it from the pet and turns it into an eye
+    // that follows the pointer until Esc, a second right-click or a click in
+    // another app. The target is captured on HOVER, not on click: the click on
+    // the eye lands in OUR window, so the app's control never fires.
+    private var eyeMode = false
+    private var eyeTickTimer: Timer?
+    private var eyeLabelWindow: NSPanel?
+    private var eyeLabelView: EyeLabelView?
+    private var eyeMonitors: [Any] = []
+    /// Last point a hit-test was taken from, and when. The 15 Hz tick must not
+    /// turn into 15 AX reads a second.
+    private var eyeLastTestedPoint: CGPoint?
+    private var eyeLastHitTestAt: Date?
+    /// What the pointer was over, kept ("latched") while it is over our own
+    /// windows — the stored descriptor is what makes click-the-eye answerable.
+    private var eyeLatchedDescriptor: LookDescriptor?
+    private var eyeLatchedPoint: CGPoint?
+    /// One `eye-latch` line per entry into the latch, not per tick.
+    private var eyeLatchAnnounced = false
+    /// NSMenu action boxes must outlive the tracking loop.
+    private var hatMenuTargets: [EyeMenuItemTarget] = []
     // AX notifications replace the 0.5 s reposition poll while the chip is
     // armed: the Hermes pop-out posts ~17 ms AXWindowMoved events during a
     // drag (a probe logged 86 in one drag, each with live AXPosition/AXSize).
@@ -3144,6 +3355,9 @@ private final class OverlayController {
         }
         claimChipPadBottom = spec.padBottom
         if !spec.enabled {
+            // Disarming first: EYE MODE holds a timer and monitors that a
+            // closed hat must not leave behind.
+            disarmEyeMode()
             claimChipTimer?.invalidate()
             claimChipTimer = nil
             claimChipTimerInterval = 0.0
@@ -4113,6 +4327,9 @@ private final class OverlayController {
         recoverLostPressIfNeeded()
         // The drag owns the frame until mouseUp; the timer must stay out of it.
         guard !claimChipDragging else { return }
+        // EYE MODE owns the frame: the follow tick places the chip, so the pet
+        // placement tick must never snap it back to the pop-out.
+        guard !eyeMode else { return }
         guard claimChipEnabled, !isShuttingDown,
               let primaryHeight = primaryScreenHeight() else {
             hideClaimChip()
@@ -4132,6 +4349,8 @@ private final class OverlayController {
     private func applyClaimChipFrame(petWindow: CGRect, primaryHeight: CGFloat) {
         recoverLostPressIfNeeded()
         guard !claimChipDragging else { return }
+        // The follow tick owns the frame while the eye is detached.
+        guard !eyeMode else { return }
         guard claimChipEnabled, !isShuttingDown else {
             hideClaimChip()
             return
@@ -4183,6 +4402,9 @@ private final class OverlayController {
         view.onClick = { [weak self] in
             self?.claimChipClicked()
         }
+        view.onRightClick = { [weak self] point in
+            self?.claimChipRightClicked(at: point)
+        }
         view.onPressBegan = { [weak self] point in
             self?.beginChipPress(at: point)
         }
@@ -4221,6 +4443,12 @@ private final class OverlayController {
         claimChipDragging = false
         // Using the hat again puts any read-out away first.
         dismissLookCard()
+        // In EYE MODE the hat IS the eye: the click landed in our own window, so
+        // the app's control never fired and the captured target is the subject.
+        if eyeMode {
+            answerEyeClick()
+            return
+        }
         guard claimChipEnabled else {
             chipJournal("click-skipped:disabled")
             return
@@ -4543,7 +4771,12 @@ private final class OverlayController {
         return frame
     }
 
+    /// The plain doors (hat click, ⌘⇧A, the LOOK submit): nothing prefilled.
     private func openSummonField() {
+        openSummonField(prefill: nil)
+    }
+
+    private func openSummonField(prefill: String?) {
         // Consume LOOK state before ANY guard: an aborted open must never leave
         // a queued element behind for the next hat tap to inherit.
         let lookContext = pendingLookContext
@@ -4564,6 +4797,10 @@ private final class OverlayController {
         }
         let appKitFrame = appKitRect(fromQuartz: frame,
                                      primaryHeight: primaryHeight)
+        // An open ask field is one of EYE MODE's exits: the eye has delivered its
+        // target, so the hat goes home while the user types. This runs AFTER the
+        // frame above was taken, so the field still opens where the eye was.
+        disarmEyeMode()
         // Captured BEFORE we activate: this is the app the user was working in
         // and the one that gets focus back when the field closes.
         summonFieldReturnApp = NSWorkspace.shared.frontmostApplication
@@ -4594,6 +4831,11 @@ private final class OverlayController {
                                                  size: appKitFrame.size))
         view.autoresizingMask = [.width, .height]
         view.configureForLook(context: lookContext)
+        // The hat's right-click menu hands over a prefilled request (the watch
+        // doors); the text stays editable and the caret lands at the end.
+        if let prefill = prefill, !prefill.isEmpty {
+            view.field.stringValue = prefill
+        }
         view.onSubmit = { [weak self] text, destination in
             guard let self = self else { return }
             if let target = self.summonFieldLookTarget {
@@ -4623,6 +4865,12 @@ private final class OverlayController {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKey()
         window.makeFirstResponder(view.field)
+        if let prefill = prefill, !prefill.isEmpty,
+           let editor = view.field.currentEditor() {
+            // Caret at the END: the prefilled command is editable, not selected.
+            editor.selectedRange = NSRange(location: (prefill as NSString).length,
+                                           length: 0)
+        }
         chipJournal("ask-open")
     }
 
@@ -4789,6 +5037,474 @@ private final class OverlayController {
         } else {
             app.activate(options: [.activateIgnoringOtherApps])
         }
+    }
+
+    // MARK: EYE MODE
+
+    /// Right-click the hat turns it into an eye that follows the pointer, with a
+    /// live label naming the control under the cursor. The target is captured on
+    /// HOVER (see `eyeTick`), never by catching the user's click: the eye only
+    /// ever reads.
+    private func armEyeMode() {
+        // Never behind an open ask field: the field and the eye would fight for
+        // the same corner, and the field's own open door disarms the eye anyway.
+        guard !eyeMode, !summonFieldOpen, !isShuttingDown,
+              claimChipEnabled else { return }
+        guard claimChipWindow != nil, claimChipView != nil else { return }
+        // Another of our windows on screen would sit in the eye's read path.
+        dismissLookCard()
+        eyeMode = true
+        eyeLatchedDescriptor = nil
+        eyeLatchedPoint = nil
+        eyeLastTestedPoint = nil
+        eyeLastHitTestAt = nil
+        eyeLatchAnnounced = false
+        claimChipView?.eyeMode = true
+        chipJournal("eye-arm")
+        ensureEyeLabel()
+        installEyeMonitors()
+        let timer = Timer(timeInterval: EyeModeSpec.tickInterval,
+                          repeats: true) { [weak self] _ in
+            self?.eyeTick()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        eyeTickTimer = timer
+        // Place the eye on the current pointer at once: waiting up to 66 ms
+        // leaves the hat visible at the pet after the menu closes.
+        eyeTick()
+    }
+
+    /// Esc, a second right-click, a click outside our windows, the ask opening
+    /// or teardown all land here, so no monitor or timer outlives the mode.
+    private func disarmEyeMode() {
+        guard eyeMode else { return }
+        eyeMode = false
+        eyeTickTimer?.invalidate()
+        eyeTickTimer = nil
+        removeEyeMonitors()
+        dismissEyeLabel()
+        claimChipView?.eyeMode = false
+        eyeLatchedDescriptor = nil
+        eyeLatchedPoint = nil
+        eyeLastTestedPoint = nil
+        eyeLastHitTestAt = nil
+        eyeLatchAnnounced = false
+        chipJournal("eye-disarm")
+        // The hat returns to the pet.
+        positionClaimChip()
+        claimChipWindow?.orderFrontRegardless()
+    }
+
+    /// The whole 15 Hz loop: move the eye and its label, then — only when the
+    /// pointer moved and at most every 100 ms — hit-test the point under it and
+    /// latch what it found.
+    private func eyeTick() {
+        guard eyeMode, !isShuttingDown else { return }
+        guard let primaryHeight = primaryScreenHeight() else { return }
+        let mouse = NSEvent.mouseLocation
+        guard mouse.x.isFinite, mouse.y.isFinite else { return }
+        let quartz = CGPoint(x: mouse.x, y: primaryHeight - mouse.y)
+
+        positionEyeWindow(quartz: quartz, primaryHeight: primaryHeight)
+        positionEyeLabel(quartz: quartz, primaryHeight: primaryHeight)
+
+        // Our own windows win every AX hit-test (§8): while the pointer is over
+        // the eye, the label or the ask field, keep the stored descriptor —
+        // latch — and take no hit-test at all. This is what makes
+        // click-the-eye work after the pointer travels to the eye.
+        if eyePointIsOurs(quartz, primaryHeight: primaryHeight) {
+            if eyeLatchedDescriptor != nil, !eyeLatchAnnounced {
+                eyeLatchAnnounced = true
+                chipJournal("eye-latch")
+            }
+            return
+        }
+        eyeLatchAnnounced = false
+
+        if let last = eyeLastTestedPoint {
+            let dx = quartz.x - last.x
+            let dy = quartz.y - last.y
+            if (dx * dx + dy * dy).squareRoot() < EyeModeSpec.moveThreshold {
+                return
+            }
+        }
+        if let tested = eyeLastHitTestAt,
+           Date().timeIntervalSince(tested) < EyeModeSpec.hitTestInterval {
+            return
+        }
+        eyeLastTestedPoint = quartz
+        eyeLastHitTestAt = Date()
+
+        let descriptor = lookElementDescriptor(at: quartz)
+        // §8: never trust a hit that lands in our own process. The window
+        // server can still report our own window for a beat after the eye
+        // moved, so drop the test point and retry on the next tick.
+        if eyeDescriptorIsSelf(descriptor) {
+            eyeLastTestedPoint = nil
+            return
+        }
+        eyeLatchedDescriptor = descriptor
+        eyeLatchedPoint = quartz
+        updateEyeLabel()
+        chipJournal("eye-hover:" + (descriptor.role ?? "?"))
+    }
+
+    /// True when the resolved element belongs to THIS process. The pid is the
+    /// exact test; the name comparison catches a descriptor whose AX pid read
+    /// failed but whose app name is still ours.
+    private func eyeDescriptorIsSelf(_ descriptor: LookDescriptor) -> Bool {
+        if descriptor.pid != 0,
+           descriptor.pid == ProcessInfo.processInfo.processIdentifier {
+            return true
+        }
+        return lookDescriptorIsSelf(descriptor)
+    }
+
+    /// True when a Quartz point lands inside one of THIS process's windows: the
+    /// eye, its label, or the ask field. No AX hit-test is taken there.
+    private func eyePointIsOurs(_ quartz: CGPoint, primaryHeight: CGFloat) -> Bool {
+        let windows: [NSWindow?] = [claimChipWindow, eyeLabelWindow, summonFieldWindow]
+        for window in windows {
+            guard let window = window, window.isVisible else { continue }
+            let frame = quartzRect(fromAppKit: window.frame,
+                                   primaryHeight: primaryHeight)
+            if frame.contains(quartz) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// The exits are observed, never swallowed: a global monitor needs no new
+    /// grant (the companion already holds Accessibility) and lets the click
+    /// reach the app. Escape is the only key read; no event tap and no
+    /// modifier-key stream, so this path asks for no extra permission.
+    private func installEyeMonitors() {
+        guard eyeMonitors.isEmpty else { return }
+        let mouse: NSEvent.EventTypeMask = [.leftMouseDown,
+                                            .rightMouseDown,
+                                            .otherMouseDown]
+        if let globalMouse = NSEvent.addGlobalMonitorForEvents(
+            matching: mouse,
+            handler: { [weak self] _ in
+                // The click landed in another app: outside our windows' reach.
+                self?.disarmEyeMode()
+            }) {
+            eyeMonitors.append(globalMouse)
+        }
+        let escape: UInt16 = 53
+        let keyHandler: (NSEvent) -> Void = { [weak self] event in
+            if event.keyCode == escape {
+                self?.disarmEyeMode()
+            }
+        }
+        if let localKey = NSEvent.addLocalMonitorForEvents(
+            matching: .keyDown,
+            handler: { event in
+                keyHandler(event)
+                return event
+            }) {
+            eyeMonitors.append(localKey)
+        }
+        if let globalKey = NSEvent.addGlobalMonitorForEvents(
+            matching: .keyDown,
+            handler: keyHandler) {
+            eyeMonitors.append(globalKey)
+        }
+    }
+
+    private func removeEyeMonitors() {
+        for monitor in eyeMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        eyeMonitors.removeAll()
+    }
+
+    /// The hat's right-click: the LOOK/watch menu, or the documented exit from
+    /// EYE MODE (the same right-click that armed it).
+    private func claimChipRightClicked(at point: NSPoint) {
+        claimChipDragging = false
+        claimChipView?.cancelPendingPress()
+        if eyeMode {
+            disarmEyeMode()
+            return
+        }
+        // The user's gesture, literally: right-click the hat and an eye rides the
+        // cursor until you click something. The watch actions moved behind
+        // Option-right-click so the primary click is not a menu.
+        if NSEvent.modifierFlags.contains(.option) {
+            presentHatMenu(at: point)
+            return
+        }
+        armEyeMode()
+    }
+
+    /// `Look at this…` arms the eye; the three watch items open the SAME ask
+    /// field prefilled, so they ride the normal agent turn with no new plumbing.
+    private func presentHatMenu(at point: NSPoint) {
+        guard !isShuttingDown, !summonFieldOpen, let view = claimChipView else {
+            return
+        }
+        let frontmost = hatMenuFrontmostAppName()
+        let app = frontmost ?? "this app"
+        // The `watch` row in state.json is the ground truth; the in-process
+        // observer covers an unreadable file.
+        let watchActive = watchIsActive()
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        var targets: [EyeMenuItemTarget] = []
+        func entry(_ title: String,
+                   enabled: Bool = true,
+                   action: @escaping () -> Void) -> NSMenuItem {
+            let target = EyeMenuItemTarget(action)
+            targets.append(target)
+            let item = NSMenuItem(title: title,
+                                  action: #selector(EyeMenuItemTarget.fire(_:)),
+                                  keyEquivalent: "")
+            item.target = target
+            item.isEnabled = enabled
+            return item
+        }
+
+        menu.addItem(entry("Look at this…") { [weak self] in
+            self?.armEyeMode()
+        })
+        menu.addItem(.separator())
+        // No nameable frontmost app: keep the row visible but disabled rather
+        // than prefilling a watch for "this app", which can never resolve.
+        menu.addItem(entry("Watch \(app)…", enabled: frontmost != nil) { [weak self] in
+            self?.openSummonField(prefill: "watch \(app) for ")
+        })
+        menu.addItem(entry("What did the watch see?", enabled: watchActive) { [weak self] in
+            self?.openSummonField(prefill: "what did the watch see?")
+        })
+        menu.addItem(entry("Stop watching", enabled: watchActive) { [weak self] in
+            self?.openSummonField(prefill: "stop watching")
+        })
+
+        // The boxes must outlive the tracking loop (an item's target is weak).
+        // Replaced on the next menu rather than cleared: the action is delivered
+        // as the menu closes, and holding a handful of boxes one menu longer is
+        // free.
+        hatMenuTargets = targets
+        menu.popUp(positioning: nil, at: point, in: view)
+    }
+
+    /// The app a watch would attach to: the menu-bar owner, never this helper
+    /// (an accessory process never owns the menu bar).
+    private func hatMenuFrontmostAppName() -> String? {
+        let me = ProcessInfo.processInfo.processIdentifier
+        if let app = NSWorkspace.shared.menuBarOwningApplication,
+           app.processIdentifier != me {
+            return axNonEmpty(app.localizedName)
+        }
+        if let app = NSWorkspace.shared.frontmostApplication,
+           app.processIdentifier != me {
+            return axNonEmpty(app.localizedName)
+        }
+        return nil
+    }
+
+    /// Is a watch active? The `watch` row in state.json is the ground truth and
+    /// costs one small file read on a right-click. The engine writes
+    /// `"stopped": null` while the watch runs and a block once it stopped, and
+    /// JSON null arrives as NSNull — not Swift nil — so both must count as
+    /// active. With no readable file the companion's own observer decides.
+    private func watchIsActive() -> Bool {
+        if let row = readWatchStateRow() {
+            let stopped = row["stopped"]
+            return stopped == nil || stopped is NSNull
+        }
+        return watchObserver != nil
+    }
+
+    /// The `watch` row of the shared state snapshot, or nil when unreadable.
+    private func readWatchStateRow() -> [String: Any]? {
+        let dir = (NSHomeDirectory() as NSString)
+            .appendingPathComponent(".hermes/plugin-data/butler")
+        let path = (dir as NSString).appendingPathComponent("state.json")
+        guard let data = FileManager.default.contents(atPath: path),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return nil
+        }
+        return object["watch"] as? [String: Any]
+    }
+
+    /// Clicking the eye asks about the latched target. The click landed in OUR
+    /// window, so the app's control never saw it: no button activated, no menu
+    /// item ran. The question is answerable from the captured descriptor even
+    /// when an open menu has already closed — a stale-location read, not a lost
+    /// one.
+    private func answerEyeClick() {
+        guard eyeMode else { return }
+        guard let descriptor = eyeLatchedDescriptor else {
+            chipJournal("eye-miss")
+            return
+        }
+        chipJournal("eye-ask:" + (descriptor.role ?? "?"))
+        let target = LookTarget(app: descriptor.app,
+                                role: descriptor.role,
+                                label: descriptor.label,
+                                window: descriptor.window,
+                                doc: descriptor.doc,
+                                enabled: descriptor.enabled,
+                                box: descriptor.box)
+        let line = target.contextLine
+        pendingLookContext = line.isEmpty ? nil : line
+        pendingLookTarget = line.isEmpty ? nil : target
+        // openSummonField() disarms EYE MODE itself once it has the frame, so
+        // every door into the field (this one, ⌘⇧A, the menu) leaves the mode.
+        openSummonField()
+    }
+
+    /// +16/+16 from the pointer, clamped into the screen's visible frame. If the
+    /// clamped frame would cover the point under test, the offset flips to the
+    /// other side, so the eye is never the element being read.
+    private func eyeFollowFrame(quartz: CGPoint,
+                                size: CGSize,
+                                primaryHeight: CGFloat) -> CGRect? {
+        let anchor = CGRect(x: quartz.x, y: quartz.y, width: 1.0, height: 1.0)
+        guard let screen = screenContaining(anchor,
+                                            primaryHeight: primaryHeight) else {
+            return nil
+        }
+        let visible = quartzRect(fromAppKit: screen.visibleFrame,
+                                 primaryHeight: primaryHeight)
+        func clamped(_ rect: CGRect) -> CGRect {
+            var frame = rect
+            frame.origin.x = min(max(frame.origin.x, visible.minX + 4.0),
+                                 visible.maxX - size.width - 4.0)
+            frame.origin.y = min(max(frame.origin.y, visible.minY + 4.0),
+                                 visible.maxY - size.height - 4.0)
+            return frame
+        }
+        var frame = clamped(CGRect(x: quartz.x + EyeModeSpec.offset,
+                                   y: quartz.y + EyeModeSpec.offset,
+                                   width: size.width,
+                                   height: size.height))
+        if frame.contains(quartz) {
+            frame = clamped(CGRect(x: quartz.x - EyeModeSpec.offset - size.width,
+                                   y: quartz.y - EyeModeSpec.offset - size.height,
+                                   width: size.width,
+                                   height: size.height))
+        }
+        return frame
+    }
+
+    private func positionEyeWindow(quartz: CGPoint, primaryHeight: CGFloat) {
+        guard let window = claimChipWindow else { return }
+        guard let frame = eyeFollowFrame(quartz: quartz,
+                                         size: claimChipSize(),
+                                         primaryHeight: primaryHeight) else {
+            return
+        }
+        let appKitFrame = appKitRect(fromQuartz: frame,
+                                     primaryHeight: primaryHeight)
+        if window.frame != appKitFrame {
+            window.setFrame(appKitFrame, display: false)
+            if let view = claimChipView {
+                view.frame = NSRect(origin: .zero, size: appKitFrame.size)
+                view.needsDisplay = true
+            }
+        }
+        window.orderFrontRegardless()
+    }
+
+    /// The read-out hangs at +16/+38 from the pointer: below the eye and clear
+    /// of the tested point, clamped into the same visible frame.
+    private func positionEyeLabel(quartz: CGPoint, primaryHeight: CGFloat) {
+        guard let window = eyeLabelWindow else { return }
+        let size = CGSize(width: EyeModeSpec.labelWidth,
+                          height: EyeModeSpec.labelHeight)
+        let anchor = CGRect(x: quartz.x, y: quartz.y, width: 1.0, height: 1.0)
+        guard let screen = screenContaining(anchor,
+                                            primaryHeight: primaryHeight) else {
+            return
+        }
+        let visible = quartzRect(fromAppKit: screen.visibleFrame,
+                                 primaryHeight: primaryHeight)
+        var frame = CGRect(x: quartz.x + EyeModeSpec.offset,
+                           y: quartz.y + EyeModeSpec.labelOffset,
+                           width: size.width,
+                           height: size.height)
+        frame.origin.x = min(max(frame.origin.x, visible.minX + 4.0),
+                             visible.maxX - frame.width - 4.0)
+        frame.origin.y = min(max(frame.origin.y, visible.minY + 4.0),
+                             visible.maxY - frame.height - 4.0)
+        if frame.contains(quartz) {
+            // Near an edge the clamp can land the pill ON the point under test,
+            // which would latch forever (our own window wins every hit-test).
+            // Mirror it above-left and clamp again.
+            frame = CGRect(x: quartz.x - EyeModeSpec.offset - size.width,
+                           y: quartz.y - EyeModeSpec.labelOffset - size.height,
+                           width: size.width,
+                           height: size.height)
+            frame.origin.x = min(max(frame.origin.x, visible.minX + 4.0),
+                                 visible.maxX - frame.width - 4.0)
+            frame.origin.y = min(max(frame.origin.y, visible.minY + 4.0),
+                                 visible.maxY - frame.height - 4.0)
+        }
+        let appKitFrame = appKitRect(fromQuartz: frame,
+                                     primaryHeight: primaryHeight)
+        if window.frame != appKitFrame {
+            window.setFrame(appKitFrame, display: true)
+        }
+        window.orderFrontRegardless()
+    }
+
+    /// The label is created with the mode and lives until it ends: creating a
+    /// window per descriptor would flash a frame at the origin.
+    private func ensureEyeLabel() {
+        guard eyeMode, eyeLabelWindow == nil else { return }
+        let size = CGSize(width: EyeModeSpec.labelWidth,
+                          height: EyeModeSpec.labelHeight)
+        let window = EyeLabelWindow(contentRect: NSRect(origin: .zero, size: size),
+                                    styleMask: [.borderless, .nonactivatingPanel],
+                                    backing: .buffered,
+                                    defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.level = .statusBar
+        window.collectionBehavior = [.canJoinAllSpaces,
+                                     .stationary,
+                                     .fullScreenAuxiliary,
+                                     .ignoresCycle]
+        // A read-out, never a target: the click goes straight through to the
+        // control underneath.
+        window.ignoresMouseEvents = true
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
+        window.isReleasedWhenClosed = false
+        window.acceptsMouseMovedEvents = false
+        window.hidesOnDeactivate = false
+
+        let view = EyeLabelView(frame: NSRect(origin: .zero, size: size))
+        view.autoresizingMask = [.width, .height]
+        view.text = "\u{2026}"
+        window.contentView = view
+        eyeLabelWindow = window
+        eyeLabelView = view
+        window.orderFrontRegardless()
+    }
+
+    private func updateEyeLabel() {
+        guard eyeMode, let view = eyeLabelView else { return }
+        if let descriptor = eyeLatchedDescriptor {
+            view.text = EyeLabelView.line(for: descriptor)
+        } else {
+            view.text = "\u{2026}"
+        }
+    }
+
+    private func dismissEyeLabel() {
+        if let window = eyeLabelWindow {
+            window.orderOut(nil)
+            window.close()
+        }
+        eyeLabelWindow = nil
+        eyeLabelView = nil
     }
 
     // MARK: System-wide summon hot key
@@ -5499,6 +6215,8 @@ private final class OverlayController {
         }
         isShuttingDown = true
         cancelPendingExit()
+        // Kill the eye's timer/monitors/label before anything else tears down.
+        disarmEyeMode()
         watchdogTimer?.invalidate()
         watchdogTimer = nil
         activeRing = nil
