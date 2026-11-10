@@ -54,6 +54,15 @@ const SUMMON_FLASH_MS = 1500
 // A fresh session frees the shared display title by renaming the prior chat.
 // Identity is the id; the sentence after it is only how the chat reads.
 const BUTLER_PREVIOUS_TITLE = 'Butler (previous)'
+// Identity is the id, never the title: the gateway regenerates a chat's title
+// from its content, so a chat we titled "Butler" is renamed once it has
+// content. Keep the ordered ids the butler has actually used and route by them;
+// a title match survives only as the legacy fallback below.
+const TRACKED_CHAT_IDS_KEY = 'butler.chat.ids'
+const TRACKED_CHAT_IDS_LIMIT = 12
+// One page of session.list. Hitting this page boundary means the response may
+// be truncated, so absence from it is not confirmed absence.
+const SESSION_LIST_LIMIT = 200
 const SUMMON_DESTINATION_KEY = 'butler.summon.destination'
 const SUMMON_EXISTING = 'existing'
 const SUMMON_NEW = 'new'
@@ -286,15 +295,75 @@ function mostRecentSession(rows) {
   return matching[0] || null
 }
 
-async function listButlerSessions() {
-  if (!host || typeof host.request !== 'function') return []
+/**
+ * Every session the host will list; `null` when the list could not be read.
+ *
+ * The distinction matters for the tracked ids: an absent session may be pruned
+ * from the list, but a failed `session.list` must never be read as "all gone".
+ */
+async function listSessions() {
+  if (!host || typeof host.request !== 'function') return null
   try {
-    const result = await host.request('session.list', { limit: 200 })
-    const rows = Array.isArray(result) ? result : asArray(result && result.sessions)
-    return rows.filter(row => exactButlerTitle(row))
+    const result = await host.request('session.list', { limit: SESSION_LIST_LIMIT })
+    if (Array.isArray(result)) return result
+    const sessions = result && result.sessions
+    // A success-shaped response that carries no rows is not an empty inventory;
+    // treating it as one would prune every tracked id.
+    return Array.isArray(sessions) ? sessions : null
+  } catch (err) {
+    return null
+  }
+}
+
+/**
+ * Full session list, title filter deliberately absent.
+ *
+ * A renamed chat is still the Butler chat; only the legacy fallback in
+ * `legacyButlerChat` may look at titles.
+ */
+async function listButlerSessions() {
+  return listSessions()
+}
+
+function normalizeTrackedChatIds(value) {
+  const ids = []
+  for (const entry of asArray(value)) {
+    const id = asText(entry)
+    if (id && !ids.includes(id)) ids.push(id)
+    if (ids.length >= TRACKED_CHAT_IDS_LIMIT) break
+  }
+  return ids
+}
+
+/** Ordered Butler chat ids, newest first. A denied/unreadable store reads empty. */
+function readTrackedChatIds() {
+  try {
+    const store = localStore()
+    if (!store) return []
+    const raw = store.getItem(TRACKED_CHAT_IDS_KEY)
+    if (!raw) return []
+    return normalizeTrackedChatIds(JSON.parse(raw))
   } catch (err) {
     return []
   }
+}
+
+function writeTrackedChatIds(ids) {
+  const next = normalizeTrackedChatIds(ids)
+  try {
+    const store = localStore()
+    if (store) store.setItem(TRACKED_CHAT_IDS_KEY, JSON.stringify(next))
+  } catch (err) {
+    // A storage-denied renderer still routes for this opening.
+  }
+  return next
+}
+
+/** Prepend ids (newest first), dedupe, cap; returns the stored order. */
+function rememberChatIds(...values) {
+  const fresh = uniqueIds(...values)
+  if (!fresh.length) return readTrackedChatIds()
+  return writeTrackedChatIds(uniqueIds(fresh, readTrackedChatIds()))
 }
 
 function sessionTargetId(row) {
@@ -410,6 +479,43 @@ function addTargetIds(list, values) {
   }
 }
 
+/**
+ * The newest tracked id that still exists in `session.list`.
+ *
+ * A tracked id is pruned only when the list was actually read and does not
+ * contain it in any id form. On a failed list the stored order is returned
+ * untouched and its newest id is still used, so a transient gateway hiccup
+ * cannot mint a duplicate Butler chat.
+ */
+function trackedButlerChat(rows) {
+  const stored = readTrackedChatIds()
+  if (!stored.length) return null
+  if (!Array.isArray(rows)) {
+    return { target: stored[0], ids: [stored[0]], row: null, verified: false }
+  }
+  const surviving = stored.filter(id => rows.some(row => rowTargetIds(row).includes(id)))
+  // A full page may be truncated; absence from it does not confirm absence from
+  // the account, so only prune when the whole list came back.
+  if (rows.length < SESSION_LIST_LIMIT && surviving.length !== stored.length) {
+    writeTrackedChatIds(surviving)
+  }
+  const target = surviving[0]
+  if (!target) return null
+  const row = rows.find(entry => rowTargetIds(entry).includes(target)) || null
+  return { target, ids: uniqueIds(target, rowTargetIds(row)), row, verified: true }
+}
+
+/** Legacy fallback: a chat still titled exactly Butler, remembered once found. */
+function legacyButlerChat(rows) {
+  const row = mostRecentSession(rows)
+  const target = sessionTargetId(row)
+  if (!target) return null
+  // Only a row the session list actually returned can be remembered: a title
+  // match is never trusted on its own.
+  rememberChatIds(target)
+  return { target, ids: uniqueIds(target, rowTargetIds(row)), row, verified: true }
+}
+
 function launcherState(ok, reason = null, error = null) {
   return {
     ok,
@@ -434,6 +540,7 @@ async function focusSession(row) {
     try {
       const opened = await host.openSession(storedId, { intent: 'in-place' })
       setLauncherTarget(storedId, uniqueIds(rowTargetIds(row), openResultIds(opened)))
+      rememberChatIds(storedId)
       return launcherState(true)
     } catch (err) {
       lastError = err
@@ -447,6 +554,7 @@ async function focusSession(row) {
       session_id: asText(row.session_id) || asText(row.id) || storedId
     })
     setLauncherTarget(storedId, uniqueIds(rowTargetIds(row), openResultIds(activated)))
+    rememberChatIds(storedId)
     return launcherState(true)
   } catch (err) {
     return launcherState(false, 'session_focus_failed', err)
@@ -463,7 +571,11 @@ async function focusSession(row) {
  * route, titles label, and a refused rename never blocks a send.
  */
 async function claimButlerTitle(target, runtimeId, previousSessions = []) {
+  // Only chats still carrying the exact title need it released; the full
+  // session list is passed in, and renaming every unrelated chat would be a
+  // destructive surprise.
   const previous = asArray(previousSessions)
+    .filter(row => exactButlerTitle(row))
     .slice()
     .sort((a, b) => sessionStartedAt(a) - sessionStartedAt(b))
   for (let index = 0; index < previous.length; index += 1) {
@@ -479,7 +591,35 @@ async function claimButlerTitle(target, runtimeId, previousSessions = []) {
 }
 
 /**
- * Mint a genuinely new chat, then label it.
+ * Mint a genuinely new chat untitled, claim the display title for it, and
+ * remember the id that actually routes the send. Throws on transport failure;
+ * marks a gateway reuse with `code = 'reused'` so callers can tell it apart.
+ */
+async function mintButlerChat(previousSessions = []) {
+  const created = await host.request('session.create', {})
+  const runtimeId = asText(created && created.session_id)
+  const storedId = asText(created && created.stored_session_id) || runtimeId
+  const target = storedId || runtimeId
+  if (!target) throw new Error('session.create returned no session id')
+  const previous = asArray(previousSessions)
+    .slice()
+    .sort((a, b) => sessionStartedAt(a) - sessionStartedAt(b))
+  if (previous.some(row => sessionTargetId(row) === target)) {
+    // Defensive: the whole roster is passed in, so an untitled create must never
+    // answer with any existing chat — before it can be retitled or tracked.
+    const error = new Error('session.create reused an existing Butler session')
+    error.code = 'reused'
+    throw error
+  }
+  // Free 'Butler' from every prior titled chat before claiming it. A failed
+  // rename is not a send failure: the fresh id still owns the route.
+  await claimButlerTitle(target, runtimeId, previous)
+  rememberChatIds(target)
+  return { created, runtimeId, storedId, target, previous }
+}
+
+/**
+ * Mint a genuinely new chat, then label it and focus it.
  *
  * `session.create` with a `title` is title-as-identity on the gateway: it
  * resolves and returns the EXISTING chat holding that title instead of minting
@@ -491,29 +631,16 @@ async function createButlerSession(previousSessions = []) {
   if (!host || typeof host.request !== 'function') {
     return launcherState(false, 'session_create_unavailable')
   }
-  let created = null
+  let minted = null
   try {
-    created = await host.request('session.create', {})
+    minted = await mintButlerChat(previousSessions)
   } catch (err) {
+    if (err && err.code === 'reused') {
+      return launcherState(false, 'session_create_reused')
+    }
     return launcherState(false, 'session_create_failed', err)
   }
-  const runtimeId = asText(created && created.session_id)
-  const storedId = asText(created && created.stored_session_id) || runtimeId
-  if (!runtimeId && !storedId) {
-    return launcherState(false, 'session_create_failed',
-      new Error('session.create returned no session id'))
-  }
-  const target = storedId || runtimeId
-  const previous = asArray(previousSessions)
-    .slice()
-    .sort((a, b) => sessionStartedAt(a) - sessionStartedAt(b))
-  if (previous.some(row => sessionTargetId(row) === target)) {
-    // Defensive: an untitled create must never answer with a titled chat.
-    return launcherState(false, 'session_create_reused')
-  }
-  // Free 'Butler' from every prior titled chat before claiming it. A failed
-  // rename is not a send failure: the fresh id still owns the route.
-  await claimButlerTitle(target, runtimeId, previous)
+  const { created, runtimeId, target } = minted
   let lastError = null
   if (host && typeof host.openSession === 'function') {
     try {
@@ -589,28 +716,33 @@ function notifySummonSuccess(result) {
   }
 }
 
-/** Create the one "Butler" chat, or focus the most recent matching one. */
+/**
+ * Focus the tracked Butler chat, or create one.
+ *
+ * Resolution is id-first so a gateway-renamed chat is still found; the exact
+ * title match is only the legacy fallback for a desktop that never tracked an
+ * id. If focusing fails, surface the reason instead of quietly minting a
+ * different session behind the user's back.
+ */
 async function openButlerSession() {
   if (launcherBusy) return launcherState(false, 'busy')
   launcherBusy = true
   launcherTargetId = null
   launcherTargetAliases = []
   try {
-    const existing = mostRecentSession(await listButlerSessions())
-    if (existing) {
-      // The default destination is the MOST RECENT exact Butler chat: focus
-      // that one, so "Butler chat" follows the user's latest work instead of a
-      // chat chosen the day the plugin was installed. If focusing fails,
-      // surface the reason instead of quietly minting a different session
-      // behind the user's back.
-      const focused = await focusSession(existing)
+    const rows = await listSessions()
+    const recent = trackedButlerChat(rows) || legacyButlerChat(rows)
+    if (recent) {
+      // A failed session.list still yields the newest tracked id (with no row
+      // to verify), so focus can be addressed by that id alone.
+      const focused = await focusSession(recent.row || { id: recent.target })
       if (!focused.ok) notifyLauncherFailure()
       return focused
     }
 
     let created
     try {
-      created = await createButlerSession()
+      created = await createButlerSession(asArray(rows))
     } catch (err) {
       created = launcherState(false, 'session_create_failed', err)
     }
@@ -909,45 +1041,27 @@ function startClaimConfigPolling(ctx) {
  * The Butler chat id an in-place chip send should target. Never focuses a
  * window: the id is the whole answer, and that is the point of the field.
  *
- * "recent" is today's behaviour — the newest exact "Butler" chat, created only
- * when none exists. "new" ALWAYS mints a fresh chat and never falls back to an
- * existing one: when creation fails the caller reports `session_create_failed`
- * and nothing is sent.
+ * "recent" resolves id-first — newest tracked id that still exists, then the
+ * legacy exact-title chat, then a fresh untitled chat. A title is only a label
+ * now; the gateway renames chats from their content. "new" ALWAYS mints a fresh
+ * chat and never falls back to an existing one: when creation fails the caller
+ * reports `session_create_failed` and nothing is sent.
  */
 async function resolveChipSendTarget(destination = 'recent') {
   const wantsNew = destination === 'new'
   if (!host || typeof host.request !== 'function') return null
   try {
+    const rows = await listSessions()
     if (wantsNew) {
       // Mint untitled first, exactly like createButlerSession: a titled create
       // would hand back the existing Butler chat instead of a fresh one.
-      const previous = await listButlerSessions()
-      const created = await host.request('session.create', {})
-      const runtimeId = asText(created && created.session_id)
-      const storedId = asText(created && created.stored_session_id) || runtimeId
-      const target = storedId || runtimeId
-      if (!target) return null
-      if (previous.some(row => sessionTargetId(row) === target)) {
-        // Defensive: an untitled create must never answer with a titled chat.
-        return null
-      }
-      await claimButlerTitle(target, runtimeId, previous)
-      return target
+      const minted = await mintButlerChat(asArray(rows))
+      return minted.target
     }
-    const existing = mostRecentSession(await listButlerSessions())
-    const existingId = sessionTargetId(existing)
-    if (existingId) return existingId
-    const created = await host.request('session.create', {})
-    const id = asText(created && (created.session_id || created.stored_session_id || created.id))
-    if (!id) return null
-    // Titles are labels; the id routes the send. A failed/refused rename never
-    // blocks the send.
-    try {
-      await renameButlerTitle(id, BUTLER_TITLE)
-    } catch (err) {
-      // Rename is cosmetic.
-    }
-    return id
+    const recent = trackedButlerChat(rows) || legacyButlerChat(rows)
+    if (recent) return recent.target
+    const minted = await mintButlerChat(asArray(rows))
+    return minted.target
   } catch (err) {
     // Creation/routing failed: report no session rather than a half-send.
     return null
@@ -995,6 +1109,9 @@ async function sendPendingSummonText(text, destination = 'recent') {
       body: { text, session_id: target }
     })
     if (response && response.ok === true) {
+      // A successful send proves the chat is in use: it is now the newest
+      // tracked id even if a title match, not the tracked list, resolved it.
+      rememberChatIds(target)
       return { ok: true, session_id: target, destination }
     }
     return {
@@ -1101,10 +1218,23 @@ function startSummonPendingPolling(ctx) {
  * text is seated as a draft and the caller gets the exact failure reason.
  */
 async function refreshSummonTarget(fallback) {
-  const row = mostRecentSession(await listButlerSessions())
+  const rows = await listSessions()
+  const wanted = asText(fallback)
+  // Prefer the exact row the retry is addressing: ids are identity, so a
+  // renamed chat still answers here.
+  if (Array.isArray(rows) && wanted) {
+    const row = rows.find(entry => rowTargetIds(entry).includes(wanted))
+    if (row) {
+      const target = sessionTargetId(row) || wanted
+      return { target, ids: uniqueIds(wanted, rowTargetIds(row)) }
+    }
+  }
+  const tracked = trackedButlerChat(rows)
+  if (tracked) return { target: tracked.target, ids: tracked.ids }
+  const row = mostRecentSession(rows)
   if (!row) return null
   const ids = rowTargetIds(row)
-  const target = sessionTargetId(row) || asText(fallback) || ids[0]
+  const target = sessionTargetId(row) || wanted || ids[0]
   if (!target && !ids.length) return null
   return { target, ids }
 }
