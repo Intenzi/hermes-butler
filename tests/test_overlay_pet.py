@@ -1111,3 +1111,26 @@ def test_look_reads_under_the_hat_and_click_then_asks_about_it() -> None:
     assert "pendingLookTarget" in click
     assert 'chipJournal("ask-about-look")' in click
     assert "toggleSummonField()" in click, "a plain click with no recent look still opens the ask field"
+
+
+def test_look_never_answers_with_our_own_window() -> None:
+    """Both symptoms so far were self-hits: "Button · Ask butler" then "Window ·
+    ButlerOverlay". The drop must retry with the hat parked and then fall back to
+    the active (non-self) app's window.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert "private func lookDescriptorIsSelf(" in source
+    assert "private func lookDescriptorForActiveApp(" in source
+    assert "menuBarOwningApplication" in source, "the active app is the menu-bar owner, never an accessory"
+
+    resolve = _swift_function_body(source, "private func resolveLookDrop(",
+                                   "/// Place the card next to the drop point")
+    assert "lookDescriptorIsSelf(descriptor)" in resolve
+    assert "retries - 1" in resolve, "one short retry while the parked window settles"
+    assert "lookDescriptorForActiveApp()" in resolve
+    assert 'chipJournal("look-self-hit-fallback")' in resolve
+
+    drop = _swift_function_body(source, "private func endLookDrag(at screenPoint: NSPoint)",
+                                "/// Read the drop point")
+    assert "resolveLookDrop(" in drop

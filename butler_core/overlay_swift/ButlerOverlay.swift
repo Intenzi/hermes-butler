@@ -771,6 +771,49 @@ private func lookElementDescriptor(at point: CGPoint) -> LookDescriptor {
                           box: axBoxAttribute(chosen))
 }
 
+/// True when the hit element belongs to THIS process.
+///
+/// The hat is a status-level window, so wherever it happens to be, AX hit
+/// testing finds it before anything underneath. Reporting "Window ·
+/// ButlerOverlay" is never a useful answer, so the caller retries with the hat
+/// parked and finally falls back to the active app's window.
+private func lookDescriptorIsSelf(_ descriptor: LookDescriptor) -> Bool {
+    guard let app = descriptor.app else { return false }
+    let me = ProcessInfo.processInfo.processName
+    let mine = NSRunningApplication.current.localizedName ?? me
+    return app == mine || app == me
+}
+
+/// The app the user is actually working in: the menu-bar owner, which accessory
+/// helpers like this one never are.
+private func activeWorkAppName() -> String? {
+    if let app = NSWorkspace.shared.menuBarOwningApplication,
+       app.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+        return axNonEmpty(app.localizedName)
+    }
+    return axNonEmpty(NSWorkspace.shared.frontmostApplication?.localizedName)
+}
+
+/// A descriptor for the active (non-self) app's focused window. Last resort when
+/// the hit-test can only see our own window.
+private func lookDescriptorForActiveApp() -> LookDescriptor {
+    let app = activeWorkAppName()
+    var window: String?
+    var doc: String?
+    if let pid = NSWorkspace.shared.menuBarOwningApplication?.processIdentifier,
+       pid != ProcessInfo.processInfo.processIdentifier {
+        let root = AXUIElementCreateApplication(pid)
+        if let focused = axElement(from: copyAXAttribute(root, "AXFocusedWindow")) {
+            let enclosing = axEnclosingWindow(focused)
+            window = enclosing.window
+            doc = enclosing.doc
+        }
+    }
+    return LookDescriptor(role: "Window", label: nil, app: app, window: window,
+                          doc: doc, enabled: nil, value: nil, box: nil,
+                          isWindowFallback: true)
+}
+
 /// Hit-test the cursor and compose the LOOK context + target for the retained
 /// typed path. Resolution lives in `lookElementDescriptor` so both doors share
 /// one path.
@@ -3529,13 +3572,38 @@ private final class OverlayController {
         }
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            let descriptor = lookElementDescriptor(at: point)
-            self.positionClaimChip()
-            self.claimChipWindow?.orderFrontRegardless()
-            self.lastLookDescriptor = descriptor
-            self.lastLookAt = Date()
-            self.presentLookCard(descriptor, at: point, primaryHeight: primaryHeight)
+            self.resolveLookDrop(at: point, primaryHeight: primaryHeight, retries: 1)
         }
+    }
+
+    /// Read the drop point, tolerating the window server still reporting our own
+    /// parked window for a beat. Never answers with "ButlerOverlay".
+    private func resolveLookDrop(at point: CGPoint,
+                                 primaryHeight: CGFloat,
+                                 retries: Int) {
+        var descriptor = lookElementDescriptor(at: point)
+        if lookDescriptorIsSelf(descriptor), retries > 0 {
+            // One short retry while the parked window settles; the hat stays
+            // off-screen until this resolves.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+                self?.resolveLookDrop(at: point,
+                                      primaryHeight: primaryHeight,
+                                      retries: retries - 1)
+            }
+            return
+        }
+        if lookDescriptorIsSelf(descriptor) {
+            descriptor = lookDescriptorForActiveApp()
+            chipJournal("look-self-hit-fallback")
+        } else {
+            chipJournal("look-hit:" + (descriptor.app ?? "?")
+                        + "/" + (descriptor.role ?? "?"))
+        }
+        positionClaimChip()
+        claimChipWindow?.orderFrontRegardless()
+        lastLookDescriptor = descriptor
+        lastLookAt = Date()
+        presentLookCard(descriptor, at: point, primaryHeight: primaryHeight)
     }
 
     /// Place the card next to the drop point, flipped/clamped so it never sits
