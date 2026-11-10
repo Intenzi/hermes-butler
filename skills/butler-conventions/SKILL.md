@@ -232,3 +232,52 @@ destroyed forever — "nothing is around my pet", with the companion healthy and
 no log line anywhere. Verify a chip fix with the CGWindow list, not by looking:
 a live chip is an 84x24 window owned by the `ButlerOverlay` pid, 10 pt clear of
 the pet panel.
+
+## 8. LOOK: pointer gestures, self-hit, and the pet as an answer surface
+
+LOOK reads the control under a point the user chose with the pointer. Three
+rules keep it honest.
+
+- **No look hot key.** The user rejected ⌘⇧L outright: looking must be a
+  pointer gesture, never a chord and never a hop into the Hermes chat. The
+  shipped gesture is: drag the hat onto the thing → a non-key card at the drop
+  point → click the hat within 90 s to ask about *that* element.
+- **Our own window wins every AX hit-test.** The hat is a `.statusBar`-level
+  window, so `AXUIElementCopyElementAtPosition` answers with it wherever it is:
+  first as `Button · "Ask butler"` (the chip's accessibility label), then, once
+  parked, as `Window · ButlerOverlay`. `orderOut` is applied by the window
+  server on the NEXT pass, so an immediate hit-test still sees it. Fix shape:
+  park the window at (-20000, -20000), hit-test on the next run-loop turn,
+  ignore any descriptor whose app is this process, retry once after 80 ms, then
+  fall back to `NSWorkspace.menuBarOwningApplication`'s focused window (an
+  accessory helper never owns the menu bar). Never print our own process name.
+- **Electron answers with an unlabelled container.** The control is an
+  `AXGroup` with an empty title, so the descriptor walks down 2 levels for a
+  labelled child and then up 4 for a labelled ancestor before falling back to a
+  window line. "Group" alone is never an answer.
+
+### The pet is the answer surface
+
+The pet already speaks (`ctx.pet.say(line, {ttlMs, id})`, driven by a 2 s beat in
+`desktop/plugin.js`). To get the agent's answer onto that channel without
+reading sessions or adding a transport, the agent calls a tool that writes a
+file: `butler_say({"text": …})` → `say.json` (`{id, text, at}`, 280-char cap on
+a word boundary) → `GET /state` merges a `say` key → the desktop says it once
+per `id` at a 15 s ttl. LOOK turns use `LOOK_FRAMING_TEMPLATE`
+(`butler_core/summon.py`), which instructs the agent to answer in at most two
+sentences, call `butler_say` with that same sentence, and keep the full
+explanation for the chat. The bubble is one line — detail belongs in chat — and
+without an `at`-freshness gate a desktop reload re-speaks the last answer.
+
+### Hermes already ships a HUD — pitch accordingly
+
+`⌘⇧H` detaches the chat into an always-on-top bar whose *position* is the
+context ("this / here" resolve to the app and screen under it), with ⌘⇧G to
+snap it to the pointer and tap-⌘⌥ to summon it (macOS: needs Input Monitoring).
+So "ask about what's on screen" is table stakes inside Hermes. What the HUD does
+NOT do: element-level reads (role/label/enabled/value of the control under a
+point), stepped guidance with per-step verification, passive AX watching, or an
+on-screen character that carries state. Third-party blurbs claiming the HUD
+draws annotations over your screen are wrong — the only annotation code
+(`preview-annotate-host`) annotates the in-app preview pane. Lead the pitch with
+Walk + verification, not screen Q&A.
