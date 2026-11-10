@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1380,7 +1381,8 @@ def test_eye_follow_offset_and_cadence_never_sit_on_the_target() -> None:
     assert offset_lines, "the eye offset constant exists"
     offset = float(offset_lines[0].split("=")[1].strip())
     assert offset > 8.0, "the eye must never sit under the pointer"
-    assert "static let labelOffset: CGFloat = 38.0" in spec
+    label = re.search(r"static let labelOffset: CGFloat = ([0-9.]+)", source)
+    assert label and float(label.group(1)) >= 40.0, "the label must clear the eye that sits at +offset"
     assert "static let labelWidth: CGFloat = 220.0" in spec
     assert "static let labelHeight: CGFloat = 18.0" in spec
     # ~15 Hz follow, at most one AX hit-test per 100 ms, 6 pt movement gate.
@@ -1701,5 +1703,7 @@ def test_right_click_arms_the_eye_and_option_right_click_is_the_menu() -> None:
     assert "modifierFlags.contains(.option)" in handler
     assert "presentHatMenu(at: point)" in handler
     assert "armEyeMode()" in handler
-    # A plain right-click must arm, not open the menu.
-    assert handler.index("armEyeMode()") > handler.index("presentHatMenu(at: point)")
+    # A plain right-click must arm, not open the menu: the unmodified path ends
+    # with a bare arm call (index-of fails here, "disarmEyeMode()" contains the
+    # same substring).
+    assert "\n        armEyeMode()\n" in handler
