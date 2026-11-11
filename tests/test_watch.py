@@ -35,6 +35,7 @@ class FakeOverlay:
     def __init__(self, replies=None, running=True):
         self.replies = list(replies or [])
         self.requests = []
+        self.timeouts = []
         self.sends = []
         self.starts = []
         self.running = running
@@ -53,6 +54,7 @@ class FakeOverlay:
 
     def request(self, op, timeout=None):
         self.requests.append(op)
+        self.timeouts.append(timeout)
         if not self.replies:
             return None
         reply = self.replies.pop(0)
@@ -77,12 +79,21 @@ def _isolated(tmp_path: Path):
     _reset()
 
 
-def _start(tmp_path: Path, monkeypatch, until=None, replies=None, once=True):
+def _start(tmp_path: Path, monkeypatch, until=None, replies=None, once=True,
+           scan=None):
     overlay = FakeOverlay(replies if replies is not None
                           else [{"op": "watch-started", "app": "Slack"}])
     monkeypatch.setattr(engine, "_OVERLAY", overlay)
-    result = engine.start_watch("Slack", until=until, once=once)
+    result = engine.start_watch("Slack", until=until, scan=scan, once=once)
     return overlay, result
+
+
+def _scan_hit(**extra) -> dict:
+    row = {"op": "watch-hit", "app": "Slack", "kind": "author",
+           "label": "Adolan", "window": "general — Slack",
+           "at": 1_794_330_012.0}
+    row.update(extra)
+    return row
 
 
 def _state(tmp_path: Path) -> dict:
@@ -974,3 +985,219 @@ def test_both_other_frames_know_watch_exists() -> None:
 
     look = frame_for("[butler look] App: Preview\nQuestion: is it done?", "look")
     assert "butler_watch_start" in look
+
+
+# ------------------------------------------------ content scan (round 26)
+#
+# `scan` is the content watch: it re-walks the app and compares match
+# signatures with the arm-time baseline. The author matcher is role-filtered by
+# the companion, so a message BODY that merely contains the name cannot fire;
+# a text matcher is the explicitly weaker mode and is reported as "text".
+
+def test_a_scan_alone_arms_and_reaches_the_companion(
+        tmp_path: Path, monkeypatch) -> None:
+    overlay, result = _start(
+        tmp_path, monkeypatch,
+        replies=[{"op": "watch-started", "app": "Slack", "baseline": 4}],
+        scan={"author": "Adolan"})
+
+    assert result["ok"] is True
+    sent = overlay.requests[0]
+    assert sent["op"] == "watch_start"
+    assert "until" not in sent, "one matcher per watch"
+    assert sent["scan"] == {"author": "Adolan",
+                            "roles": ["AXImage", "AXButton", "AXLink"],
+                            "interval": 3, "max_nodes": 1500}
+    assert engine._watch["scan"]["author"] == "Adolan"
+    assert engine._watch["scan_baseline"] == 4, "the arm-time count is kept"
+    assert isinstance(engine._watch["scan_baseline_at"], float)
+    assert engine._watch["scan_ticks"] == 0
+    assert _state(tmp_path)["watch"]["scan"]["author"] == "Adolan"
+    # The arm-time baseline walk happens BEFORE the ack, so a scan start gets
+    # the longer round-trip budget instead of the ordinary 5 s one.
+    assert overlay.timeouts == [engine.WATCH_SCAN_REQUEST_TIMEOUT]
+    assert engine.WATCH_SCAN_REQUEST_TIMEOUT > engine.WATCH_REQUEST_TIMEOUT
+
+
+def test_until_and_scan_together_are_refused(
+        tmp_path: Path, monkeypatch) -> None:
+    overlay = FakeOverlay()
+    monkeypatch.setattr(engine, "_OVERLAY", overlay)
+
+    result = engine.start_watch("Slack", until="Export complete",
+                                scan={"author": "Adolan"})
+
+    assert result == {"error": "pass until or scan, not both"}
+    assert overlay.requests == [], "never reaches the companion"
+    assert overlay.starts == []
+    assert engine._watch is None
+
+
+@pytest.mark.parametrize("scan", [
+    {},
+    {"roles": ["AXImage"]},
+    {"author": ""},
+    {"author": "   "},
+    {"author": "Adolan", "text": "invoice"},
+])
+def test_an_empty_or_double_matcher_scan_is_refused(
+        scan, tmp_path: Path, monkeypatch) -> None:
+    overlay = FakeOverlay()
+    monkeypatch.setattr(engine, "_OVERLAY", overlay)
+
+    result = engine.start_watch("Slack", scan=scan)
+
+    assert "error" in result
+    assert overlay.requests == []
+    assert overlay.starts == []
+    assert engine._watch is None
+
+
+def test_scan_interval_and_node_budget_are_clamped(
+        tmp_path: Path, monkeypatch) -> None:
+    overlay, result = _start(
+        tmp_path, monkeypatch,
+        replies=[{"op": "watch-started", "app": "Slack", "baseline": 0}],
+        scan={"author": "Adolan", "interval_seconds": 1, "max_nodes": 99_999,
+              "roles": ["AXImage"]})
+
+    assert result["ok"] is True
+    sent = overlay.requests[0]["scan"]
+    assert sent["interval"] == 2, "floor is 2s"
+    assert sent["max_nodes"] == 4000, "cap is 4000 nodes"
+    assert sent["roles"] == ["AXImage"], "explicit roles win over the default"
+
+    overlay = FakeOverlay([{"op": "watch-started", "app": "Slack"}])
+    monkeypatch.setattr(engine, "_OVERLAY", overlay)
+    engine.start_watch("Slack", scan={"author": "Adolan",
+                                      "interval_seconds": 30})
+    assert overlay.requests[0]["scan"]["interval"] == 10, "ceiling is 10s"
+    assert overlay.requests[0]["scan"]["max_nodes"] == 1500, "default budget"
+
+
+def test_an_author_hit_announces_once_and_ends_the_one_shot_watch(
+        tmp_path: Path, monkeypatch) -> None:
+    overlay, _result = _start(
+        tmp_path, monkeypatch,
+        replies=[{"op": "watch-started", "app": "Slack", "baseline": 4}],
+        scan={"author": "Adolan"})
+    said = []
+    monkeypatch.setattr(engine, "say",
+                        lambda text: said.append(text) or {"ok": True})
+
+    engine._on_overlay_event(_scan_hit())
+
+    assert said == ["Slack: Adolan appeared"], "announced exactly once"
+    assert engine._watch["hit"]["kind"] == "author"
+    assert engine._watch["hit"]["label"] == "Adolan"
+    assert engine._watch["stopped"]["reason"] == "hit", "one-shot semantics"
+    assert overlay.sends == [{"op": "watch_stop"}]
+    state = _state(tmp_path)
+    assert state["watch_hit"]["kind"] == "author"
+    assert state["watch_hit"]["label"] == "Adolan"
+
+    # A duplicate hit line cannot announce twice.
+    engine._on_overlay_event(_scan_hit())
+    assert said == ["Slack: Adolan appeared"]
+
+
+def test_a_text_scan_hit_is_reported_as_text(
+        tmp_path: Path, monkeypatch) -> None:
+    overlay, _result = _start(
+        tmp_path, monkeypatch,
+        replies=[{"op": "watch-started", "app": "Slack", "baseline": 0}],
+        scan={"text": "invoice"})
+    said = []
+    monkeypatch.setattr(engine, "say",
+                        lambda text: said.append(text) or {"ok": True})
+
+    engine._on_overlay_event(_scan_hit(kind="text", label="new invoice ready"))
+
+    assert said == ["Slack: new invoice ready appeared"]
+    assert engine._watch["hit"]["kind"] == "text", (
+        "a text match is never dressed up as an author")
+    assert _state(tmp_path)["watch_hit"]["kind"] == "text"
+    lines = engine.watch_status().splitlines()
+    assert lines[1] == (
+        'scan: text "invoice" · roles any · baseline 0 · 0 ticks · hit')
+
+
+def test_a_scan_tick_updates_the_counters_without_inflating_events(
+        tmp_path: Path, monkeypatch) -> None:
+    _start(tmp_path, monkeypatch,
+           replies=[{"op": "watch-started", "app": "Slack", "baseline": 4}],
+           scan={"author": "Adolan"})
+
+    engine._on_overlay_event({"op": "watch-scan", "baseline": 4,
+                              "matches": 7, "new": 1,
+                              "at": 1_794_330_100.0})
+
+    assert engine._watch["scan_ticks"] == 1
+    assert engine._watch["scan"]["matches"] == 7
+    assert engine._watch["scan"]["new"] == 1
+    assert engine._watch["scan_baseline"] == 4
+    assert engine._watch["events"] == 0, "a tick is accounting, not an event"
+    assert engine._watch_ring == [], "the ring stays a change log"
+    assert _state(tmp_path)["watch"]["scan_ticks"] == 1
+
+
+def test_status_shows_the_scan_line(tmp_path: Path, monkeypatch) -> None:
+    _start(tmp_path, monkeypatch,
+           replies=[{"op": "watch-started", "app": "Slack", "baseline": 4}],
+           scan={"author": "Adolan"})
+
+    lines = engine.watch_status().splitlines()
+
+    assert lines[0] == "watching Slack for content scan · 0 events · no hit"
+    assert lines[1] == (
+        'scan: author "Adolan" · roles AXImage,AXButton,AXLink '
+        '· baseline 4 · 0 ticks · no hit')
+
+
+def test_the_watch_start_schema_offers_the_scan_object(tmp_path: Path) -> None:
+    schema = _registered(tmp_path)["butler_watch_start"]["schema"]
+    scan = schema["properties"]["scan"]
+
+    assert scan["type"] == "object"
+    assert {"author", "text", "roles", "interval_seconds",
+            "max_nodes"} <= set(scan["properties"])
+    assert scan["properties"]["interval_seconds"]["default"] == 3
+    assert scan["properties"]["max_nodes"]["default"] == 1500
+
+
+def test_a_scan_line_cannot_invent_a_scan_on_an_until_watch(
+        tmp_path: Path, monkeypatch) -> None:
+    _start(tmp_path, monkeypatch, until="Export complete")
+
+    engine._on_overlay_event({"op": "watch-scan", "baseline": 4,
+                              "matches": 4, "new": 0})
+
+    assert engine._watch["scan"] is None
+    assert "scan_ticks" not in engine._watch
+    assert "scan:" not in engine.watch_status()
+
+
+def test_status_says_baseline_unknown_until_the_ack_lands(
+        tmp_path: Path) -> None:
+    """Before the companion acks, the arm-time count is unknown, not zero.
+
+    "baseline 0" is a real claim (the app exposes no author-role markup);
+    printing it while the baseline walk is still in flight would be a lie.
+    """
+    (tmp_path / "state.json").write_text(json.dumps({
+        "watch": {
+            "app": "Discord",
+            "until": None,
+            "scan": {"author": "Adolan",
+                     "roles": ["AXImage", "AXButton", "AXLink"],
+                     "interval": 3, "max_nodes": 1500},
+            "once": True,
+            "events": 0, "hit": None, "stopped": None, "recent": [],
+            "scan_baseline": 0, "scan_baseline_at": None, "scan_ticks": 0,
+        },
+    }), encoding="utf-8")
+
+    line = engine.watch_status().splitlines()[1]
+
+    assert line == ('scan: author "Adolan" · roles AXImage,AXButton,AXLink '
+                    '· baseline ? · 0 ticks · no hit')

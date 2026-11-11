@@ -128,6 +128,51 @@ WATCH_START_SCHEMA = {
             "type": "string",
             "description": "Optional condition: announce once when a label, title or value contains this text (case-insensitive).",
         },
+        "scan": {
+            "type": "object",
+            "description": (
+                "Optional content scan, mutually exclusive with until: announce "
+                "when THIS author's message appears. AX has no timestamps, so "
+                "new means new since the watch armed. Author-role nodes only, "
+                "so a message body that merely contains the name cannot fire."
+            ),
+            "properties": {
+                "author": {
+                    "type": "string",
+                    "description": (
+                        "The handle/nickname to watch for (case-insensitive, "
+                        "whole word) on an author node such as an avatar, "
+                        "button or link — not the message body."
+                    ),
+                },
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "Weaker alternative: any node whose label contains this "
+                        "text. A hit is reported as a text match, never as an author."
+                    ),
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "AX roles that count as an author node. Default "
+                        "AXImage, AXButton, AXLink; AXStaticText is excluded "
+                        "because that is the message body."
+                    ),
+                },
+                "interval_seconds": {
+                    "type": "number",
+                    "default": 3,
+                    "description": "Seconds between scans (floor 2, ceiling 10).",
+                },
+                "max_nodes": {
+                    "type": "integer",
+                    "default": 1500,
+                    "description": "AX nodes visited per scan (cap 4000).",
+                },
+            },
+        },
         "once": {
             "type": "boolean",
             "default": True,
@@ -231,15 +276,19 @@ def tool_watch_start(args, **kwargs):
 
     Reads the app's AX notifications over time and keeps a bounded, human
     readable tail (butler_watch_status) plus an optional one-shot condition
-    (``until``) announced by the pet. A hit ends the watch by default (``once``
-    true); pass ``once: false`` to keep observing until ``butler_watch_ack`` or
-    a stop. Unattended-safe: it never clicks, types, or brings an app forward,
-    and it needs no new TCC grant (the existing companion is the single
-    Accessibility subject). One watch at a time.
+    (``until``) announced by the pet. ``scan`` is the content version: watch a
+    specific AUTHOR (or, weaker, a text label) for a node that was not on
+    screen when the watch armed — the message body cannot fire an author hit
+    because only author-role nodes are matched. A hit ends the watch by default
+    (``once`` true); pass ``once: false`` to keep observing until
+    ``butler_watch_ack`` or a stop. Unattended-safe: it never clicks, types, or
+    brings an app forward, and it needs no new TCC grant (the existing
+    companion is the single Accessibility subject). One watch at a time.
     """
     try:
         return _out(bp_engine.start_watch(args.get("app") or "",
                                           args.get("until") or None,
+                                          scan=args.get("scan"),
                                           once=args.get("once", True)))
     except Exception as exc:  # noqa: BLE001 - handlers must never raise
         logger.exception("butler_watch_start failed")

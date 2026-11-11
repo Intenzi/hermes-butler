@@ -1230,6 +1230,21 @@ private let watchRateWindow: TimeInterval = 1.0
 private let watchLabelLimit = 120
 private let watchLivenessInterval: TimeInterval = 2.0
 
+/// Content SCAN defaults: a repeating walk of the app's AX tree compared with
+/// an arm-time signature baseline (AX carries no timestamps, so "newer than
+/// now" is "new since arming"). The floor keeps a tick from hammering a busy
+/// app; the ceiling keeps a message from going unnoticed for minutes.
+private let watchScanDefaultInterval: TimeInterval = 3.0
+private let watchScanMinInterval: TimeInterval = 2.0
+private let watchScanMaxInterval: TimeInterval = 10.0
+private let watchScanDefaultMaxNodes = 1500
+private let watchScanMaxNodes = 4000
+private let watchScanDepth = 24
+/// AX roles that count as an AUTHOR. `AXStaticText` is deliberately absent:
+/// that is the message BODY, so including it would false-flag anyone who
+/// merely writes the name in a message.
+private let watchScanDefaultRoles = ["AXImage", "AXButton", "AXLink"]
+
 /// C trampoline for the watched app, mirroring `petAXObserverCallback`: the
 /// controller is the refcon on every `AXObserverAddNotification`. The element
 /// is only valid during the call, so the work hops to the main queue.
@@ -1259,10 +1274,40 @@ private struct PetSpec {
     let enabled: Bool
 }
 
+/// One content-scan matcher: an author handle (strong mode) or a plain text
+/// label (the explicitly weaker mode), plus the roles that count as an author
+/// node and the tick budget.
+private struct WatchScanSpec {
+    let author: String?
+    let text: String?
+    /// Uppercased AX role names; only author mode filters on these.
+    let roles: [String]
+    let interval: TimeInterval
+    let maxNodes: Int
+
+    /// The wire's matcher name: an author hit is never reported as text.
+    var kind: String {
+        return author != nil ? "author" : "text"
+    }
+
+    /// The lowercased needle both matchers look for.
+    var needle: String {
+        return (author ?? text ?? "").lowercased()
+    }
+
+    var roleSet: Set<String> {
+        // AX role strings are compared uppercased: a caller may spell the role
+        // in any case, and the defaults are the human-readable AX names.
+        return Set(roles.map { $0.uppercased() })
+    }
+}
+
 /// One ambient watch request: an app to observe and an optional condition.
 private struct WatchStartSpec {
     let app: String
     let until: String?
+    /// The content scan (mutually exclusive with `until`).
+    let scan: WatchScanSpec?
     /// Producer-side start token, echoed on every line this watch emits so a
     /// late line from the REPLACED watch can never be mistaken for the new one.
     let token: String?
@@ -1327,6 +1372,76 @@ private func guideEndReason(_ raw: Any?) -> String {
         }
     }
     return cleaned.isEmpty ? "ended" : cleaned
+}
+
+private func parseWatchScan(_ object: [String: Any], line: String) -> WatchScanSpec? {
+    func trimmedString(_ key: String) -> String? {
+        guard let raw = object[key], !(raw is NSNull),
+              let text = stringValue(raw) else {
+            return nil
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+    let author = trimmedString("author")
+    let text = trimmedString("text")
+    // Exactly one matcher: the author mode is the strong one and a text hit is
+    // reported as text, never dressed up as an author.
+    guard (author != nil) != (text != nil) else {
+        logMalformedOnce(line: line,
+                         reason: "watch_start scan needs exactly one of author/text")
+        return nil
+    }
+    var roles = watchScanDefaultRoles
+    if let rawRoles = object["roles"], !(rawRoles is NSNull) {
+        guard let list = rawRoles as? [Any] else {
+            logMalformedOnce(line: line, reason: "watch_start scan has invalid roles")
+            return nil
+        }
+        var cleaned: [String] = []
+        for entry in list {
+            guard let role = stringValue(entry) else {
+                logMalformedOnce(line: line, reason: "watch_start scan has invalid roles")
+                return nil
+            }
+            let trimmed = role.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                logMalformedOnce(line: line, reason: "watch_start scan has invalid roles")
+                return nil
+            }
+            let upper = trimmed.uppercased()
+            if !cleaned.contains(upper) {
+                cleaned.append(upper)
+            }
+        }
+        guard !cleaned.isEmpty else {
+            logMalformedOnce(line: line, reason: "watch_start scan has no roles")
+            return nil
+        }
+        roles = cleaned
+    }
+    var interval = watchScanDefaultInterval
+    var rawInterval: Any? = object["interval"]
+    if rawInterval == nil || rawInterval is NSNull {
+        rawInterval = object["interval_seconds"]
+    }
+    if let rawInterval = rawInterval, !(rawInterval is NSNull) {
+        guard let parsed = numberValue(rawInterval) else {
+            logMalformedOnce(line: line, reason: "watch_start scan has invalid interval")
+            return nil
+        }
+        interval = min(max(parsed, watchScanMinInterval), watchScanMaxInterval)
+    }
+    var maxNodes = watchScanDefaultMaxNodes
+    if let rawNodes = object["max_nodes"], !(rawNodes is NSNull) {
+        guard let parsed = intValue(rawNodes) else {
+            logMalformedOnce(line: line, reason: "watch_start scan has invalid max_nodes")
+            return nil
+        }
+        maxNodes = min(max(parsed, 1), watchScanMaxNodes)
+    }
+    return WatchScanSpec(author: author, text: text, roles: roles,
+                         interval: interval, maxNodes: maxNodes)
 }
 
 private func parseCommand(line: String) -> OverlayCommand? {
@@ -1502,6 +1617,23 @@ private func parseCommand(line: String) -> OverlayCommand? {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             until = trimmed.isEmpty ? nil : trimmed
         }
+        var scan: WatchScanSpec?
+        if let rawScan = object["scan"], !(rawScan is NSNull) {
+            guard let scanObject = rawScan as? [String: Any] else {
+                logMalformedOnce(line: line, reason: "watch_start has an invalid scan")
+                return nil
+            }
+            guard let parsed = parseWatchScan(scanObject, line: line) else {
+                return nil
+            }
+            scan = parsed
+        }
+        // One matcher per watch: an `until` event condition and a content scan
+        // would compete for the single hit slot.
+        if until != nil && scan != nil {
+            logMalformedOnce(line: line, reason: "watch_start has both until and scan")
+            return nil
+        }
         var token: String?
         if let rawToken = object["token"], !(rawToken is NSNull) {
             guard let text = stringValue(rawToken) else {
@@ -1511,7 +1643,8 @@ private func parseCommand(line: String) -> OverlayCommand? {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             token = trimmed.isEmpty ? nil : trimmed
         }
-        return .watchStart(WatchStartSpec(app: app, until: until, token: token))
+        return .watchStart(WatchStartSpec(app: app, until: until,
+                                          scan: scan, token: token))
 
     case "watch_stop":
         return .watchStop
@@ -3320,6 +3453,17 @@ private final class OverlayController {
     private var watchLastSignatureAt: [String: Date] = [:]
     /// Required clean stop path: a watch must not survive the watched app.
     private var watchLivenessTimer: Timer?
+    /// Content scan: the matcher, its arm-time signature baseline and the
+    /// repeating tick. Nil for an ordinary `until`/change watch.
+    private var watchScan: WatchScanSpec?
+    private var watchScanTimer: Timer?
+    /// `(role, label, x, y, w, h)` signatures present at ARM. Only a signature
+    /// absent from this set is news; AX has no timestamps, so "newer than now"
+    /// is "new since arming".
+    private var watchScanBaseline: Set<String> = []
+    /// The baseline size at arm, echoed to the producer for the status line.
+    private var watchScanBaselineCount = 0
+    private var watchScanTicks = 0
     private var stdinThread: Thread?
     private var activeRing: RingSpec?
     private var observerTokens: [(NotificationCenter, NSObjectProtocol)] = []
@@ -4036,6 +4180,11 @@ private final class OverlayController {
         watchedPid = pid
         watchUntil = spec.until
         watchHitArmed = spec.until != nil
+        if spec.scan != nil {
+            // A scan has a matcher but no `until`: it is armed exactly like a
+            // condition and fires one announcement per arm.
+            watchHitArmed = true
+        }
         watchSeq = 0
         watchEventCount = 0
         watchRootElement = root
@@ -4044,6 +4193,10 @@ private final class OverlayController {
         watchLastSignatureAt.removeAll()
         watchLastValues.removeAll()
         watchWindowTitles.removeAll()
+        watchScan = spec.scan
+        watchScanBaseline.removeAll()
+        watchScanBaselineCount = 0
+        watchScanTicks = 0
         watchObserver = newObserver
 
         CFRunLoopAddSource(CFRunLoopGetCurrent(),
@@ -4052,12 +4205,23 @@ private final class OverlayController {
         attachWatchWindowObservers()
         attachWatchFocusedObservers()
         startWatchLivenessTimer()
+        // Arm the scan's signature baseline BEFORE the ack: a match that is
+        // already on screen is not news, and the reply can tell the producer
+        // how many author nodes the app exposes at all (0 means the app has no
+        // author-role markup, so the scan can only ever come up empty).
+        var scanBaseline = 0
+        if spec.scan != nil {
+            scanBaseline = armWatchScanBaseline()
+        }
         var started: [String: Any] = [
             "op": "watch-started",
             "app": watchAppName ?? spec.app,
             "until": spec.until ?? NSNull(),
             "pid": Int(pid),
         ]
+        if spec.scan != nil {
+            started["baseline"] = scanBaseline
+        }
         if let token = spec.token {
             started["token"] = token
         }
@@ -4075,6 +4239,9 @@ private final class OverlayController {
         } else {
             emitWatchEvent(kind: "focus", role: "AXApplication",
                            label: watchAppName, window: watchFocusedWindowTitle())
+        }
+        if spec.scan != nil {
+            startWatchScanTimer()
         }
     }
 
@@ -4095,6 +4262,12 @@ private final class OverlayController {
         watchLastValues.removeAll()
         watchEmitTimes.removeAll()
         watchLastSignatureAt.removeAll()
+        watchScan = nil
+        watchScanTimer?.invalidate()
+        watchScanTimer = nil
+        watchScanBaseline.removeAll()
+        watchScanBaselineCount = 0
+        watchScanTicks = 0
         watchLivenessTimer?.invalidate()
         watchLivenessTimer = nil
     }
@@ -4248,6 +4421,242 @@ private final class OverlayController {
         if watchLastValues[String(key)] == nil, let value = axWatchRawValueText(focused) {
             watchLastValues[String(key)] = value
         }
+    }
+
+    // MARK: Ambient WATCH — content scan
+    //
+    // An AXObserver only reports CHANGES, and a chat message arriving usually
+    // emits none. The scan therefore re-walks the tree on a timer and compares
+    // match signatures with the set recorded at arm: a signature that was not
+    // there is "new" (AX has no timestamps). The role filter is what
+    // distinguishes an AUTHOR from a message BODY: an AXStaticText node that
+    // merely contains the name is not an author node and can never fire an
+    // author hit.
+
+    /// Start the repeating scan. The arm-time baseline is already recorded, so
+    /// the first tick only has to compare.
+    private func startWatchScanTimer() {
+        watchScanTimer?.invalidate()
+        watchScanTimer = nil
+        guard let scan = watchScan else {
+            return
+        }
+        let timer = Timer(timeInterval: scan.interval, repeats: true) { [weak self] _ in
+            self?.runWatchScanTick()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchScanTimer = timer
+    }
+
+    /// Record the arm-time signature set and return its size (0 means the app
+    /// exposes no author-role markup, or nothing matched at arm).
+    private func armWatchScanBaseline() -> Int {
+        guard let scan = watchScan else {
+            return 0
+        }
+        let matches = collectWatchScanMatches(scan)
+        watchScanBaseline = Set(matches.map { $0.signature })
+        watchScanBaselineCount = watchScanBaseline.count
+        return watchScanBaselineCount
+    }
+
+    /// One scan tick: walk, compare with the baseline, report one accounting
+    /// line, then announce the first genuinely new match.
+    private func runWatchScanTick() {
+        guard let scan = watchScan, watchObserver != nil, !isShuttingDown else {
+            return
+        }
+        // Cheap liveness gate first: a killed app delivers nothing, and a scan
+        // must not outlive the watch it belongs to.
+        if let pid = watchedPid {
+            let app = NSRunningApplication(processIdentifier: pid)
+            if app == nil || app?.isTerminated == true {
+                stopWatch(reason: "app-quit", emit: true)
+                return
+            }
+        }
+        let matches = collectWatchScanMatches(scan)
+        let fresh = matches.filter { !watchScanBaseline.contains($0.signature) }
+        watchScanTicks += 1
+        var payload: [String: Any] = [
+            "op": "watch-scan",
+            "baseline": watchScanBaselineCount,
+            "matches": matches.count,
+            "new": fresh.count,
+            "at": Date().timeIntervalSince1970,
+        ]
+        if let token = watchToken {
+            payload["token"] = token
+        }
+        writeWatchLine(payload)
+        // News is announced once per arm: a sticky watch keeps scanning (and
+        // counting) but never re-announces.
+        if let first = fresh.first {
+            announceWatchScanHit(first)
+        }
+        // Fold what was seen into the baseline, so the next tick's "new" means
+        // "new since the last tick" instead of naming the same node again.
+        // Growth stops at the walk budget rather than re-seeding from the
+        // CURRENT matches: dropping an arm-time signature would make a message
+        // that scrolled away and back look new again.
+        if !fresh.isEmpty {
+            for signature in fresh.map({ $0.signature })
+            where watchScanBaseline.count < watchScanMaxNodes {
+                watchScanBaseline.insert(signature)
+            }
+        }
+    }
+
+    /// One node that matches the scan, plus the signature `new` is decided on.
+    private struct WatchScanMatch {
+        let signature: String
+        let kind: String
+        let role: String
+        let label: String
+        let window: String?
+    }
+
+    /// Announce one new match on the same `watch-hit` line the `until`
+    /// condition uses, plus `kind` so a text match is never reported as an
+    /// author. One announcement per arm, exactly like the event condition.
+    private func announceWatchScanHit(_ match: WatchScanMatch) {
+        guard watchHitArmed, watchObserver != nil, !isShuttingDown else {
+            return
+        }
+        watchHitArmed = false
+        var hit: [String: Any] = [
+            "op": "watch-hit",
+            "app": watchAppName ?? "",
+            "kind": match.kind,
+            "label": match.label,
+            "window": match.window ?? "",
+            "at": Date().timeIntervalSince1970,
+        ]
+        if let token = watchToken {
+            hit["token"] = token
+        }
+        writeWatchLine(hit)
+    }
+
+    /// Deep-walk the app and return every node that matches `scan`. Depth and
+    /// node budget are the brief's (24, `maxNodes`); a degenerate box
+    /// (`w <= 1 or h <= 1`) is a transcript artefact or an off-screen row, not
+    /// a message, so it is dropped before the matcher ever sees it.
+    ///
+    /// Known limit: a virtualized list only materializes the rows it is
+    /// drawing, so a message that never scrolls into the AX tree is not
+    /// walkable. Ticks still advance and `matches` stays flat — status tells
+    /// the truth rather than inventing a hit.
+    private func collectWatchScanMatches(_ scan: WatchScanSpec) -> [WatchScanMatch] {
+        guard let pid = watchedPid else {
+            return []
+        }
+        let root = AXUIElementCreateApplication(pid)
+        var matcher: NSRegularExpression?
+        if scan.author != nil {
+            matcher = watchScanWordMatcher(scan.needle)
+        }
+        var out: [WatchScanMatch] = []
+        var visited = 0
+        walkWatchScan(root, depth: 0, scan: scan, matcher: matcher,
+                      out: &out, visited: &visited)
+        return out
+    }
+
+    /// The whole-word matcher for an author handle: `Adolan` matches `Adolan`
+    /// and `Adolan (she/her)` but not `AdolanFan`. Case-insensitive.
+    private func watchScanWordMatcher(_ needle: String) -> NSRegularExpression? {
+        let escaped = NSRegularExpression.escapedPattern(for: needle)
+        let pattern = "(?<![\\p{L}\\p{N}_])" + escaped + "(?![\\p{L}\\p{N}_])"
+        return try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }
+
+    private func walkWatchScan(_ element: AXUIElement,
+                               depth: Int,
+                               scan: WatchScanSpec,
+                               matcher: NSRegularExpression?,
+                               out: inout [WatchScanMatch],
+                               visited: inout Int) {
+        if depth > watchScanDepth || visited >= scan.maxNodes {
+            return
+        }
+        visited += 1
+        if let match = watchScanMatch(element, scan: scan, matcher: matcher) {
+            out.append(match)
+        }
+        guard let rawKids = copyAXAttribute(element, "AXChildren"),
+              let kids = rawKids as? [Any] else {
+            return
+        }
+        for kid in kids {
+            if visited >= scan.maxNodes {
+                return
+            }
+            if let kidElement = axElement(from: kid) {
+                walkWatchScan(kidElement, depth: depth + 1, scan: scan,
+                              matcher: matcher, out: &out, visited: &visited)
+            }
+        }
+    }
+
+    private func watchScanMatch(_ element: AXUIElement,
+                                scan: WatchScanSpec,
+                                matcher: NSRegularExpression?) -> WatchScanMatch? {
+        let fields = readAXFields(element)
+        let role = fields.role
+        let box = fields.box
+        guard box.count == 4,
+              let x = numberValue(box[0]),
+              let y = numberValue(box[1]),
+              let width = numberValue(box[2]),
+              let height = numberValue(box[3]),
+              width > 1.0, height > 1.0 else {
+            // A degenerate/absent frame is not a message on screen.
+            return nil
+        }
+        guard let label = fields.label, !label.isEmpty else {
+            return nil
+        }
+        if scan.author != nil {
+            // Author mode: ONLY an author-role node can fire. The body
+            // (AXStaticText by default) never reaches the matcher at all.
+            guard scan.roleSet.contains(role.uppercased()) else {
+                return nil
+            }
+            guard watchScanWholeWord(matcher, label: label,
+                                     needle: scan.needle) else {
+                return nil
+            }
+        } else if !label.lowercased().contains(scan.needle) {
+            return nil
+        }
+        // Whole points keep the signature stable across sub-pixel jitter: the
+        // same message must not look "new" on every tick because it re-laid
+        // out by half a point.
+        func whole(_ value: Double) -> Int {
+            return Int(max(min(value, 1_000_000_000.0), -1_000_000_000.0).rounded())
+        }
+        let signature = [role, label,
+                         String(whole(x)), String(whole(y)),
+                         String(whole(width)), String(whole(height))]
+            .joined(separator: "\u{1}")
+        return WatchScanMatch(signature: signature, kind: scan.kind,
+                              role: role, label: label,
+                              window: watchWindowLine(element))
+    }
+
+    private func watchScanWholeWord(_ matcher: NSRegularExpression?,
+                                    label: String,
+                                    needle: String) -> Bool {
+        guard let matcher = matcher else {
+            // Fail CLOSED: author mode's whole point is that a name inside some
+            // other text is not an author. A matcher that would not compile is
+            // our bug, not a licence to fall back to the substring mode the
+            // caller would have chosen explicitly via scan.text.
+            return false
+        }
+        let range = NSRange(label.startIndex..<label.endIndex, in: label)
+        return matcher.firstMatch(in: label, options: [], range: range) != nil
     }
 
     /// Entry point from the C callback (mirrors petAXNotificationFired).

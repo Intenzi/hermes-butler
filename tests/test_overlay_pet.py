@@ -2361,3 +2361,139 @@ def test_hat_announces_its_anchor_mode_on_stdout() -> None:
     assert "JSONSerialization.data(withJSONObject: payload" in writer
     # One write per line: two writes could split the JSON line on the pipe.
     assert "FileHandle.standardOutput.write(data + Data([0x0a]))" in writer
+
+
+def test_watch_scan_has_a_baseline_set_and_a_role_filtered_tick() -> None:
+    """The content scan: author-role nodes only, "new" means new since arming.
+
+    AX carries no timestamps, so the companion implements "newer than now" as
+    "a match signature that was not in the set recorded at arm". The role
+    filter is what distinguishes an author from a message BODY: a node that
+    merely contains the name (AXStaticText, the body) can never fire an author
+    hit because it is not an author role.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    # Defaults from the brief: 3s tick (floor 2, ceiling 10), 1500 nodes
+    # (cap 4000), depth 24, and author roles that never include AXStaticText.
+    assert "private let watchScanDefaultInterval: TimeInterval = 3.0" in source
+    assert "private let watchScanMinInterval: TimeInterval = 2.0" in source
+    assert "private let watchScanMaxInterval: TimeInterval = 10.0" in source
+    assert "private let watchScanDefaultMaxNodes = 1500" in source
+    assert "private let watchScanMaxNodes = 4000" in source
+    assert "private let watchScanDepth = 24" in source
+    assert ('private let watchScanDefaultRoles = ["AXImage", "AXButton", "AXLink"]'
+            in source)
+    roles_line = next(line for line in source.splitlines()
+                      if "watchScanDefaultRoles =" in line)
+    assert "AXStaticText" not in roles_line, (
+        "AXStaticText is the message body, not an author node")
+
+    # Wire: the existing watch_start gains an optional scan object, one matcher.
+    parse = _swift_function_body(source, 'case "watch_start":',
+                                 'case "watch_stop":')
+    assert 'object["scan"]' in parse
+    assert "parseWatchScan(" in parse
+    assert "until != nil && scan != nil" in parse
+    scanner = _swift_function_body(source, "private func parseWatchScan(",
+                                   "private func parseCommand(")
+    assert 'trimmedString("author")' in scanner
+    assert 'trimmedString("text")' in scanner
+    assert "watchScanDefaultRoles" in scanner
+    assert "watchScanMinInterval" in scanner
+    assert "watchScanMaxInterval" in scanner
+    assert "watchScanMaxNodes" in scanner
+
+    # State: a baseline signature set plus the repeating tick.
+    assert "private var watchScan: WatchScanSpec?" in source
+    assert "private var watchScanTimer: Timer?" in source
+    assert "private var watchScanBaseline: Set<String> = []" in source
+
+    timer = _swift_function_body(source, "private func startWatchScanTimer()",
+                                 "private func armWatchScanBaseline()")
+    assert "Timer(timeInterval: scan.interval, repeats: true)" in timer
+    assert "RunLoop.main.add(timer, forMode: .common)" in timer
+
+    baseline = _swift_function_body(source, "private func armWatchScanBaseline()",
+                                    "private func runWatchScanTick()")
+    assert "watchScanBaseline = Set(matches.map { $0.signature })" in baseline
+    assert "watchScanBaselineCount = watchScanBaseline.count" in baseline
+
+    tick = _swift_function_body(source, "private func runWatchScanTick()",
+                                "private struct WatchScanMatch")
+    assert '"op": "watch-scan"' in tick
+    assert '"baseline": watchScanBaselineCount' in tick
+    assert '"matches": matches.count' in tick
+    assert '"new": fresh.count' in tick
+    assert "collectWatchScanMatches(scan)" in tick
+    assert "!watchScanBaseline.contains($0.signature)" in tick
+    # Growth stops at the walk budget instead of re-seeding from the CURRENT
+    # matches: dropping an arm-time signature would let a message that
+    # scrolled away and back fire again as "new".
+    assert "watchScanBaseline.count < watchScanMaxNodes" in tick
+    assert "watchScanBaseline = Set(matches.map" not in tick
+
+    # Signature: role + label + whole-point box, so sub-pixel relayout does not
+    # make the same message look new on every tick.
+    match = _swift_function_body(source, "private func watchScanMatch(",
+                                 "private func watchScanWholeWord(")
+    assert "readAXFields(element)" in match
+    assert "scan.roleSet.contains(role.uppercased())" in match, (
+        "author mode is role-filtered: the body cannot match")
+    assert "width > 1.0, height > 1.0" in match, (
+        "degenerate boxes are transcript artefacts / off-screen rows")
+    assert "signature" in match
+    assert 'scan.kind' in match
+
+    walk = _swift_function_body(source, "private func walkWatchScan(",
+                                "private func watchScanMatch(")
+    assert "depth > watchScanDepth" in walk
+    assert "visited >= scan.maxNodes" in walk
+
+    # The whole-word matcher fails CLOSED on a matcher that would not compile:
+    # author mode must never degrade silently into the weaker substring mode.
+    word = _swift_function_body(
+        source, "private func watchScanWholeWord(",
+        "/// Entry point from the C callback (mirrors petAXNotificationFired)")
+    assert "return false" in word
+    assert "contains(needle)" not in word
+    assert "firstMatch(in: label" in word
+
+    # A scan hit is a watch-hit with kind, once per arm like the event matcher.
+    hit = _swift_function_body(source, "private func announceWatchScanHit(",
+                               "private func collectWatchScanMatches(")
+    assert '"op": "watch-hit"' in hit
+    assert '"kind": match.kind' in hit
+    assert "watchHitArmed = false" in hit
+
+
+def test_watch_scan_arms_before_the_ack_and_stops_with_the_watch() -> None:
+    """The baseline is recorded at arm (nothing fires), and teardown kills it.
+
+    A match already on screen at arm is the state the user asked about, not
+    news. The reply carries the arm-time count so the producer can say
+    "baseline 0" honestly when the app exposes no author-role markup.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    start = _swift_function_body(source, "private func startWatch(",
+                                 "private func resetWatchState()")
+    assert "armWatchScanBaseline()" in start
+    assert 'started["baseline"] = scanBaseline' in start
+    assert "startWatchScanTimer()" in start
+    assert "watchHitArmed = spec.until != nil" in start, (
+        "the event matcher keeps its own arm path")
+    # The scan is armed before the ack, and its tick starts after the ack so a
+    # stream of scan lines can never starve watch_start's reply.
+    assert start.find("startWatchScanTimer()") > start.find("writeWatchLine(started)")
+
+    reset = _swift_function_body(source, "private func resetWatchState()",
+                                 "private func stopWatch(")
+    assert "watchScan = nil" in reset
+    assert "watchScanTimer?.invalidate()" in reset
+    assert "watchScanBaseline.removeAll()" in reset
+    assert "watchScanTicks = 0" in reset
+
+    # The dispatch path still routes the one watch_start op.
+    assert "startWatch(spec)" in source
+    assert "case .watchStart(let spec):" in source

@@ -79,6 +79,21 @@ WATCH_STATE_RECENT = 12  # what state.json carries (newest last) for the desktop
 WATCH_JSONL_MAX = 500    # <plugin data dir>/watch.jsonl tail cap
 WATCH_STATUS_EVENTS = 10 # event lines watch_status() prints
 WATCH_REQUEST_TIMEOUT = 5.0
+# A scan start records its arm-time baseline (one full AX walk) BEFORE it acks,
+# so it needs a longer budget than an ordinary start: a 1500-node walk on a
+# busy app is tens of milliseconds per hundred nodes, not per thousand.
+WATCH_SCAN_REQUEST_TIMEOUT = 15.0
+
+# Content SCAN (the author-distinguishing mode): a repeating walk of the app's
+# AX tree compared against an arm-time signature baseline. AX roles that count
+# as an AUTHOR: AXStaticText is deliberately absent because that is the message
+# BODY — including it would flag anyone who merely writes the name.
+WATCH_SCAN_ROLES = ("AXImage", "AXButton", "AXLink")
+WATCH_SCAN_INTERVAL_DEFAULT = 3
+WATCH_SCAN_INTERVAL_MIN = 2
+WATCH_SCAN_INTERVAL_MAX = 10
+WATCH_SCAN_NODES_DEFAULT = 1500
+WATCH_SCAN_NODES_MAX = 4000
 
 # A guide block on the shared snapshot is LIVE status only while the guide is
 # actually being walked (running/capture_failed/stalled). Once terminal, the
@@ -942,7 +957,7 @@ def _on_overlay_event(event):
         # here too keeps an older transport honest.
         ack_watch()
         return
-    if op in ("watch-event", "watch-hit", "watch-stopped"):
+    if op in ("watch-event", "watch-hit", "watch-stopped", "watch-scan"):
         # Ambient watch lines are not summons: they feed the ring/state and the
         # condition announcement, never the summon row.
         _handle_watch_message(event)
@@ -1138,6 +1153,10 @@ def _watch_snapshot():
         return None
     row = dict(_watch)
     row["recent"] = [dict(event) for event in (_watch.get("recent") or [])]
+    if isinstance(row.get("scan"), dict):
+        # The scan counters are mutated by the tick handler; the snapshot is
+        # serialized outside the lock, so it gets its own copy.
+        row["scan"] = dict(row["scan"])
     return row
 
 
@@ -1171,6 +1190,40 @@ def _watch_event_line(event):
     if window:
         line += " — %s" % window
     return line
+
+
+def _watch_scan_line(scan, row, hit):
+    """One status line for the content scan: matcher, roles, baseline, ticks.
+
+    ``baseline`` is the number of match signatures present at arm; 0 means the
+    app exposes no author-role markup, so the scan can only ever come up empty
+    (say so instead of guessing that a message arrived).
+    """
+    author = scan.get("author")
+    if isinstance(author, str) and author:
+        matcher = 'author "%s"' % author
+        roles = ",".join(scan.get("roles") or []) or "?"
+    else:
+        matcher = 'text "%s"' % (scan.get("text") or "")
+        # The text matcher is deliberately role-agnostic: that is exactly why
+        # it is the weaker mode, and "any" is the honest denominator.
+        roles = "any"
+    baseline = row.get("scan_baseline")
+    if not isinstance(baseline, int):
+        baseline = scan.get("baseline")
+    try:
+        baseline = max(0, int(baseline or 0))
+    except (TypeError, ValueError):
+        baseline = 0
+    try:
+        ticks = int(row.get("scan_ticks") or 0)
+    except (TypeError, ValueError):
+        ticks = 0
+    # Until the companion acks, the arm-time count is unknown: "0" would read
+    # as "this app has no author-role markup", which is a different claim.
+    baseline_text = str(baseline) if row.get("scan_baseline_at") else "?"
+    return "scan: %s · roles %s · baseline %s · %d ticks · %s" % (
+        matcher, roles, baseline_text, ticks, "hit" if hit else "no hit")
 
 
 def _append_watch_jsonl(event):
@@ -1226,6 +1279,28 @@ def _handle_watch_message(event):
             # A stopped watch is inert: a straggler already in the pipe must not
             # count an event (or announce a hit) for a watch that is over.
             return
+        if op == "watch-scan":
+            # One accounting line per scan tick: the baseline size, how many
+            # nodes matched this tick and how many of them are new. It is not
+            # an event (the ring stays a change log), so only the scan counters
+            # and the durable status move.
+            scan = _watch.get("scan")
+            if not isinstance(scan, dict):
+                # Not a scan watch: a stray line cannot invent one.
+                return
+            for key in ("baseline", "matches", "new"):
+                value = event.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    scan[key] = int(value)
+            _watch["scan_ticks"] = int(_watch.get("scan_ticks") or 0) + 1
+            _watch["scan_last_at"] = event.get("at") or time.time()
+            # The companion's arm-time count is authoritative; keep it even
+            # when a tick reports a shrinking current match count.
+            baseline = scan.get("baseline")
+            if isinstance(baseline, int) and baseline >= 0:
+                _watch["scan_baseline"] = baseline
+            _write_state()
+            return
         if op == "watch-event":
             row = _watch_event_row(event)
             _watch_ring.append(row)
@@ -1251,6 +1326,12 @@ def _handle_watch_message(event):
                 "window": event.get("window"),
                 "at": event.get("at") or time.time(),
             }
+            # A content-scan hit names its matcher: "author" is a role-filtered
+            # author node, "text" is the weaker label substring match. A text
+            # hit is never dressed up as an author.
+            kind = event.get("kind")
+            if isinstance(kind, str) and kind:
+                hit["kind"] = kind
             if not once:
                 # Sticky mode keeps observing after the announcement; the hit
                 # stays unacknowledged until the user (or the pane) says so.
@@ -1269,6 +1350,11 @@ def _handle_watch_message(event):
                 "acknowledged": False,
                 "id": uuid.uuid4().hex[:8],
             }
+            if hit.get("kind"):
+                # Same matcher label on the outliving announcement, so the
+                # desktop can say "author" vs a mere text match after the watch
+                # row is gone.
+                watch_hit["kind"] = hit["kind"]
             # Remember that THIS process published the top-level block, so a
             # later write can tell "acked elsewhere" from "never announced".
             _watch_hit_id = watch_hit["id"]
@@ -1315,6 +1401,83 @@ def _handle_watch_message(event):
             _send_watch_stop()
 
 
+def _watch_scan_number(value):
+    """One scan number, or None when the payload is not numeric.
+
+    A model may spell a number as a string ("3"); a bool is not a number here.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_watch_scan(scan):
+    """Validate one ``scan`` object for the companion (None when absent).
+
+    Returns ``(normalized, error)`` with ``error`` a tool-shaped dict, never an
+    exception: a handler must always answer. The normalized keys are the wire
+    protocol's (author|text, roles, interval, max_nodes), so what the row keeps
+    for status/debug is exactly what the companion was asked to do.
+    """
+    if scan is None:
+        return None, None
+    if not isinstance(scan, dict):
+        return None, {"error": "scan must be an object"}
+    author = scan.get("author")
+    author = author.strip() if isinstance(author, str) else ""
+    text = scan.get("text")
+    text = text.strip() if isinstance(text, str) else ""
+    # One matcher only: author is the strong mode, text the explicitly weaker
+    # one (a text hit is never reported as an author).
+    if author and text:
+        return None, {"error": "pass scan.author or scan.text, not both"}
+    if not author and not text:
+        return None, {"error": "scan needs author or text"}
+    roles = scan.get("roles")
+    if roles is None:
+        roles = list(WATCH_SCAN_ROLES)
+    elif isinstance(roles, str):
+        roles = [roles]
+    if not isinstance(roles, (list, tuple)):
+        return None, {"error": "scan.roles must be a list of AX roles"}
+    cleaned = []
+    for role in roles:
+        if not isinstance(role, str) or not role.strip():
+            return None, {"error": "scan.roles must be a list of AX roles"}
+        role = role.strip()
+        if role not in cleaned:
+            cleaned.append(role)
+    if not cleaned:
+        return None, {"error": "scan.roles must name at least one role"}
+    raw_interval = scan.get("interval_seconds")
+    if raw_interval is None:
+        raw_interval = scan.get("interval")
+    interval = WATCH_SCAN_INTERVAL_DEFAULT
+    if raw_interval is not None:
+        number = _watch_scan_number(raw_interval)
+        if number is None:
+            return None, {"error": "scan.interval_seconds must be a number"}
+        interval = int(round(min(max(number, WATCH_SCAN_INTERVAL_MIN),
+                                 WATCH_SCAN_INTERVAL_MAX)))
+    raw_nodes = scan.get("max_nodes")
+    max_nodes = WATCH_SCAN_NODES_DEFAULT
+    if raw_nodes is not None:
+        number = _watch_scan_number(raw_nodes)
+        if number is None:
+            return None, {"error": "scan.max_nodes must be a number"}
+        max_nodes = int(round(max(1.0, min(number, WATCH_SCAN_NODES_MAX))))
+    normalized = {"roles": cleaned, "interval": interval,
+                  "max_nodes": max_nodes}
+    if author:
+        normalized["author"] = author
+    else:
+        normalized["text"] = text
+    return normalized, None
+
+
 def _watch_start_failure(app, code):
     """Map a companion rejection to an honest, exception-free tool result."""
     if code == "app-not-running":
@@ -1327,7 +1490,7 @@ def _watch_start_failure(app, code):
     return {"error": code or "watch_start failed", "app": app}
 
 
-def start_watch(app, until=None, once=True):
+def start_watch(app, until=None, scan=None, once=True):
     """Observe one running app's Accessibility tree; never clicks or types.
 
     Wholly passive: the companion attaches AX observers and streams change
@@ -1341,12 +1504,19 @@ def start_watch(app, until=None, once=True):
     announcement, a terminal ``stopped.reason == "hit"`` row, and no re-arm
     until the agent starts a new watch. ``once=False`` keeps observing after the
     hit until ``acknowledge_watch_hit`` (or a stop) clears it.
+
+    ``scan`` is the content version of the same question: pass
+    ``{"author": "Adolan"}`` (or the weaker ``{"text": ...}``) and the
+    companion re-walks the app's AX tree on a timer, announcing a matching node
+    that was NOT on screen when the watch armed. AX has no timestamps, so
+    "newer than now" is "new since arming". ``until`` and ``scan`` are mutually
+    exclusive: one matcher per watch.
     """
     with _watch_start_lock:
-        return _start_watch_locked(app, until, once)
+        return _start_watch_locked(app, until, once, scan)
 
 
-def _start_watch_locked(app, until, once=True):
+def _start_watch_locked(app, until, once=True, scan=None):
     global _watch
     try:
         name = str(app or "").strip()
@@ -1355,6 +1525,13 @@ def _start_watch_locked(app, until, once=True):
         needle = until.strip() if isinstance(until, str) else None
         if not needle:
             needle = None
+        if needle and scan is not None:
+            # One matcher per watch: the event condition and the content scan
+            # would compete for the single hit slot.
+            return {"error": "pass until or scan, not both"}
+        scan_spec, scan_error = _normalize_watch_scan(scan)
+        if scan_error is not None:
+            return scan_error
         # Be liberal with the flag a model may spell as a string; the schema
         # says boolean. One-shot is the default, so only an explicit false
         # spelling opts into sticky mode (an empty/unknown string must not).
@@ -1372,6 +1549,8 @@ def _start_watch_locked(app, until, once=True):
         op = {"op": "watch_start", "app": name, "token": token}
         if needle:
             op["until"] = needle
+        if scan_spec is not None:
+            op["scan"] = scan_spec
         # Install the provisional row BEFORE the round trip: events can start
         # flowing the instant the companion attaches its observers. A rejected
         # start RESTORES the row that was running before it — the companion
@@ -1383,6 +1562,7 @@ def _start_watch_locked(app, until, once=True):
             provisional = {
                 "app": name,
                 "until": needle,
+                "scan": scan_spec,
                 "once": once,
                 "token": token,
                 "owner_pid": os.getpid(),
@@ -1392,6 +1572,12 @@ def _start_watch_locked(app, until, once=True):
                 "stopped": None,
                 "recent": [],
             }
+            if scan_spec is not None:
+                # The companion answers with the arm-time baseline size; until
+                # that ack, the honest count is "unknown" (0 found so far).
+                provisional["scan_baseline"] = 0
+                provisional["scan_baseline_at"] = None
+                provisional["scan_ticks"] = 0
             _watch = provisional
 
         def restore_previous():
@@ -1406,7 +1592,11 @@ def _start_watch_locked(app, until, once=True):
                 _write_state()
 
         try:
-            reply = _OVERLAY.request(op, timeout=WATCH_REQUEST_TIMEOUT)
+            # A scan start walks the tree once to record its baseline before it
+            # acks; give that round trip the longer budget it actually needs.
+            timeout = (WATCH_SCAN_REQUEST_TIMEOUT if scan_spec is not None
+                       else WATCH_REQUEST_TIMEOUT)
+            reply = _OVERLAY.request(op, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - transport must not raise
             restore_previous()
             return {"error": str(exc), "app": name}
@@ -1430,6 +1620,15 @@ def _start_watch_locked(app, until, once=True):
             if _watch is not provisional:
                 # A concurrent stop_watch landed while we waited for the ack.
                 return {"error": "watch start was cancelled", "app": name}
+            if scan_spec is not None:
+                # The companion recorded the baseline BEFORE it acked, so its
+                # reply is the first honest count of matches at arm (0 means
+                # the app exposes no author-role markup at all).
+                baseline = reply.get("baseline")
+                if isinstance(baseline, (int, float)) \
+                        and not isinstance(baseline, bool):
+                    _watch["scan_baseline"] = max(0, int(baseline))
+                _watch["scan_baseline_at"] = time.time()
             stopped = _watch.get("stopped")
             if stopped is not None:
                 if stopped.get("token") == token:
@@ -1437,9 +1636,12 @@ def _start_watch_locked(app, until, once=True):
                     # instantly). Keep the row: status reports the clean stop.
                     started_at = _watch["started_at"]
                     _write_state()
-                    return {"ok": True, "app": name, "until": needle,
-                            "once": once, "started_at": started_at,
-                            "status": watch_status()}
+                    result = {"ok": True, "app": name, "until": needle,
+                              "once": once, "started_at": started_at,
+                              "status": watch_status()}
+                    if scan_spec is not None:
+                        result["scan"] = scan_spec
+                    return result
                 # A stop line written BEFORE this watch was installed (an old
                 # watch quitting, a concurrent stop) must not mark the new row
                 # dead; the start did not take.
@@ -1447,8 +1649,11 @@ def _start_watch_locked(app, until, once=True):
                 return {"error": "watch start was superseded by a stop", "app": name}
             started_at = _watch["started_at"]
             _write_state()
-        return {"ok": True, "app": name, "until": needle, "once": once,
-                "started_at": started_at, "status": watch_status()}
+        result = {"ok": True, "app": name, "until": needle, "once": once,
+                  "started_at": started_at, "status": watch_status()}
+        if scan_spec is not None:
+            result["scan"] = scan_spec
+        return result
     except Exception as exc:  # noqa: BLE001 - a handler must always answer
         return {"error": str(exc)}
 
@@ -1470,11 +1675,15 @@ def watch_status():
     if row is None:
         return "no watch active"
     until = row.get("until")
+    scan = row.get("scan") if isinstance(row.get("scan"), dict) else None
     hit = row.get("hit")
     stopped = row.get("stopped")
+    subject = until or ("content scan" if scan else None) or "any change"
     lines = ["watching %s for %s · %d events · %s" % (
-        row.get("app") or "?", until or "any change",
+        row.get("app") or "?", subject,
         int(row.get("events") or 0), "hit" if hit else "no hit")]
+    if scan is not None:
+        lines.append(_watch_scan_line(scan, row, bool(hit)))
     if hit:
         suffix = (" — %s" % hit["window"]) if hit.get("window") else ""
         lines.append("hit: %s%s at %s" % (hit.get("label") or "", suffix,
