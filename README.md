@@ -10,7 +10,10 @@ plain language and it plans a short guide, rings the real control on your screen
 says one line about it, and waits — moving on only when the macOS Accessibility
 layer confirms the step actually landed. A click that did not land stalls the
 guide instead of being counted. It works with any petdex pet, installs nothing
-into your apps, and never types or clicks for you.
+into your apps, and never types or clicks for you. The best part? Butler does this without vision.
+
+<img width="242" height="208" alt="image" src="https://github.com/user-attachments/assets/192283dd-f818-43ed-8589-f1dc39514370" />
+
 
 ## Install
 
@@ -33,45 +36,37 @@ installed, Butler compiles the bundled Swift source instead (7–14 s). See
 
 ## What you get
 
-| Verb | What it looks like | What it proves |
-|---|---|---|
-| **WALK** · `butler_guide_start` | A ring on the real control, a one-line bubble, live progress. | Each step is read back from the Accessibility tree — a shallow walk, then one re-walk to depth 24 for Electron apps — before the guide advances. One guide at a time; a second is refused unless you pass `replace=true`. |
-| **DESCRIBE** · `butler_look` | Right-click the hat beside the pet for a menu, or drag it: the screen dims and a badge names the live target. | The ask opens carrying App / Window / Control (role, label, enabled, box) read from the AX layer. |
-| **WATCH** · `butler_watch_start` | ⏲ watching line on the pet, and a hit line that stays until you acknowledge it. | One app's AX tree is read in the background; `until` matches emitted change events, `scan: {author, roles}` waits for a genuinely new message from a named author. |
+Three things, all from the same pet.
 
-Every door ends in a real agent turn: `[butler summon]`, `[butler look]` and
-`[butler watch]` frames are how a request reaches the model. A typed
-`watch <app> for …` routes to the watch frame.
+## Guide
+<img width="2054" height="1486" alt="image" src="https://github.com/user-attachments/assets/15e5ffdc-d6d1-46ee-9028-5cadea82ad55" />
 
-## LOOK
+**Ask for help with a task.** The pet rings the next thing to click, says one
+line about it, and stays there until the screen actually changes. Click the wrong
+thing and it waits — it does not pretend you are done and it does not move on to
+step two.
 
-Right-click the 26x24 hat beside the popped-out pet for the menu, or drag the
-hat to look. A screen-sized overlay takes the click, so clicks do not reach your apps;
-the cursor becomes a crosshair, and a badge shows the live target under the
-pointer. Release to ask; `Esc` or right-click cancels. The ask field opens with
-the App, the Window, and the control already filled in, and the answer is spoken
-in one line on the pet while the chat keeps the full explanation.
+## Look
+<img width="2452" height="1602" alt="image" src="https://github.com/user-attachments/assets/364931e2-ebab-4ecb-a98c-9b9d868f7826" />
 
-LOOK needs the pet **popped out** into its own window, because the hat lives
-beside it. With the pet inside the Hermes window, clicking the pet opens the ask
-field instead.
 
-## WATCH
+**Point at something and ask about it.** Right-click the hat beside the pet, then
+click whatever you are curious about. Butler tells you what that control is, what
+it does, and why it might be greyed out — and the click never reaches the app
+underneath, so nothing fires by accident.
 
-```
-butler_watch_start({"app": "Finder", "until": "invoice"})
-butler_watch_status
-butler_watch_stop
-```
+## Watch
+<img width="384" height="242" alt="image" src="https://github.com/user-attachments/assets/48c1908c-bcc3-4885-a4d7-bac8ea5abd5f" />
 
-`until` is plain text: the watch speaks once when a label, title, or value in
-that app contains it — window titles are the reliable case. `scan: {author,
-roles}` is the content mode: it waits for a NEW message from a named author,
-matched only against author-role nodes (AXImage / AXButton / AXLink) and only
-for signatures that were absent from the arm-time baseline. One watch runs at a
-time; a hit is announced once and the line stays on the pet until you clear it
-from the hat menu (**Acknowledge watch hit**). The `/butler` pane shows
-`⏲ Watching <app> · <N> changes · <mm:ss>` with a **Stop** button.
+
+**Tell it to watch for one thing.** "Tell me when the build finishes." You go and
+do something else; when it happens the pet says so, and keeps saying so until you
+acknowledge it. Not a notification that scrolls away — a line that waits for you.
+
+All three work the same way underneath: Butler reads the on-screen element data
+that macOS already publishes, the same information a screen reader uses. No
+pictures, no OCR, no model looking at your screen.
+
 
 ## Requirements
 
@@ -107,7 +102,7 @@ from the hat menu (**Acknowledge watch hit**). The `/butler` pane shows
   guide resumes; if the control moved, it stalls rather than counting the step.
 - **The watch says baseline 0.** Nothing matched the author-role nodes when the
   watch armed — the view had not rendered yet, or the name does not match what AX
-  exposes. Open the list, then arm the watch again.
+  exposes. Open the list, then rerun the watch again.
 
 ## Docs
 
