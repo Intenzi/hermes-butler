@@ -889,7 +889,11 @@ def test_look_is_a_pointer_drag_not_a_hot_key() -> None:
 
 
 def test_look_card_is_a_non_activating_pointer_readout() -> None:
-    """The drop shows a 320 pt card that never takes focus and never emits."""
+    """The drop card never takes focus and never emits.
+
+    Round 16 leaves it with no caller (the drag arms INSPECT MODE instead); the
+    class and its helpers are kept, marked dead, only until the demo is over.
+    """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
     window = _swift_function_body(
@@ -928,7 +932,7 @@ def test_look_card_is_a_non_activating_pointer_readout() -> None:
 
     end = _swift_function_body(
         source, "private func endLookDrag(at screenPoint: NSPoint) {",
-        "private func lookCardFrame(")
+        "/// Park the overlays, then resolve on the next run-loop turn")
     present = _swift_function_body(
         source, "private func presentLookCard(",
         "private func installLookCardMonitors()")
@@ -936,7 +940,11 @@ def test_look_card_is_a_non_activating_pointer_readout() -> None:
         assert "summon_text" not in body
         assert "look_text" not in body
         assert "openSummonField()" not in body
-    assert "lookElementDescriptor(at: point)" in end
+    # Round 16: the drag release goes through INSPECT MODE's resolver now; the
+    # card is dead code kept only until the demo is over.
+    assert "resolveInspectRelease(at: screenPoint)" in end
+    assert "presentLookCard(" not in end
+    assert "resolveLookDrop(" not in end
 
     # Anchored away from the pointer so the card never covers it.
     frame = _swift_function_body(
@@ -1125,35 +1133,33 @@ def test_summon_field_carries_the_destination_per_send() -> None:
     assert "ask-submit:\\(text.count)chars:\\(destination.rawValue)" in submit
 
 
-def test_look_reads_under_the_hat_and_click_then_asks_about_it() -> None:
-    """The drop must read the ELEMENT under the pointer, not our own chip.
+def test_look_drag_release_reads_the_element_under_the_hat() -> None:
+    """The release point must be read from the app underneath, never from us.
 
-    Measured failure: at mouseUp the hat is the topmost window at the cursor, so
-    an immediate hit-test answered "Button · Ask butler — ButlerOverlay" wherever
-    the user dropped it. The window is parked off-screen and the hit-test runs on
-    the next run-loop turn; a click within the ask window then asks about THAT
-    element instead of opening a blank request.
+    Round 16 folds the drag into INSPECT MODE: at release every overlay is
+    parked off-screen, the AX read runs on the next run-loop turn, and the drag
+    goes through `resolveInspectClick` — the same resolver the click-armed mode
+    uses. A press under the drag threshold is still the plain ask door.
     """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
-    drop = _swift_function_body(source, "private func endLookDrag(at screenPoint: NSPoint)",
-                                "/// Place the card next to the drop point")
-    assert "-20000.0" in drop, "the hat must be parked off-screen before the hit-test"
-    assert "DispatchQueue.main.async" in drop, "the hit-test must run after the window server catches up"
-    assert "lastLookDescriptor = descriptor" in drop
+    release = _swift_function_body(
+        source, "private func resolveInspectRelease(at screenPoint: NSPoint) {",
+        "/// The release point when the chip's mouseUp is lost")
+    assert "-20000.0" in release, "every overlay is parked off-screen before the hit-test"
+    assert "DispatchQueue.main.async" in release, "the read runs after the window server catches up"
+    assert "resolveInspectClick(at: point, retries: 1)" in release
 
     click = _swift_function_body(source, "private func claimChipClicked()",
                                  "// MARK: Pointer LOOK gesture")
-    assert "lastLookDescriptor" in click
-    assert "pendingLookTarget" in click
-    assert 'chipJournal("ask-about-look")' in click
-    assert "toggleSummonField()" in click, "a plain click with no recent look still opens the ask field"
+    assert "toggleSummonField()" in click, "a plain click still opens the ask field"
 
 
 def test_look_never_answers_with_our_own_window() -> None:
     """Both symptoms so far were self-hits: "Button · Ask butler" then "Window ·
-    ButlerOverlay". The drop must retry with the hat parked and then fall back to
-    the active (non-self) app's window.
+    ButlerOverlay". The resolver retries with the overlays parked and then falls
+    back to the active (non-self) app's window — for BOTH confirmations, since
+    the drag and the right-click share it.
     """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
@@ -1161,16 +1167,21 @@ def test_look_never_answers_with_our_own_window() -> None:
     assert "private func lookDescriptorForActiveApp(" in source
     assert "menuBarOwningApplication" in source, "the active app is the menu-bar owner, never an accessory"
 
-    resolve = _swift_function_body(source, "private func resolveLookDrop(",
-                                   "/// Place the card next to the drop point")
+    resolve = _swift_function_body(source, "private func resolveInspectClick(",
+                                   "/// The hat's right-click")
     assert "lookDescriptorIsSelf(descriptor)" in resolve
-    assert "retries - 1" in resolve, "one short retry while the parked window settles"
+    assert "retries - 1" in resolve, "one short retry while the parked overlay settles"
     assert "lookDescriptorForActiveApp()" in resolve
-    assert 'chipJournal("look-self-hit-fallback")' in resolve
+    assert 'chipJournal("inspect-self-hit-fallback")' in resolve
+    assert 'cancelInspectMode(reason: "self-after-fallback")' in resolve
 
-    drop = _swift_function_body(source, "private func endLookDrag(at screenPoint: NSPoint)",
-                                "/// Read the drop point")
-    assert "resolveLookDrop(" in drop
+    # The old drag-only resolver is requiem code now: kept for the demo, never
+    # called from the release path.
+    drop = _swift_function_body(
+        source, "private func endLookDrag(at screenPoint: NSPoint) {",
+        "/// Park the overlays, then resolve on the next run-loop turn")
+    assert "resolveLookDrop(" not in drop
+    assert "resolveInspectRelease(at: screenPoint)" in drop
 
 
 def test_watch_observes_the_app_windows_and_focused_control() -> None:
@@ -1450,7 +1461,8 @@ def test_inspect_mode_builds_one_click_catcher_per_screen() -> None:
     assert "override var canBecomeMain: Bool" in window
     assert window.count("return false") >= 2, "neither key nor main"
 
-    arm = _swift_function_body(source, "private func armInspectMode() {",
+    arm = _swift_function_body(source,
+                               "private func armInspectMode(releaseToAsk: Bool = false) {",
                                "/// One click catcher per screen")
     # Never behind an open ask field: every door into the field disarms the mode.
     assert "!inspectMode" in arm
@@ -1462,6 +1474,9 @@ def test_inspect_mode_builds_one_click_catcher_per_screen() -> None:
     assert 'chipJournal("inspect-arm")' in arm
     assert "raiseInspectOverlays()" in arm
     assert "installInspectTimers()" in arm
+    # Round 16: the drag arms the SAME function with the release confirmation.
+    assert "inspectReleaseToAsk = releaseToAsk" in arm
+    assert "installInspectMonitors(releaseToAsk: releaseToAsk)" in arm
 
     overlays = _swift_function_body(source, "private func raiseInspectOverlays() {",
                                     "private func installInspectTimers()")
@@ -1535,8 +1550,11 @@ def test_inspect_badge_follows_the_cursor_and_never_covers_the_point() -> None:
     """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
-    assert 'static let titleText = "👀 click to ask · right-click to cancel"' in source
+    # Round 16: the pill's gesture line is honest about the arm mode.
+    assert 'static let clickTitle = "👀 click to ask · esc / right-click to cancel"' in source
+    assert 'static let releaseTitle = "👀 release to ask · esc to cancel"' in source
     assert "click to ask" in source
+    assert "release to ask" in source
     assert "right-click to cancel" in source
     assert "static let badgeOffsetX: CGFloat = 18.0" in source
     assert "static let badgeOffsetY: CGFloat = 26.0" in source
@@ -1567,8 +1585,9 @@ def test_inspect_badge_follows_the_cursor_and_never_covers_the_point() -> None:
     assert "y: cursor.y + InspectModeSpec.badgeOffsetY" in place
     assert "cursor.y - InspectModeSpec.badgeOffsetY - size.height" in place
 
-    assert "InspectModeSpec.titleText as NSString" in view
-    assert "InspectModeSpec.titleText" in view, "the pill's first line is the fixed gesture"
+    assert "badgeTitle as NSString" in view, "the pill draws the gesture line it was given"
+    assert "private var badgeTitle = InspectModeSpec.clickTitle" in view
+    assert "title != badgeTitle" in view, "a mode change repaints the gesture line"
     assert "badgeDetail" in view, "the second line is the live target"
     assert "NSBezierPath(roundedRect: badgeFrame" in view
 
@@ -1642,12 +1661,19 @@ def test_inspect_cursor_is_the_crosshair_and_is_popped_on_exit() -> None:
     assert "override func cursorUpdate(with event: NSEvent)" in view
     assert "NSCursor.crosshair.set()" in view
 
-    arm = _swift_function_body(source, "private func armInspectMode() {",
+    arm = _swift_function_body(source,
+                               "private func armInspectMode(releaseToAsk: Bool = false) {",
                                "/// One click catcher per screen")
     assert "NSCursor.crosshair.push()" in arm
 
     disarm = _swift_function_body(source, "private func disarmInspectMode() {",
                                   "/// The 10 Hz loop")
+    # Round 16: the Esc monitors (and the drag release catcher) never outlive
+    # the mode.
+    assert "for monitor in inspectMonitors" in disarm
+    assert "NSEvent.removeMonitor(monitor)" in disarm
+    assert "inspectMonitors.removeAll()" in disarm
+    assert "inspectReleaseToAsk = false" in disarm
     assert "NSCursor.pop()" in disarm
     assert "NSCursor.arrow.set()" in disarm
     assert "window.orderOut(nil)" in disarm
@@ -1683,13 +1709,18 @@ def test_inspect_mode_times_out_and_journals_every_hop() -> None:
     assert 'chipJournal("inspect-cancel:" + reason)' in cancel
     assert "disarmInspectMode()" in cancel
 
-    for event in ("inspect-arm", "inspect-click:", "inspect-cancel:", "inspect-timeout"):
+    for event in ("inspect-arm", "drag-arm", "drag-arm-refused", "drag-release:",
+                  "inspect-escape", "inspect-click:", "inspect-cancel:",
+                  "inspect-timeout"):
         assert f'chipJournal("{event}' in source, f"journal line {event} is missing"
 
 
-def test_inspect_cancel_doors_are_right_click_and_the_badge() -> None:
-    """Right click anywhere and a click inside the badge both cancel; the mode
-    never reads a key, so there is no Esc path to capture."""
+def test_inspect_cancel_doors_are_right_click_the_badge_and_escape() -> None:
+    """Right click anywhere, a click inside the badge and Esc all cancel.
+
+    Round 16 makes Escape universal across the LOOK paths, so the mode now does
+    read one key — and only one — through the arm/disarm monitor pair.
+    """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
     view = _swift_function_body(source,
@@ -1710,7 +1741,15 @@ def test_inspect_cancel_doors_are_right_click_and_the_badge() -> None:
                                     "private func installInspectTimers()")
     assert 'cancelInspectMode(reason: "right-click")' in overlays
     assert 'cancelInspectMode(reason: "badge")' in overlays
-    assert "keyDown" not in overlays, "no keyboard capture"
+    assert "keyDown" not in overlays, "the overlays themselves never read a key"
+
+    monitors = _swift_function_body(source, "private func installInspectMonitors(",
+                                    "/// One Esc path for both arm modes")
+    assert "NSEvent.addGlobalMonitorForEvents(matching: .keyDown" in monitors
+    escape = _swift_function_body(source, "private func escapeInspectMode() -> Bool {",
+                                  "private func disarmInspectMode()")
+    assert 'chipJournal("inspect-escape")' in escape
+    assert 'cancelInspectMode(reason: "escape")' in escape
 
 
 def test_the_round_thirteen_follower_and_eye_click_machinery_is_gone() -> None:
@@ -1726,22 +1765,25 @@ def test_the_round_thirteen_follower_and_eye_click_machinery_is_gone() -> None:
                  "dismissEyeLabel", "armEyeMode", "disarmEyeMode",
                  "claimChipView?.eyeMode", "EyeMenuItemTarget", "1.0 / 15.0"):
         assert gone not in source, f"round-13 eye machinery must be gone: {gone}"
-    assert "private func armInspectMode()" in source
+    assert "private func armInspectMode(releaseToAsk: Bool = false)" in source
     assert "private func disarmInspectMode()" in source
     assert "private final class InspectOverlayView: NSView" in source
 
 
 def test_inspect_path_needs_no_event_tap_flags_or_input_monitoring() -> None:
-    """The mode captures pointer clicks with its own windows. No event tap, no
-    modifier-key stream, no Input Monitoring, no trust probe of its own: the
-    companion's existing Accessibility grant is the single subject (§4)."""
+    """The mode captures pointer clicks with its own windows and reads exactly
+    one key: Esc, through a local + global monitor (the look card proves the
+    same global monitor works). No event tap, no modifier-key stream, no Input
+    Monitoring, no trust probe: the companion's existing Accessibility grant is
+    the single subject (§4)."""
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
     for forbidden in ("CGEventTap", "flagsChanged", "Input Monitoring",
                       "kCGSessionEventTap"):
         assert forbidden not in source, f"the inspect path must not use {forbidden}"
 
-    inspect_path = (_swift_function_body(source, "private func armInspectMode() {",
+    inspect_path = (_swift_function_body(source,
+                                         "private func armInspectMode(releaseToAsk: Bool = false) {",
                                          "/// One click catcher per screen")
                     + _swift_function_body(source, "private func raiseInspectOverlays() {",
                                            "private func installInspectTimers()")
@@ -1754,9 +1796,124 @@ def test_inspect_path_needs_no_event_tap_flags_or_input_monitoring() -> None:
                     + _swift_function_body(source, "private func resolveInspectClick(",
                                            "/// The hat's right-click"))
     assert "AXIsProcessTrustedWithOptions" not in inspect_path
-    assert "NSEvent.addGlobalMonitorForEvents" not in inspect_path
-    assert "NSEvent.addLocalMonitorForEvents" not in inspect_path
     assert "CGEventPost" not in inspect_path
+
+    # The only monitors: Esc (both scopes) and, for a drag arm, the release.
+    monitors = _swift_function_body(source, "private func installInspectMonitors(",
+                                    "/// One Esc path for both arm modes")
+    assert "let escape: UInt16 = 53" in monitors
+    assert "NSEvent.addLocalMonitorForEvents(matching: .keyDown" in monitors
+    assert "NSEvent.addGlobalMonitorForEvents(matching: .keyDown" in monitors
+    assert monitors.count("event.keyCode == escape") == 2, (
+        "Esc is checked in both the local and the global handler")
+    assert "NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp" in monitors
+    assert "flagsChanged" not in monitors
+
+
+# --- Round 16: one LOOK UX — a drag arms INSPECT MODE too ---------------------
+
+def test_drag_arms_the_same_inspect_mode_and_confirms_on_release() -> None:
+    """Dragging the hat and right-clicking it are ONE gesture with one UX.
+
+    The drag enters INSPECT MODE (same overlays, same badge, same resolver) with
+    ``releaseToAsk`` set; the only difference is that the target is confirmed
+    when the pointer comes up instead of on a click. A press under the threshold
+    is still the plain click that opens the ask field.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    arm = _swift_function_body(source,
+                               "private func armInspectMode(releaseToAsk: Bool = false) {",
+                               "/// One click catcher per screen")
+    assert "inspectReleaseToAsk = releaseToAsk" in arm
+    assert 'chipJournal("drag-arm")' in arm
+    assert 'chipJournal("inspect-arm")' in arm
+
+    drag = _swift_function_body(source,
+                                "private func beginLookDrag(at screenPoint: NSPoint) {",
+                                "/// Nothing to drag any more")
+    assert "armInspectMode(releaseToAsk: true)" in drag, (
+        "the drag reuses the right-click arm path, with the release flag")
+    assert 'chipJournal("drag-arm-refused")' in drag, (
+        "a refused arm is journaled instead of failing silently")
+
+    move = _swift_function_body(source,
+                                "private func moveLookDrag(to screenPoint: NSPoint) {",
+                                "/// Release: a drag-armed mode confirms HERE")
+    assert "guard !inspectMode" in move
+    assert move.find("guard !inspectMode") < move.find("setFrameOrigin"), (
+        "while INSPECT MODE is up the hidden hat is not dragged")
+
+    mouse_up = _swift_function_body(
+        source, "private func endLookDrag(at screenPoint: NSPoint) {",
+        "/// Park the overlays, then resolve on the next run-loop turn")
+    assert "guard inspectMode, inspectReleaseToAsk else" in mouse_up
+    assert "resolveInspectRelease(at: screenPoint)" in mouse_up
+    assert "presentLookCard(" not in mouse_up, "the drop card is not raised any more"
+    assert "resolveLookDrop(" not in mouse_up
+
+    release = _swift_function_body(
+        source, "private func resolveInspectRelease(at screenPoint: NSPoint) {",
+        "/// The release point when the chip's mouseUp is lost")
+    # The release resolves through INSPECT MODE's resolver: parked, then deferred.
+    assert "inspectResolving = true" in release
+    assert "-20000.0" in release
+    assert "DispatchQueue.main.async" in release
+    assert "resolveInspectClick(at: point, retries: 1)" in release
+    assert "lookElementDescriptor" not in release, "the read happens after the defer"
+
+    resolve = _swift_function_body(source, "private func resolveInspectClick(",
+                                   "/// The hat's right-click")
+    assert 'chipJournal("drag-release:" + (descriptor.role ?? "?"))' in resolve
+    assert 'chipJournal("inspect-click:" + (descriptor.role ?? "?"))' in resolve
+    assert resolve.find("disarmInspectMode()") < resolve.find("openSummonField()"), (
+        "the mode, and its Esc monitors, are gone before the field takes key")
+
+    # The two arm modes offer honestly different confirmations, and the badge
+    # draws the line it was handed.
+    assert 'static let clickTitle = "👀 click to ask · esc / right-click to cancel"' in source
+    assert 'static let releaseTitle = "👀 release to ask · esc to cancel"' in source
+    assert "inspectReleaseToAsk ? InspectModeSpec.releaseTitle" in source
+
+
+def test_escape_cancels_inspect_mode_and_its_monitors_die_with_it() -> None:
+    """Escape cancels in every LOOK path: both arm modes, the ask field, and
+    (already) the read-out card.
+
+    The monitors are installed at arm and removed at disarm, so no key capture
+    outlives the mode. Local + global: the global one is how Esc reaches a
+    background accessory helper, and the companion already holds the trust the
+    look card's global monitor proves.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    arm = _swift_function_body(source,
+                               "private func armInspectMode(releaseToAsk: Bool = false) {",
+                               "/// One click catcher per screen")
+    assert "installInspectMonitors(releaseToAsk: releaseToAsk)" in arm
+
+    monitors = _swift_function_body(source, "private func installInspectMonitors(",
+                                    "/// One Esc path for both arm modes")
+    assert "NSEvent.addLocalMonitorForEvents(matching: .keyDown" in monitors
+    assert "NSEvent.addGlobalMonitorForEvents(matching: .keyDown" in monitors
+    assert "let escape: UInt16 = 53" in monitors
+    assert monitors.count("event.keyCode == escape") == 2
+    # Only a consumed Esc is swallowed; a stray monitor can never eat the key.
+    assert "(self?.escapeInspectMode() ?? false) ? nil : event" in monitors
+
+    disarm = _swift_function_body(source, "private func disarmInspectMode() {",
+                                  "/// The 10 Hz loop")
+    assert "for monitor in inspectMonitors" in disarm
+    assert "NSEvent.removeMonitor(monitor)" in disarm
+    assert "inspectMonitors.removeAll()" in disarm
+
+    escape = _swift_function_body(source, "private func escapeInspectMode() -> Bool {",
+                                  "private func disarmInspectMode()")
+    assert 'chipJournal("inspect-escape")' in escape
+    assert 'cancelInspectMode(reason: "escape")' in escape
+
+    # The ask field keeps its own Esc door.
+    assert "cancelOperation" in source
 
 
 def test_inspect_arm_survives_teardown_and_the_ask_field_is_unchanged() -> None:

@@ -2010,8 +2010,14 @@ private final class ClaimChipView: NSView {
     }
 }
 
-// MARK: - Pointer LOOK card
+// MARK: - Pointer LOOK card (DEAD since the drag parity)
 
+/// DEAD SINCE THE DRAG PARITY: no caller. A hat drag arms INSPECT MODE and
+/// confirms on release through `resolveInspectClick`, so the follower/card pair
+/// below is never raised. Kept (with `resolveLookDrop`, `lookCardFrame`,
+/// `presentLookCard`) instead of deleting a large Swift block hours before a
+/// submission. Delete the whole block once the demo is over.
+///
 /// The read-out panel. It must NEVER become key: the user's app keeps typing
 /// focus while the card is on screen, and a click anywhere simply dismisses it.
 private final class LookCardWindow: NSPanel {
@@ -2394,8 +2400,11 @@ private enum InspectModeSpec {
     static let moveThreshold: CGFloat = 6.0
     /// No click for a minute cancels the mode on its own.
     static let timeout: TimeInterval = 60.0
-    /// The badge's fixed first line.
-    static let titleText = "👀 click to ask · right-click to cancel"
+    /// The badge's fixed first line. The two arm modes confirm differently
+    /// (a click vs the release that ends a drag), so the offer is spelled out
+    /// per mode instead of pretending both are clicks.
+    static let clickTitle = "👀 click to ask · esc / right-click to cancel"
+    static let releaseTitle = "👀 release to ask · esc to cancel"
 }
 
 /// Hard cap + tail ellipsis for the live target line.
@@ -2467,6 +2476,9 @@ private final class InspectOverlayView: NSView {
     /// pointer is on another display (only one badge exists at a time).
     private(set) var badgeFrame = NSRect.zero
     private var badgeDetail = ""
+    /// The gesture line: "click to ask" for a right-click arm, "release to ask"
+    /// for a drag arm. Set with every badge update.
+    private var badgeTitle = InspectModeSpec.clickTitle
     private var badgeCursor: NSPoint?
     private var cursorTracking: NSTrackingArea?
 
@@ -2542,8 +2554,8 @@ private final class InspectOverlayView: NSView {
     }
 
     /// Two 11 pt lines plus air: the pill is small, the second line one glance.
-    static func badgeSize(for detail: String) -> NSSize {
-        let titleWidth = (InspectModeSpec.titleText as NSString)
+    static func badgeSize(for detail: String, title: String) -> NSSize {
+        let titleWidth = (title as NSString)
             .size(withAttributes: [.font: titleFont]).width
         let detailLine = detail.isEmpty ? "\u{2026}" : detail
         let detailWidth = (detailLine as NSString)
@@ -2631,16 +2643,23 @@ private final class InspectOverlayView: NSView {
                                           width: size.width, height: size.height)
     }
 
-    /// The controller feeds the pointer (in this view's coordinates) and the
-    /// current target line on every tick. A nil cursor hides the badge.
-    func updateBadge(cursor: NSPoint?, detail: String) {
+    /// The controller feeds the pointer (in this view's coordinates), the
+    /// current target line and the gesture line on every tick. A nil cursor
+    /// hides the badge. The title has no default on purpose: every arm mode
+    /// must say how it resolves.
+    func updateBadge(cursor: NSPoint?,
+                     detail: String,
+                     title: String) {
         let text = inspectTargetText(detail)
-        guard cursor != badgeCursor || text != badgeDetail else { return }
+        guard cursor != badgeCursor || text != badgeDetail
+            || title != badgeTitle else { return }
         badgeCursor = cursor
         badgeDetail = text
+        badgeTitle = title
         if let cursor = cursor {
             badgeFrame = badgeFrame(cursor: cursor,
-                                    size: InspectOverlayView.badgeSize(for: text))
+                                    size: InspectOverlayView.badgeSize(for: text,
+                                                                       title: title))
         } else {
             badgeFrame = .zero
         }
@@ -2672,7 +2691,7 @@ private final class InspectOverlayView: NSView {
                                y: content.maxY - InspectModeSpec.badgeLineHeight,
                                width: content.width,
                                height: InspectModeSpec.badgeLineHeight)
-        (InspectModeSpec.titleText as NSString).draw(
+        (badgeTitle as NSString).draw(
             in: titleRect,
             withAttributes: InspectOverlayView.titleAttributes)
         let detail = badgeDetail.isEmpty ? "\u{2026}" : badgeDetail
@@ -3085,10 +3104,17 @@ private final class OverlayController {
     // point and ask about it. The hat is only an indicator while the mode is up
     // — a follower with an offset can never itself be clicked.
     private var inspectMode = false
+    /// Armed by a hat DRAG instead of a right-click: the same mode, but the
+    /// target is confirmed by the pointer's RELEASE, never by a press.
+    private var inspectReleaseToAsk = false
     private var inspectWindows: [NSPanel] = []
     private var inspectViews: [InspectOverlayView] = []
     private var inspectTickTimer: Timer?
     private var inspectTimeoutTimer: Timer?
+    /// Esc (local + global) and, while drag-armed, the release catcher. They
+    /// are installed at arm and removed at disarm so no monitor outlives the
+    /// mode.
+    private var inspectMonitors: [Any] = []
     /// Where the mode was armed: a click that never left that point tests the
     /// arming point, never a stale pre-arm read-out.
     private var inspectArmPoint: CGPoint?
@@ -4683,52 +4709,94 @@ private final class OverlayController {
                                       y: window.frame.minY - screenPoint.y)
     }
 
-    /// The press crossed `dragThreshold`: the grab is already latched.
+    /// The press crossed `dragThreshold`: the grab is already latched. The drag
+    /// arms the SAME INSPECT MODE a right-click arms, only with the release as
+    /// the confirmation, so both gestures offer one read-out and one ask field.
     private func beginLookDrag(at screenPoint: NSPoint) {
         if !claimChipDragging, let window = claimChipWindow {
             claimChipDragging = true
             claimChipDragOffset = NSPoint(x: window.frame.minX - screenPoint.x,
                                           y: window.frame.minY - screenPoint.y)
         }
-        chipJournal("look-drag-begin")
+        armInspectMode(releaseToAsk: true)
+        // The arm can refuse (an ask field already open, the chip not live, no
+        // screen): say so instead of failing silently.
+        if !inspectMode {
+            chipJournal("drag-arm-refused")
+        }
     }
 
+    /// Nothing to drag any more: INSPECT MODE owns the pointer and the hat is
+    /// hidden for the duration, so moving the window here would move something
+    /// nobody can see.
     private func moveLookDrag(to screenPoint: NSPoint) {
-        guard claimChipDragging, let window = claimChipWindow else { return }
+        guard !inspectMode, claimChipDragging, let window = claimChipWindow else {
+            return
+        }
         window.setFrameOrigin(NSPoint(x: screenPoint.x + claimChipDragOffset.x,
                                       y: screenPoint.y + claimChipDragOffset.y))
     }
 
-    /// Release: put the hat back, then hit-test the drop point and raise the
-    /// read-out. Nothing here activates the app, focuses Hermes or types.
+    /// Release: a drag-armed mode confirms HERE. The release point is handed to
+    /// the SAME resolver the click-armed mode uses (`resolveInspectClick`), so
+    /// parking, the deferred AX read and the ask field are one path. Nothing
+    /// here activates the app, focuses Hermes or types.
     private func endLookDrag(at screenPoint: NSPoint) {
         guard claimChipDragging else { return }
         claimChipDragging = false
-        chipJournal("look-drop")
-        guard let primaryHeight = primaryScreenHeight(),
-              screenPoint.x.isFinite, screenPoint.y.isFinite else {
-            positionClaimChip()
-            claimChipWindow?.orderFrontRegardless()
+        // The mode may already be gone (Esc, timeout, a lost grab): disarm put
+        // the hat back, so the release has nothing left to confirm.
+        guard inspectMode, inspectReleaseToAsk else {
+            chipJournal("drag-release:cancelled")
             return
         }
-        let point = CGPoint(x: screenPoint.x,
-                            y: primaryHeight - screenPoint.y)
-        // The hat sits exactly under the cursor at mouseUp, and `orderOut` is
-        // applied by the window server on the NEXT pass — an immediate AX
-        // hit-test therefore still answered with our own chip ("Button · Ask
-        // butler"). Park the window off-screen, let the run loop turn, then
-        // hit-test what is really underneath.
-        if let window = claimChipWindow {
+        resolveInspectRelease(at: screenPoint)
+    }
+
+    /// Park the overlays, then resolve on the next run-loop turn — exactly the
+    /// click path, triggered by a release. The local mouseUp monitor and the
+    /// chip's own mouseUp can both land here; `inspectResolving` makes the
+    /// second one a no-op.
+    private func resolveInspectRelease(at screenPoint: NSPoint) {
+        guard inspectMode, inspectReleaseToAsk, !inspectResolving,
+              !isShuttingDown else { return }
+        guard let primaryHeight = primaryScreenHeight(),
+              screenPoint.x.isFinite, screenPoint.y.isFinite else {
+            cancelInspectMode(reason: "no-point")
+            return
+        }
+        let point = CGPoint(x: screenPoint.x, y: primaryHeight - screenPoint.y)
+        inspectResolving = true
+        inspectTickTimer?.invalidate()
+        inspectTickTimer = nil
+        inspectTimeoutTimer?.invalidate()
+        inspectTimeoutTimer = nil
+        // §8: our own windows win every AX hit-test, so every overlay is parked
+        // off-screen (orderOut alone is applied by the window server on the
+        // NEXT pass) and the read happens on the next run-loop turn.
+        for window in inspectWindows {
             window.setFrameOrigin(NSPoint(x: -20000.0, y: -20000.0))
         }
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.resolveLookDrop(at: point, primaryHeight: primaryHeight, retries: 1)
+            // `resolveInspectClick` re-checks `inspectMode` first, so an Esc (or
+            // any other cancel) that lands in this one-turn gap wins and this
+            // block becomes a no-op instead of opening the field.
+            self?.resolveInspectClick(at: point, retries: 1)
         }
     }
 
-    /// Read the drop point, tolerating the window server still reporting our own
-    /// parked window for a beat. Never answers with "ButlerOverlay".
+    /// The release point when the chip's mouseUp is lost (the window is hidden
+    /// for the duration, which is exactly when AppKit drops it): the global
+    /// pointer position IS the release point at that instant.
+    private func inspectReleasedAtMouseUp() {
+        guard inspectMode, inspectReleaseToAsk, !inspectResolving else { return }
+        resolveInspectRelease(at: NSEvent.mouseLocation)
+    }
+
+    /// DEAD SINCE THE DRAG PARITY: no caller — the drag arms INSPECT MODE now,
+    /// so the read-out card is only reachable from this unreferenced resolver.
+    /// Kept (with `presentLookCard` / `lookCardFrame`) instead of deleting a
+    /// large Swift block hours before a submission; delete once the demo is over.
     private func resolveLookDrop(at point: CGPoint,
                                  primaryHeight: CGFloat,
                                  retries: Int) {
@@ -4759,6 +4827,7 @@ private final class OverlayController {
 
     /// Place the card next to the drop point, flipped/clamped so it never sits
     /// under the pointer and always stays on the screen that owns it.
+    /// DEAD SINCE THE DRAG PARITY: only `presentLookCard` calls this now.
     private func lookCardFrame(at point: CGPoint,
                                size: CGSize,
                                primaryHeight: CGFloat) -> CGRect? {
@@ -4785,6 +4854,10 @@ private final class OverlayController {
         return frame
     }
 
+    /// DEAD SINCE THE DRAG PARITY: no caller. The drag arms INSPECT MODE and
+    /// resolves through `resolveInspectClick`; the card below (and its class
+    /// near the top of this file) is kept only until the demo is over, then
+    /// deleted in one piece.
     private func presentLookCard(_ descriptor: LookDescriptor,
                                  at point: CGPoint,
                                  primaryHeight: CGFloat) {
@@ -4860,6 +4933,9 @@ private final class OverlayController {
         lookCardWindow = nil
     }
 
+    /// DEAD SINCE THE DRAG PARITY: only the unreferenced `presentLookCard` calls
+    /// this. `dismissLookCard` above stays live (the hat press and the arm
+    /// dismiss any card that might still be on screen).
     private func installLookCardMonitors() {
         let mouse: NSEvent.EventTypeMask = [.leftMouseDown,
                                             .rightMouseDown,
@@ -5250,10 +5326,12 @@ private final class OverlayController {
 
     // MARK: INSPECT MODE
 
-    /// Right-click the hat: every display gets a screen-sized click catcher, the
-    /// hat is hidden, and the badge under the pointer names the control a click
-    /// would ask about. Pointer-only: no key, no focus, no first responder.
-    private func armInspectMode() {
+    /// Right-click the hat (or drag it past the threshold, with `releaseToAsk`):
+    /// every display gets a screen-sized click catcher, the hat is hidden, and
+    /// the badge under the pointer names the control a click/release would ask
+    /// about. Pointer-only: no focus, no first responder. The only key this mode
+    /// ever reads is Esc, through the two monitors installed below.
+    private func armInspectMode(releaseToAsk: Bool = false) {
         // Never behind an open ask field: the field and the overlays would both
         // want the pointer, and every door into the field disarms the mode.
         guard !inspectMode, !summonFieldOpen, !isShuttingDown,
@@ -5262,6 +5340,7 @@ private final class OverlayController {
         // Another of our windows on screen would sit in the read path.
         dismissLookCard()
         inspectMode = true
+        inspectReleaseToAsk = releaseToAsk
         inspectResolving = false
         inspectArmPoint = cursorQuartzPoint()
         inspectLastTestedPoint = nil
@@ -5270,7 +5349,14 @@ private final class OverlayController {
         // The hat is an indicator only while the mode is up; the overlay owns
         // the pointer. Hidden, not torn down: disarm puts it back on the pet.
         claimChipWindow?.orderOut(nil)
-        chipJournal("inspect-arm")
+        // A drag is already in flight from the press that armed the mode, so the
+        // release catcher must exist before the overlays do.
+        installInspectMonitors(releaseToAsk: releaseToAsk)
+        if releaseToAsk {
+            chipJournal("drag-arm")
+        } else {
+            chipJournal("inspect-arm")
+        }
         raiseInspectOverlays()
         // No screen means no click catcher and no way to leave the mode except
         // the timeout: do not arm at all.
@@ -5343,6 +5429,59 @@ private final class OverlayController {
         inspectTimeoutTimer = timeout
     }
 
+    /// Esc cancels in every LOOK path, so the mode installs a local AND a global
+    /// key monitor at arm. Only keyCode 53 is read; every other key is passed
+    /// through untouched, so the app underneath keeps its keyboard. The look
+    /// card proves a global monitor works here: the companion already holds
+    /// Accessibility trust, so this needs no new or wider privacy grant.
+    ///
+    /// A drag-armed mode additionally watches this app's own mouseUp. The chip
+    /// window is hidden while the mode is up, and AppKit drops a mouseUp whose
+    /// window was ordered out mid-gesture — which would pin the mode until the
+    /// timeout and lose the release the user aimed.
+    private func installInspectMonitors(releaseToAsk: Bool) {
+        let escape: UInt16 = 53
+        if let localKey = NSEvent.addLocalMonitorForEvents(matching: .keyDown,
+                                                           handler: { [weak self] event in
+            guard event.keyCode == escape else { return event }
+            // Swallow it ONLY when this mode consumed it: cancelling must not
+            // also cancel something in the app the user was working in, and a
+            // monitor that outlived the mode must never eat Esc blindly.
+            return (self?.escapeInspectMode() ?? false) ? nil : event
+        }) {
+            inspectMonitors.append(localKey)
+        }
+        if let globalKey = NSEvent.addGlobalMonitorForEvents(matching: .keyDown,
+                                                             handler: { [weak self] event in
+            if event.keyCode == escape {
+                self?.escapeInspectMode()
+            }
+        }) {
+            inspectMonitors.append(globalKey)
+        }
+        guard releaseToAsk else { return }
+        if let localUp = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp,
+                                                          handler: { [weak self] event in
+            // Observed, not swallowed: the chip's own mouseUp still has to
+            // clear its press latch after the mode has resolved.
+            self?.inspectReleasedAtMouseUp()
+            return event
+        }) {
+            inspectMonitors.append(localUp)
+        }
+    }
+
+    /// One Esc path for both arm modes: journal the hop, then leave the mode
+    /// (which puts the hat back on the pet). Returns whether it actually
+    /// cancelled, so the monitor only swallows an Esc this mode consumed.
+    @discardableResult
+    private func escapeInspectMode() -> Bool {
+        guard inspectMode else { return false }
+        chipJournal("inspect-escape")
+        cancelInspectMode(reason: "escape")
+        return true
+    }
+
     /// Right-click, a badge click, the ask opening or teardown all land here, so
     /// no timer or overlay outlives the mode. A cancel is a mode exit, hence the
     /// hat returning to the pet.
@@ -5362,10 +5501,17 @@ private final class OverlayController {
         guard inspectMode else { return }
         inspectMode = false
         inspectResolving = false
+        inspectReleaseToAsk = false
         inspectTickTimer?.invalidate()
         inspectTickTimer = nil
         inspectTimeoutTimer?.invalidate()
         inspectTimeoutTimer = nil
+        // The Esc monitors (and, for a drag arm, the release catcher) live only
+        // as long as the mode: remove every one before the overlays go.
+        for monitor in inspectMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        inspectMonitors.removeAll()
         for window in inspectWindows {
             window.orderOut(nil)
             window.close()
@@ -5380,6 +5526,10 @@ private final class OverlayController {
         inspectLastTestedPoint = nil
         inspectBadgeDetail = ""
         chipJournal("inspect-disarm")
+        // The chip was hidden for the whole mode, so a mouseUp that never
+        // reached it must not leave the press latch or the 👀 draw behind.
+        claimChipDragging = false
+        claimChipView?.cancelPendingPress()
         // The hat returns to the pet.
         positionClaimChip()
         claimChipWindow?.orderFrontRegardless()
@@ -5427,15 +5577,21 @@ private final class OverlayController {
 
     /// Feed each overlay view the pointer in ITS coordinates. Only the display
     /// under the pointer carries the badge: a pill clamped onto another screen
-    /// would be a ghost.
+    /// would be a ghost. The gesture line is honest about how this arm resolves.
     private func updateInspectBadges(cursor: NSPoint) {
+        let title = inspectReleaseToAsk ? InspectModeSpec.releaseTitle
+                                        : InspectModeSpec.clickTitle
         for view in inspectViews {
             guard let window = view.window else { continue }
             let local = view.convert(window.convertPoint(fromScreen: cursor), from: nil)
             if view.bounds.contains(local) {
-                view.updateBadge(cursor: local, detail: inspectBadgeDetail)
+                view.updateBadge(cursor: local,
+                                 detail: inspectBadgeDetail,
+                                 title: title)
             } else {
-                view.updateBadge(cursor: nil, detail: inspectBadgeDetail)
+                view.updateBadge(cursor: nil,
+                                 detail: inspectBadgeDetail,
+                                 title: title)
             }
         }
     }
@@ -5494,9 +5650,12 @@ private final class OverlayController {
 
     /// Left click on the overlay. The click is captured on purpose: at this
     /// point the topmost window is OUR overlay, so the control under it never
-    /// fires and the question becomes "what did I just click?".
+    /// fires and the question becomes "what did I just click?". A drag-armed
+    /// mode confirms on RELEASE instead: a press here is the tail of the drag
+    /// that armed it, so it must not resolve early.
     private func inspectClicked(at screenPoint: NSPoint) {
-        guard inspectMode, !inspectResolving, !isShuttingDown else { return }
+        guard inspectMode, !inspectResolving, !isShuttingDown,
+              !inspectReleaseToAsk else { return }
         guard let primaryHeight = primaryScreenHeight(),
               screenPoint.x.isFinite, screenPoint.y.isFinite else {
             cancelInspectMode(reason: "no-point")
@@ -5556,7 +5715,13 @@ private final class OverlayController {
             cancelInspectMode(reason: "self-after-fallback")
             return
         }
-        chipJournal("inspect-click:" + (descriptor.role ?? "?"))
+        // The journal names the confirmation the user actually made: a release
+        // for a drag arm, a click for a right-click arm.
+        if inspectReleaseToAsk {
+            chipJournal("drag-release:" + (descriptor.role ?? "?"))
+        } else {
+            chipJournal("inspect-click:" + (descriptor.role ?? "?"))
+        }
         let target = LookTarget(app: descriptor.app,
                                 role: descriptor.role,
                                 label: descriptor.label,
