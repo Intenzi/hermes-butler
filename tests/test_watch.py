@@ -401,7 +401,11 @@ def test_a_stopped_watch_keeps_the_reason_visible(
     lines = engine.watch_status().splitlines()
 
     assert lines[-1] == "stopped: app-quit"
-    assert _state(tmp_path)["watch"]["stopped"]["reason"] == "app-quit"
+    stopped = _state(tmp_path)["watch"]["stopped"]
+    assert stopped["reason"] == "app-quit"
+    # The desktop dedupes its one "Watch ended" line on (app, at, reason), so a
+    # stop line without a timestamp would collapse two endings of the same app.
+    assert isinstance(stopped["at"], float)
 
 
 # -------------------------------------------------------------- stop_watch

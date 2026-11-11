@@ -112,6 +112,49 @@ hermes butler status
 hermes butler doctor [--ask]
 ```
 
+## LOOK
+
+LOOK answers a question about one control on the screen.
+
+Right-click the hat badge beside the popped-out pet (or drag it). The screen
+dims, the cursor becomes a crosshair, and a badge follows the pointer with the
+live target under it. Click or release to ask about that control; `Esc` and
+right-click cancel. While the picker is on, clicks do not reach your apps: the
+overlay takes the click, which is what makes a picker safe to aim with.
+
+LOOK needs the pet **popped out** into its own window: the hat badge lives
+beside the popped-out pet. With the pet inside the Hermes window, clicking the
+pet opens the ask field instead.
+
+The ask field opens carrying what the companion read from the Accessibility
+layer: **App**, **Window**, and the control — role, label, enabled state, and
+box. The question becomes a real agent turn; the pet speaks the answer in one
+line (`butler_say`) and the chat keeps the full explanation.
+
+## WATCH
+
+WATCH tells you when something appears or finishes in an app you already have
+open. It is passive: the companion reads the Accessibility tree only — no
+screenshots, no OCR, no new macOS permission.
+
+```
+butler_watch_start({"app": "Finder", "until": "invoice"})
+butler_watch_status
+butler_watch_stop
+```
+
+`until` is the text to announce: the watch says so once when a label, title, or
+value in that app contains it. One watch runs at a time; starting a second
+replaces the first. On a hit the pet says `<app>: <label> appeared`, and while
+the watch is live the pet carries the change count. The `/butler` pane shows
+the watch row — `⏲ Watching <app> · <N> changes · <mm:ss>` — with a **Stop**
+button.
+
+Three prompt frames reach the agent: `[butler summon]` for a guidance request,
+`[butler look]` for a LOOK question, and `[butler watch]` for monitoring. A
+typed `watch <app> for …` routes to the watch frame, the same way the menu
+prefill does.
+
 ## What is verified, and how
 
 Each step's arrival is read back from the OS before the guide advances: an
@@ -234,22 +277,10 @@ directories are the whole runtime footprint.
 - OCR requires the Screen Recording grant; without it, gated content that AX
   cannot see stays unverifiable.
 
-## Screenshots
-
-**The pet hat badge.** The 26x24 badge at the pet's upper right.
-
-![The pet hat badge beside the popped-out pet](docs/img/hat.png)
-
-**A running guide.** A ring on the real control and the one-line bubble.
-
-![A guide ringing a control](docs/img/ring.png)
-
-**The sidebar checklist.** Live step progress in the `/butler` pane.
-
-![The sidebar checklist](docs/img/panel.png)
+Screenshots land in `docs/img` before publishing.
 
 ## Tests
 
-- Python: `python -m pytest -q` — 104 tests.
-- Desktop half: `npm test` — 38 tests (Node's built-in test runner,
+- Python: `python -m pytest -q` — 214 tests.
+- Desktop half: `npm test` — 63 tests (Node's built-in test runner,
   `tests/desktop_plugin.test.mjs`).

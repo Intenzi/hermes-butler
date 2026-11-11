@@ -216,6 +216,50 @@ def test_state_and_guides_read_the_same_plugin_data_dir(
     assert client.get("/state").json() == state
 
 
+def test_watch_stop_endpoint_stops_the_watch_and_clears_the_row(
+        client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pane's Stop button posts here; it must reach engine.stop_watch()."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    engine.init(bp_paths.plugin_data_dir("butler"))
+
+    class FakeOverlay:
+        sends = []
+
+        def is_running(self):
+            return False
+
+    monkeypatch.setattr(engine, "_OVERLAY", FakeOverlay())
+    engine._watch = {
+        "app": "Slack", "until": None, "token": "tok-1",
+        "owner_pid": os.getpid(), "started_at": time.time(),
+        "events": 3, "hit": None, "stopped": None, "recent": [],
+    }
+    engine._write_state()
+    assert client.get("/state").json()["watch"]["app"] == "Slack"
+
+    response = client.post("/watch/stop")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["status"] == "stopped"
+    assert body["app"] == "Slack"
+    assert body["events"] == 3
+    # The row is cleared from the same state file the pane polls.
+    assert "watch" not in client.get("/state").json()
+
+
+def test_watch_stop_endpoint_is_honest_when_no_watch_exists(
+        client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    engine.init(bp_paths.plugin_data_dir("butler"))
+
+    response = client.post("/watch/stop")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "status": "idle"}
+
+
 def test_summon_pet_is_a_noop_without_a_petdex_pet(
         client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     (Path(os.environ["HERMES_HOME"]) / "pets").mkdir()

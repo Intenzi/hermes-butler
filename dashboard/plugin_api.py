@@ -3,6 +3,7 @@
 ``GET /state`` — the live guide state the desktop pane renders.
 ``GET /history`` — finished guide rows, newest first (cap 50).
 ``POST /summon/send`` — inject a framed butler turn into a selected session.
+``POST /watch/stop`` — stop the live watch and clear its pane row.
 ``GET /health`` — mount probe.
 """
 from __future__ import annotations
@@ -656,6 +657,25 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "reason": "injection_denied",
                 "detail": f"gateway refused session_key {route}"}
     return {"ok": True, "session": session_id, "session_key": route}
+
+
+@router.post("/watch/stop")
+def watch_stop() -> dict[str, Any]:
+    """Stop the live watch and clear its state row (the pane's Stop button).
+
+    Delegates to the same ``engine.stop_watch()`` the ``butler_watch_stop`` tool
+    calls, so the button and the tool cannot drift. ``ok`` means the request was
+    answered; the engine's own ``status`` says what happened (``stopped``,
+    ``cleared``, ``idle``, or ``elsewhere`` when another live plugin process
+    owns the watch). Never raises: a missing companion is reported, not 500'd.
+    """
+    try:
+        stopped = _engine_module().stop_watch()
+    except Exception:
+        logger.exception("butler watch stop failed")
+        return {"ok": False, "detail": "engine unavailable"}
+    payload = stopped if isinstance(stopped, dict) else {}
+    return {"ok": True, **payload}
 
 
 @router.get("/health")

@@ -19,22 +19,18 @@ provides_tools:
   - butler_watch_stop
 provides_hooks: []
 config_schema:
-  guide_poll_seconds:
+  poll_seconds:
     type: number
     default: 1.5
-    description: How often the butler re-captures the screen while waiting on a step.
-  guide_step_timeout_seconds:
+    description: How often the guide re-captures the screen while waiting on a step; read from plugin-data/butler/config.json.
+  step_timeout_seconds:
     type: number
     default: 120
-    description: How long a step stays open before the butler reports a stall.
-  overlay_enabled:
-    type: boolean
-    default: true
-    description: Spawn the click-through companion overlay for rings outside the Hermes window.
-  ocr_fallback_enabled:
-    type: boolean
-    default: true
-    description: Use on-device Apple Vision OCR when the AX tree is empty (Chromium tabs, canvas apps).
+    description: How long a step stays open before the butler reports a stall; read from plugin-data/butler/config.json.
+  stall_auto_stop_seconds:
+    type: number
+    default: 180
+    description: How long a stalled guide may sit before it stops itself; read from plugin-data/butler/config.json.
 python_dependencies:
   - "pyobjc-core>=10.3,<12"
   - "pyobjc>=10.3,<12; platform_system=='Darwin'"

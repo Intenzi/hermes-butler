@@ -46,25 +46,33 @@ GUIDE_START_SCHEMA = {
             "description": "Ordered steps to walk on the user's screen.",
             "items": {
                 "type": "object",
-                "required": ["say", "find"],
+                "description": (
+                    "One flat step: `say` plus `find` / `expect`. Exactly one "
+                    "find/expect key is required for a step to be verifiable."
+                ),
+                "required": ["say"],
                 "properties": {
                     "say": {"type": "string", "description": "One-line bubble text for this step."},
                     "find": {
                         "type": "object",
-                        "description": "How to locate the target control: label substring (required), optional role.",
+                        "description": (
+                            "How to locate the target control: optional label substring, "
+                            "optional role. An empty object is a hands-off step (no ring, no label)."
+                        ),
                         "properties": {
                             "label": {"type": "string"},
                             "role": {"type": "string"},
                         },
-                        "required": ["label"],
                     },
                     "expect": {
                         "type": "object",
-                        "description": "Observable change that marks the step done: app focused ('app'), element now visible ('visible'), or element focused ('focus').",
+                        "description": "Observable change that marks the step done: app focused ('app'), element now visible ('visible'), element focused ('focus'), frontmost window title ('window'), or app frontmost ('app_frontmost').",
                         "properties": {
                             "app": {"type": "string"},
                             "visible": {"type": "string"},
                             "focus": {"type": "string"},
+                            "window": {"type": "string"},
+                            "app_frontmost": {"type": "string"},
                         },
                     },
                 },

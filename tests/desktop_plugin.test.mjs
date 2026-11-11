@@ -25,7 +25,8 @@ const INTERNALS = [
   'openFreshButlerSession', 'openButlerSession', 'createButlerSession', 'listButlerSessions',
   'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey', 'dismissSummonBar',
   'startSummonPendingPolling', 'pollSummonPending',
-  'petSpeechBeat', 'speakButlerAnswer', 'petStatusLine', 'watchStatusLine'
+  'petSpeechBeat', 'speakButlerAnswer', 'petStatusLine', 'watchStatusLine',
+  'watchIsActive', 'watchEndedLine', 'watchPaneText', 'WatchRow', 'stopWatch'
 ]
 
 function makeDocument({
@@ -2111,4 +2112,167 @@ test('pet speech runs from module scope, not only while the pane is open', () =>
   assert.match(src, /function speechSnapshot\(data\)/)
   // The poller must speak the answer row, not just the guide status line.
   assert.match(src, /petSpeechBeat\(speechSnapshot\(data\)\)/)
+})
+
+// --- WATCH leaves a persistent mark: pane row, ended line, keep-alive ---
+
+function descendants(node) {
+  if (!node || typeof node !== 'object') return []
+  const children = node.props ? node.props.children : null
+  const list = Array.isArray(children)
+    ? children
+    : (children === undefined || children === null ? [] : [children])
+  return [node, ...list.flatMap(descendants)]
+}
+
+function buttonByText(tree, text) {
+  return descendants(tree).find(node => node.type === 'button'
+    && node.props && node.props.children === text)
+}
+
+test('a live watch renders one pane row with app, changes, and a Stop button', async () => {
+  const calls = []
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async (requestPath, options) => {
+      calls.push({ path: requestPath, method: options && options.method })
+      return { ok: true, status: 'stopped' }
+    },
+    document: makeDocument()
+  })
+  const started = 1_800_000_000
+  const watch = { app: 'Finder', events: 2, started_at: started }
+
+  assert.equal(env.api.watchIsActive(watch), true)
+  assert.equal(env.api.watchIsActive({ ...watch, stopped: { reason: 'app-quit' } }), false)
+  assert.equal(env.api.watchPaneText(watch, (started + 65) * 1000),
+    '⏲ Watching Finder · 2 changes · 01:05')
+  assert.equal(env.api.watchPaneText({ app: 'Finder', events: 0 }, started * 1000),
+    '⏲ Watching Finder · 0 changes · 00:00')
+
+  const row = env.api.WatchRow({ watch })
+  const rendered = JSON.stringify(row)
+  assert.match(rendered, /Watching Finder/)
+  assert.match(rendered, /2 changes/)
+  assert.match(rendered, /\d\d:\d\d/)
+  const stop = buttonByText(row, 'Stop')
+  assert.ok(stop, 'the row carries a Stop button')
+  // A stopped row is an ending, not a live row: it must not render.
+  assert.equal(env.api.WatchRow({ watch: { ...watch, stopped: { reason: 'app-quit' } } }), null)
+
+  stop.props.onClick()
+  await Promise.resolve()
+  assert.deepEqual(calls.at(-1), { path: '/watch/stop', method: 'POST' })
+  env.dispose()
+})
+
+test('a stopped watch speaks "Watch ended" once, then the row clears', async () => {
+  const said = []
+  const calls = []
+  const pet = {
+    say(text, options) { said.push({ text, options }) },
+    clear() {}
+  }
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async (requestPath, options) => {
+      calls.push({ path: requestPath, method: options && options.method })
+      return requestPath === '/watch/stop' ? { ok: true, status: 'stopped' } : {}
+    },
+    document: makeDocument(),
+    pet
+  })
+  const stopped = {
+    app: 'Finder', events: 4, stopped: { reason: 'app-quit', at: 2000 }
+  }
+
+  assert.equal(env.api.watchEndedLine(stopped), 'Watch ended — the app quit')
+  assert.equal(env.api.petSpeechBeat({ watch: stopped }, 1000), 'watch-ended')
+  assert.deepEqual(said.map(row => row.text), ['Watch ended — the app quit'])
+  assert.equal(said[0].options.id, 'butler-watch-ended')
+  assert.ok(calls.some(call => call.path === '/watch/stop' && call.method === 'POST'),
+    'the dead row is cleared through the same endpoint the Stop button uses')
+
+  // Exactly once: the row may linger for a poll, the line does not repeat.
+  assert.equal(env.api.petSpeechBeat({ watch: stopped }, 3000), 'idle')
+  assert.equal(said.length, 1)
+
+  // A different ending is its own line.
+  assert.equal(env.api.petSpeechBeat({
+    watch: { app: 'Finder', events: 1, stopped: { reason: 'stopped', at: 4000 } }
+  }, 5000), 'watch-ended')
+  assert.equal(said.at(-1).text, 'Watch ended — stopped')
+  env.dispose()
+})
+
+test('a throwing pet say retries the ended line instead of losing it', async () => {
+  const said = []
+  const calls = []
+  let throwOnce = true
+  const pet = {
+    say(text, options) {
+      if (throwOnce) {
+        throwOnce = false
+        throw new Error('pet muted')
+      }
+      said.push({ text, options })
+    },
+    clear() {}
+  }
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async (requestPath, options) => {
+      calls.push({ path: requestPath, method: options && options.method })
+      return { ok: true, status: 'stopped' }
+    },
+    document: makeDocument(),
+    pet
+  })
+  const stopped = {
+    app: 'Finder', events: 2, stopped: { reason: 'app-quit', at: 2000 }
+  }
+
+  // The say threw, so the line did not go out and the dedupe key is not burned.
+  assert.equal(env.api.petSpeechBeat({ watch: stopped }, 1000), 'idle')
+  assert.equal(said.length, 0)
+  assert.ok(!calls.some(call => call.path === '/watch/stop'))
+
+  assert.equal(env.api.petSpeechBeat({ watch: stopped }, 3000), 'watch-ended')
+  assert.deepEqual(said.map(row => row.text), ['Watch ended — the app quit'])
+  assert.ok(calls.some(call => call.path === '/watch/stop' && call.method === 'POST'))
+  env.dispose()
+})
+
+test('a live watch is re-said every 25 s on the existing speech beat', async () => {
+  const said = []
+  const pet = {
+    say(text, options) { said.push({ text, options }) },
+    clear() {}
+  }
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument(), pet
+  })
+  const watch = { app: 'Finder', events: 2, started_at: 1_800_000_000 }
+  const cur = { watch }
+
+  assert.equal(env.api.petSpeechBeat(cur, 1000), 'status')
+  assert.equal(said[0].text, '⏲ Watch · Finder · 2 changes')
+  // The host clamps a ttl to 30 s: the watch line asks for the clamp so the
+  // 25 s re-say lands before the previous one expires.
+  assert.equal(said[0].options.ttlMs, 30000)
+
+  assert.equal(env.api.petSpeechBeat(cur, 24999), 'repeat')
+  assert.equal(said.length, 1)
+  assert.equal(env.api.petSpeechBeat(cur, 26000), 'status')
+  assert.equal(said.length, 2)
+  assert.equal(said[1].text, said[0].text)
+
+  // Only the ambient watch line gets the keep-alive: a guide instruction is
+  // carried by the ring and the pane, and still speaks once.
+  const guide = { status: 'running', instruction: 'Click Export', watch }
+  assert.equal(env.api.petSpeechBeat(guide, 80000), 'status')
+  assert.equal(said.at(-1).text, 'Click Export')
+  assert.equal(env.api.petSpeechBeat(guide, 106000), 'repeat')
+  assert.equal(said.length, 3)
+  env.dispose()
 })

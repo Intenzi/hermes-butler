@@ -49,6 +49,14 @@ const CONFIG_REFRESH_MS = 5000
 // "pet" form is what the core emits when the pet has no displayName.
 const PET_CANVAS_SELECTORS = ['canvas[aria-label$=" pet"]', 'canvas[aria-label="pet"]']
 const PET_STATUS_REFRESH_MS = 2000
+// The host clamps a pet line's ttl to 30 s, so an ambient watch re-says its
+// count every 25 s: the pet must never look idle for half a minute while it is
+// the only surface a background watch has.
+const WATCH_KEEPALIVE_MS = 25000
+const WATCH_TTL_MS = 30000
+// A watch that ended (the app quit, the user stopped it) gets one line, long
+// enough to read once, then the pane row is gone.
+const WATCH_ENDED_TTL_MS = 9000
 // The click-flash is a confirmation, not a readout: keep it brief.
 const SUMMON_FLASH_MS = 1500
 // A fresh session frees the shared display title by renaming the prior chat.
@@ -79,6 +87,11 @@ let lastSaid = null
 // the status line stays quiet for the ttl, then resumes on its own.
 let lastSpokenSayId = null
 let answerUntil = 0
+// When the shared status line last actually spoke, and the last ended-watch
+// announcement. Both are module scope: the module speech beat and the pane's
+// beat must not double-speak a kept-alive watch or a "Watch ended" line.
+let lastSaidAt = 0
+let lastWatchEndedKey = null
 let launcherBusy = false
 let launcherTargetId = null
 // Runtime/stored aliases learned from session.list or an open-session result.
@@ -2007,7 +2020,8 @@ function petStatusLine(cur) {
  * WATCH is passive and runs while the user is in another app, so its only
  * surface is the shared pet speech beat: the change count while observing, and
  * the hit label once the condition fired. No new window and no new channel.
- * A stopped watch (app quit) drops the line; the state row keeps the details.
+ * A stopped watch (app quit, or the user pressed Stop) drops the live line;
+ * `watchEndedLine` then says the one ending line and the pane row clears.
  */
 function watchStatusLine(watch) {
   const row = watch && typeof watch === 'object' ? watch : null
@@ -2022,6 +2036,122 @@ function watchStatusLine(watch) {
   if (!app) return null
   const changes = asNumber(row.events)
   return `⏲ Watch · ${app} · ${changes} ${changes === 1 ? 'change' : 'changes'}`
+}
+
+/** True while `watch` is a LIVE row: an app, and no `stopped` marker. */
+function watchIsActive(watch) {
+  const row = watch && typeof watch === 'object' ? watch : null
+  if (!row) return false
+  // `stopped` is an object in the state row ({"reason","events","at"}), never a
+  // string; test its truthiness either way.
+  if (row.stopped) return false
+  return Boolean(asText(row.app))
+}
+
+/** One line for a watch that ended: `app-quit` reads as "the app quit". */
+function watchEndedLine(watch) {
+  const row = watch && typeof watch === 'object' ? watch : null
+  const stopped = row && row.stopped && typeof row.stopped === 'object' ? row.stopped : null
+  if (!stopped) return null
+  const reason = asText(stopped.reason) || 'stopped'
+  return `Watch ended — ${reason === 'app-quit' ? 'the app quit' : reason}`
+}
+
+/** `mm:ss` since the watch was armed; `00:00` when the start time is unreadable. */
+function watchElapsedLabel(watch, now = Date.now()) {
+  const started = timestampValue(watch && (watch.started_at ?? watch.since))
+  const seconds = started > 0 ? Math.max(0, Math.floor(now / 1000 - started)) : 0
+  const mm = String(Math.floor(seconds / 60)).padStart(2, '0')
+  const ss = String(seconds % 60).padStart(2, '0')
+  return `${mm}:${ss}`
+}
+
+/** The pane's watch row text: app, change count, elapsed time. */
+function watchPaneText(watch, now = Date.now()) {
+  const app = asText(watch && watch.app) || '?'
+  const changes = asNumber(watch && watch.events)
+  return `⏲ Watching ${app} · ${changes} changes · ${watchElapsedLabel(watch, now)}`
+}
+
+/** The pane's Stop button path: the same REST door every other action uses. */
+function stopWatch() {
+  if (typeof rest !== 'function') return Promise.resolve(false)
+  try {
+    const pending = rest('/watch/stop', { method: 'POST' })
+    if (pending && typeof pending.catch === 'function') {
+      return pending.then(result => Boolean(result && result.ok)).catch(() => false)
+    }
+  } catch (err) {
+    return Promise.resolve(false)
+  }
+  return Promise.resolve(false)
+}
+
+/**
+ * The one persistent mark a watch leaves in the pane: a row with the app, the
+ * change count, elapsed time, and a Stop button. Rendered only while the state
+ * carries a live watch row; a stopped one is an ending, not a status.
+ */
+function WatchRow({ watch }) {
+  const live = watchIsActive(watch) ? watch : null
+  if (!live) return null
+  return h('div', {
+    role: 'status',
+    style: {
+      display: 'flex', alignItems: 'center', gap: 8, alignSelf: 'flex-start',
+      fontSize: 11.5, lineHeight: 1.4, padding: '3px 8px', borderRadius: 8,
+      color: '#c7cbd2', background: 'rgba(255,255,255,.03)',
+      border: '1px solid rgba(255,255,255,.09)'
+    }
+  },
+    h('span', {}, watchPaneText(live)),
+    h('button', {
+      type: 'button',
+      onClick: () => { stopWatch() },
+      style: {
+        cursor: 'pointer', fontSize: 10.5, color: '#9aa3ea',
+        background: 'transparent', border: '1px solid rgba(122,134,255,.35)',
+        borderRadius: 6, padding: '1px 8px'
+      }
+    }, 'Stop')
+  )
+}
+
+/**
+ * Say ONE "Watch ended — <reason>" line per ended watch, then clear the row.
+ *
+ * Deduped by the state's own identity (app + stopped.at + reason) at module
+ * scope, so the pane's beat and the module beat cannot double-speak it. The row
+ * is cleared through the same `/watch/stop` door the pane's Stop button uses;
+ * the pane already hides a stopped row, so the two agree.
+ * Returns true only when this call spoke.
+ */
+function announceWatchEnded(cur) {
+  const watch = cur && cur.watch && typeof cur.watch === 'object' ? cur.watch : null
+  const line = watchEndedLine(watch)
+  if (!line) return false
+  const stopped = watch.stopped
+  const key = `${asText(watch.app) || ''}|${asText(stopped.at) || ''}|${asText(stopped.reason) || ''}`
+  if (key === lastWatchEndedKey) return false
+  // Mark the ending as spoken only once the line actually went out. A say that
+  // throws must not burn the dedupe key: the next beat retries the one line
+  // instead of losing it forever. A host with no pet channel burns the key on
+  // purpose: there is nothing to speak the line with, and retrying every 2 s
+  // would never change that.
+  if (petCtx && typeof petCtx.say === 'function') {
+    try {
+      petCtx.say(line, { tone: 'info', ttlMs: WATCH_ENDED_TTL_MS, id: 'butler-watch-ended' })
+    } catch (err) {
+      return false
+    }
+  }
+  lastWatchEndedKey = key
+  petSayTicks += 1
+  petLastTick = new Date().toLocaleTimeString()
+  lastSaid = null
+  lastSaidAt = 0
+  stopWatch()
+  return true
 }
 
 /**
@@ -2051,11 +2181,13 @@ function speakButlerAnswer(say) {
 
 /**
  * One pet-speech beat on the 2 s clock. Returns which line won: `answer`,
- * `holding` (the answer is still within its ttl), `status`, `repeat`, or `idle`.
+ * `holding` (the answer is still within its ttl), `watch-ended`, `status`,
+ * `repeat`, or `idle`.
  *
  * A spoken answer resets `lastSaid`, so the status line speaks again (instead of
  * being deduped away) once the answer's ttl lapses. One channel, last call wins,
- * no queueing.
+ * no queueing. A live watch line is re-said every WATCH_KEEPALIVE_MS; every
+ * other status line still speaks once.
  */
 /**
  * The slice of /state the pet speech beat needs, built the same way the pane
@@ -2119,20 +2251,33 @@ function petSpeechBeat(cur, now = Date.now()) {
     return 'answer'
   }
   if (now < answerUntil) return 'holding'
+  if (announceWatchEnded(cur)) return 'watch-ended'
   const line = petStatusLine(cur)
   if (!line) {
     try { petCtx && petCtx.clear && petCtx.clear('butler-say') } catch (err) { }
     lastSaid = null
     return 'idle'
   }
-  if (lastSaid === line) return 'repeat'
+  // Is this line the ambient watch count? Only then does it get a keep-alive;
+  // every other status line still speaks once (a guide instruction is already
+  // carried by the ring and the pane).
+  const watching = watchIsActive(cur && cur.watch) && !asText(cur && cur.instruction)
+    ? watchStatusLine(cur.watch) : null
+  if (lastSaid === line) {
+    const due = watching && line === watching && now - lastSaidAt >= WATCH_KEEPALIVE_MS
+    if (!due) return 'repeat'
+  }
+  // The host clamps a ttl to 30 s: the watch line asks for the clamp so the
+  // 25 s re-say lands before the previous line expires.
+  const ttlMs = watching && line === watching ? WATCH_TTL_MS : 9000
   try {
     petCtx && typeof petCtx.say === 'function'
-      && petCtx.say(line, { tone: 'info', ttlMs: 9000, id: 'butler-say' })
+      && petCtx.say(line, { tone: 'info', ttlMs, id: 'butler-say' })
   } catch (err) { }
   petSayTicks += 1
   petLastTick = new Date().toLocaleTimeString()
   lastSaid = line
+  lastSaidAt = now
   return 'status'
 }
 
@@ -2182,6 +2327,9 @@ function ButlerApp() {
   const watch = rawWatch && typeof rawWatch === 'object' && Object.keys(rawWatch).length > 0
     ? rawWatch
     : null
+  // A stopped watch is an ending, not a live row: the speech beat says its one
+  // line and stops it, and the pane drops the row immediately.
+  const liveWatch = watchIsActive(watch) ? watch : null
   const stateRef = useRef({ status: null, note: null, instruction: null, currentStep: 0, total: 0, verified: 0, say: null, watch: null })
   stateRef.current = {
     status,
@@ -2247,6 +2395,8 @@ function ButlerApp() {
     ),
 
     h(ButlerChipStatus, {}),
+
+    liveWatch && h(WatchRow, { watch: liveWatch }),
 
     error && h('div', {
       style: { fontSize: 12, color: '#f08080', border: '1px solid rgba(240,128,128,.3)', borderRadius: 10, padding: '9px 12px' }
