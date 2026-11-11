@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,19 +96,34 @@ def test_build_if_needed_recompiles_stale_binary(tmp_path: Path, monkeypatch) ->
     os.utime(binary, (1_000, 1_000))
     os.utime(source, (2_000, 2_000))
 
+    # Staleness is a source-hash question now: a sidecar recording a different
+    # hash is what schedules the rebuild.
+    buildinfo = tmp_path / ".buildinfo"
+    buildinfo.write_text(json.dumps({
+        "source_sha256": "0" * 64, "archs": ["arm64"], "built_at": 1,
+    }), encoding="utf-8")
+
     calls = []
 
     def fake_run(args, **kwargs):
         calls.append((args, kwargs))
+        # build_if_needed compiles to a staged path and renames it over the
+        # real binary only when swiftc succeeds.
+        Path(args[3]).write_bytes(b"rebuilt")
+        Path(args[3]).chmod(0o755)
 
     monkeypatch.setattr(overlay, "binary_path", lambda: str(binary))
     monkeypatch.setattr(overlay, "binary_source_path", lambda: str(source))
-    monkeypatch.setattr(overlay.shutil, "which", lambda name: "/usr/bin/swiftc")
+    monkeypatch.setattr(overlay, "buildinfo_path", lambda: str(buildinfo))
+    monkeypatch.setattr(overlay, "shutil", types.SimpleNamespace(
+        which=lambda name: "/usr/bin/swiftc"))
     monkeypatch.setattr(overlay.subprocess, "run", fake_run)
+    monkeypatch.setattr(overlay, "_write_buildinfo_best_effort", lambda *a, **k: None)
 
     assert overlay.build_if_needed() == (True, "compiled")
     assert len(calls) == 1
-    assert calls[0][0] == ["swiftc", "-O", "-o", str(binary), str(source)]
+    assert calls[0][0] == ["swiftc", "-O", "-o", str(binary) + ".new", str(source)]
+    assert binary.read_bytes() == b"rebuilt"
 
 
 def test_build_if_needed_skips_fresh_binary(tmp_path: Path, monkeypatch) -> None:
@@ -116,14 +132,24 @@ def test_build_if_needed_skips_fresh_binary(tmp_path: Path, monkeypatch) -> None
     binary.write_bytes(b"new")
     binary.chmod(0o755)
     source.write_text("// old source", encoding="utf-8")
+    # The source mtime is NEWER than the binary's: that is exactly the fresh
+    # checkout case, and the matching content hash must still win.
     os.utime(source, (1_000, 1_000))
     os.utime(binary, (2_000, 2_000))
 
+    buildinfo = tmp_path / ".buildinfo"
+    buildinfo.write_text(json.dumps({
+        "source_sha256": overlay.source_sha256(str(source)),
+        "archs": ["arm64", "x86_64"],
+        "built_at": 1,
+    }), encoding="utf-8")
+
     def fail_run(*args, **kwargs):
-        raise AssertionError("fresh binary must not compile")
+        raise AssertionError("matching source hash must not compile")
 
     monkeypatch.setattr(overlay, "binary_path", lambda: str(binary))
     monkeypatch.setattr(overlay, "binary_source_path", lambda: str(source))
+    monkeypatch.setattr(overlay, "buildinfo_path", lambda: str(buildinfo))
     monkeypatch.setattr(overlay.subprocess, "run", fail_run)
 
     assert overlay.build_if_needed() == (True, "present")
