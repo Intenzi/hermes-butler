@@ -32,8 +32,10 @@ Ambient WATCH lines (passive AX observation; never a click):
   {"op":"watch-hit","app":"Slack","until":"Export complete","label":"Export complete"}
   {"op":"watch-stopped","events":12,"reason":"app-quit"}
 """
+import hashlib
 import json
 import os
+import platform
 import queue
 import select
 import shutil
@@ -62,37 +64,118 @@ def binary_source_path():
     return os.path.join(os.path.dirname(__file__), "overlay_swift", "ButlerOverlay.swift")
 
 
+def buildinfo_path():
+    """Sidecar written by scripts/build-companion.sh next to the binary."""
+    return os.path.join(os.path.dirname(__file__), "services", ".buildinfo")
+
+
+def source_sha256(path=None):
+    """Content hash of the Swift source, used instead of its mtime."""
+    target = path or binary_source_path()
+    digest = hashlib.sha256()
+    with open(target, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_buildinfo():
+    try:
+        with open(buildinfo_path(), "r", encoding="utf-8") as handle:
+            info = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def _current_archs(exe):
+    """Best-effort arch list for a rebuilt binary (lipo, else the host)."""
+    lipo = shutil.which("lipo")
+    if lipo is not None:
+        try:
+            proc = subprocess.run([lipo, "-archs", exe], timeout=10,
+                                  check=True, capture_output=True, text=True)
+            archs = proc.stdout.split()
+            if archs:
+                return archs
+        except Exception:  # noqa: BLE001
+            pass
+    return [platform.machine() or "unknown"]
+
+
+def _write_buildinfo_best_effort(src, exe):
+    """Record what a swiftc rebuild produced so it is not rebuilt every time.
+
+    The sidecar is a cache hint, never a requirement; an install directory that
+    is not writable keeps working and simply re-checks the hash next run. Only
+    I/O failures are tolerated here - a bug in this function should surface in
+    tests instead of silently disabling the cache contract.
+    """
+    try:
+        info = {
+            "source_sha256": source_sha256(src),
+            "archs": _current_archs(exe),
+            "built_at": int(time.time()),
+        }
+        with open(buildinfo_path(), "w", encoding="utf-8") as handle:
+            json.dump(info, handle, sort_keys=False)
+            handle.write("\n")
+    except OSError:
+        pass
+
+
 def build_if_needed():
-    """Compile the bundled Swift overlay when it is missing or stale.
+    """Compile the bundled Swift overlay only when its source really changed.
 
     Returns (ok, detail); detail stays "present" or "compiled" for the doctor.
+
+    Staleness is decided by the source SHA-256 in the shipped ``.buildinfo``,
+    never by mtime: after ``git clone`` every file gets a fresh mtime, so a
+    shipped binary would always look stale and force a compile on a machine
+    that has no compiler. A missing/unreadable sidecar is treated as "trust the
+    shipped binary" for the same reason - doctor's capture probe will report a
+    genuinely broken companion.
     """
     exe = binary_path()
     src = binary_source_path()
     exe_ready = os.path.exists(exe) and os.access(exe, os.X_OK)
-    src_exists = os.path.exists(src)
 
     if exe_ready:
-        if not src_exists:
+        info = _read_buildinfo()
+        if info is None or not info.get("source_sha256"):
+            # Never make a missing sidecar cost a user a compiler. The shipped
+            # binary is expected to be good; let the capture probe decide.
             return True, "present"
         try:
-            if os.path.getmtime(exe) >= os.path.getmtime(src):
-                return True, "present"
+            current = source_sha256(src)
         except OSError:
-            # Fall through to a rebuild; an unreadable timestamp is not proof
-            # that the binary came from the current source.
-            pass
+            # The binary outlives a missing source in an installed plugin; the
+            # source's absence is not evidence that the binary is stale.
+            return True, "present"
+        if info.get("source_sha256") == current:
+            return True, "present"
+        # Hash mismatch: the source changed after this binary was built.
 
-    if not src_exists:
+    if not os.path.exists(src):
         return False, "source_missing"
     if shutil.which("swiftc") is None:
         return False, "swiftc_not_found"
+    # Compile beside the target and swap only on success. An in-place swiftc
+    # run can truncate the shipped binary before failing, which would turn a
+    # working companion into "needs a compiler" on a machine that has none.
+    staged = exe + ".new"
     try:
-        subprocess.run(["swiftc", "-O", "-o", exe, src], timeout=120,
+        subprocess.run(["swiftc", "-O", "-o", staged, src], timeout=120,
                        check=True, capture_output=True)
-        return True, "compiled"
+        os.replace(staged, exe)
     except Exception as exc:  # noqa: BLE001
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
         return False, "compile_failed: %s" % exc
+    _write_buildinfo_best_effort(src, exe)
+    return True, "compiled"
 
 
 def hermes_home():
