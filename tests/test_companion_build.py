@@ -194,7 +194,7 @@ def test_download_installs_the_verified_helper_and_its_buildinfo(
     assets = {
         base: BINARY,
         base + ".sha256": "%s  ButlerOverlay-universal\n" % _sha(BINARY),
-        # What the workflow publishes: butler_core/services/.buildinfo uploads
+        # What the workflow publishes: ButlerOverlay-universal.sha256 uploads
         # under its bare basename in the same release directory.
         release_dir + "/.buildinfo": json.dumps(release_info),
     }
@@ -444,10 +444,10 @@ def test_no_machine_code_is_tracked():
     tracked = proc.stdout.split()
 
     assert "butler_core/services/ButlerOverlay" not in tracked
-    assert "butler_core/services/.buildinfo" not in tracked
+    assert "ButlerOverlay-universal.sha256" not in tracked
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
     assert "butler_core/services/ButlerOverlay" in ignore
-    assert "butler_core/services/.buildinfo" in ignore
+    assert ".buildinfo" in ignore
 
 
 def test_the_companion_url_template_names_this_repos_versioned_release():
@@ -474,7 +474,7 @@ def test_the_release_workflow_publishes_an_attested_universal_helper():
     assert "tags:" in workflow
     assert "'v*'" in workflow
     assert "workflow_dispatch:" in workflow
-    assert "runs-on: macos-14" in workflow
+    assert "runs-on: macos-latest" in workflow
     # A release needs write access; the attestation needs the OIDC pair.
     for permission in ("contents: write", "id-token: write",
                        "attestations: write"):
@@ -490,7 +490,7 @@ def test_the_release_workflow_publishes_an_attested_universal_helper():
     assert "actions/attest-build-provenance@v2" in workflow
     assert 'gh release create "$GITHUB_REF_NAME" --generate-notes' in workflow
     for asset in ("ButlerOverlay-universal", "ButlerOverlay-universal.sha256",
-                  "butler_core/services/.buildinfo"):
+                  "ButlerOverlay-universal.sha256"):
         assert asset in workflow
 
 

@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 EXPECTED_SKILLS = {
     "butler-follow": {"when to use", "step format", "grounding rule", "follow"},
+    "butler-usage": {"offer", "choose the verb", "never for shell commands"},
     "butler-conventions": {
         "flat step keys",
         "restart batching",

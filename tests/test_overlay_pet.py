@@ -88,6 +88,9 @@ def test_frames_dir_returns_none_without_pets(tmp_path: Path, monkeypatch) -> No
 
 
 def test_build_if_needed_recompiles_stale_binary(tmp_path: Path, monkeypatch) -> None:
+    # The shipped URL template points at a live release: a test that means to
+    # exercise the COMPILE path must refuse the download first.
+    monkeypatch.setenv("BUTLER_NO_DOWNLOAD", "1")
     binary = tmp_path / "ButlerOverlay"
     source = tmp_path / "ButlerOverlay.swift"
     binary.write_bytes(b"old")

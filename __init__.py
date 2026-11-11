@@ -438,4 +438,11 @@ def register(ctx):
                            description="Butler plugin dev conventions: flat step keys, restart batching, verify-dsh-rule, checklist shape, TCC scope, card etiquette. Load for any butler board or code work.")
     except Exception:
         logger.exception("butler:conventions skill registration failed")
-    logger.info("Butler plugin registered: 9 tools, /butler (injected turn), CLI 'butler', 2 skills")
+    try:
+        usage_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "skills", "butler-usage", "SKILL.md")
+        ctx.register_skill(name="usage", path=usage_path,
+                           description="When to offer a butler guide instead of step-by-step prose, and whether to use look, watch or a guide.")
+    except Exception:
+        logger.exception("butler:usage skill registration failed")
+    logger.info("Butler plugin registered: 10 tools, /butler (injected turn), CLI 'butler', 3 skills")
