@@ -22,6 +22,10 @@
 //    {"op":"quit"}
 //
 //  Event lines the renderer writes to stdout (never a request response):
+//    {"op":"chip-anchor","mode":"pet"|"free"}
+//      Once per hat placement change: "pet" = beside the popped-out pet panel,
+//      "free" = the free-standing remembered point used when no pet panel
+//      exists (e.g. the pet docked inside the Hermes window).
 //    {"op":"launcher_click"}
 //    {"op":"summon_text","text":"...","id":"a1b2c3d4","destination":"recent"}
 //    {"op":"look_text","text":"...","id":"a1b2c3d4","destination":"recent",
@@ -1184,16 +1188,24 @@ private func writeAXResponse(_ response: [String: Any]) {
 
 // MARK: - Ambient WATCH transport
 
+/// One JSON object per line on stdout. Every event line the Python side reads
+/// (watch events, `chip-anchor`, …) goes through here, so a bad payload costs
+/// one dropped line instead of the protocol.
+private func writeEventLine(_ payload: [String: Any]) {
+    guard JSONSerialization.isValidJSONObject(payload),
+          let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
+        logStderr("butler-overlay: stdout line encode failed")
+        return
+    }
+    // One write per line: two writes could interleave with the other writer on
+    // the same pipe and split a JSON line in half.
+    FileHandle.standardOutput.write(data + Data([0x0a]))
+}
+
 /// One JSON object per line for the watch protocol: `watch-event`, `watch-hit`,
 /// `watch-stopped`, and the synchronous `watch_start` reply.
 private func writeWatchLine(_ payload: [String: Any]) {
-    guard JSONSerialization.isValidJSONObject(payload),
-          let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
-        logStderr("butler-overlay: watch line encode failed")
-        return
-    }
-    FileHandle.standardOutput.write(data)
-    FileHandle.standardOutput.write(Data([0x0a]))
+    writeEventLine(payload)
 }
 
 /// A start rejection, carrying the producer's token when it sent one so a
@@ -1265,6 +1277,16 @@ private struct ClaimChipSpec {
     /// Mirrors PET_PADDING_BOTTOM in app/pet-overlay/pet-overlay-app.tsx: the
     /// sprite sits 24 pt above the bottom edge of the pop-out window.
     static let defaultPadBottom: CGFloat = 24.0
+}
+
+/// Which anchor the hat is on: beside the popped-out pet panel, or the
+/// free-standing remembered screen point used when no pet panel exists (the
+/// default fresh-install state, where the pet is docked inside the Hermes
+/// window). Reported on stdout as `chip-anchor` so the Python side can surface
+/// which state the companion is in.
+private enum ClaimChipAnchorMode: String {
+    case pet
+    case free
 }
 
 private enum OverlayCommand {
@@ -1779,6 +1801,69 @@ private func chipJournal(_ event: String) {
     try? payload.write(toFile: path, atomically: true, encoding: .utf8)
 }
 
+/// The free-standing hat's anchor: a remembered point on screen, used whenever
+/// no popped-out pet panel resolves. It is what keeps the hat — LOOK, the ask
+/// field and the watch menu — reachable in the fresh-install state where the
+/// pet is docked inside the Hermes window.
+///
+/// The point is remembered in the companion's OWN preferences domain, so a
+/// user's placement survives restarts without the Python side knowing the
+/// geometry.
+private enum ClaimChipFreeAnchor {
+    /// The defaults key: "x,y" in AppKit global coordinates (bottom-left
+    /// origin of the primary display, y upward).
+    static let defaultsKey = "butlerHatFreeAnchor"
+    /// Where the default point sits, in points in from the screen's right and
+    /// bottom edges. 40 pt clears the Dock on a default layout.
+    static let inset: CGFloat = 40.0
+    /// How long a PET-ANCHORED hat waits before it goes free: a pop-out being
+    /// dragged, resized or created must not flicker the hat to the corner.
+    /// A hat that was never pet-anchored (fresh install, docked pet) skips the
+    /// grace and appears at the free point at once — waiting here would leave
+    /// the hat invisible, which is the defect this anchor exists to fix.
+    static let petGrace: TimeInterval = 3.0
+    /// A remembered point is clamped this far inside the screen's visible
+    /// frame, the same margin the pet-relative placement uses.
+    static let edgeMargin: CGFloat = 4.0
+
+    /// `butlerHatFreeAnchor` parsed back into a point; a malformed or absent
+    /// value simply means "never placed", never a crash or a lost hat.
+    static func remembered(from defaults: UserDefaults) -> NSPoint? {
+        guard let raw = defaults.string(forKey: defaultsKey) else {
+            return nil
+        }
+        let parts = raw.split(separator: ",")
+        guard parts.count == 2,
+              let x = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+              let y = Double(parts[1].trimmingCharacters(in: .whitespaces)),
+              x.isFinite, y.isFinite else {
+            return nil
+        }
+        return NSPoint(x: x, y: y)
+    }
+
+    /// Persisted on release, never mid-drag: a drag that ends in a cancel must
+    /// not rewrite the remembered point.
+    static func remember(_ point: NSPoint, in defaults: UserDefaults) {
+        guard point.x.isFinite, point.y.isFinite else {
+            return
+        }
+        defaults.set("\(point.x),\(point.y)", forKey: defaultsKey)
+    }
+
+    /// The main screen's bottom-right corner, inset by `inset` from the right
+    /// edge and from the bottom edge. `visibleFrame` already excludes the menu
+    /// bar and the Dock.
+    static func defaultOrigin(size: CGSize) -> NSPoint? {
+        guard let screen = primaryScreen() else {
+            return nil
+        }
+        let visible = screen.visibleFrame
+        return NSPoint(x: visible.maxX - inset - size.width,
+                       y: visible.minY + inset)
+    }
+}
+
 /// A borderless window cannot become key by default, and a window that cannot
 /// become key never routes clicks into its content view. This subclass only
 /// relaxes key status; it stays non-main so it never steals app activation.
@@ -1814,6 +1899,10 @@ private final class ClaimChipView: NSView {
     /// True from the first moved point until mouseUp; the controller then drops
     /// the read-out card at the release point.
     private(set) var lookMode = false
+    /// Set while the hat is free-standing, where the same press MOVES it. A
+    /// drag then keeps the hat glyph, because claiming to read the pointer
+    /// while the badge is simply being placed would be a lie.
+    var dragMovesTheHat = false
     private var pressStart: NSPoint?
     private var dragging = false
     var onClick: (() -> Void)?
@@ -1932,7 +2021,9 @@ private final class ClaimChipView: NSView {
         let movement = (dx * dx + dy * dy).squareRoot()
         if !dragging && movement > ClaimChipView.dragThreshold {
             dragging = true
-            lookMode = true
+            // The eye glyph means "I am reading the pointer"; a free hat being
+            // placed is not reading anything, so it stays a hat.
+            lookMode = !dragMovesTheHat
             needsDisplay = true
             onDragBegan?(start)
             chipJournal("drag-begin")
@@ -3064,6 +3155,21 @@ private final class OverlayController {
     private var claimChipSpriteSize: CGSize?
     private var claimChipPadBottom: CGFloat = ClaimChipSpec.defaultPadBottom
     private let claimChipGap: CGFloat = 10.0
+    /// Which anchor the hat is on right now, nil until the first placement of
+    /// this arm. A hat already on the pet waits out the grace before going
+    /// free; one that was never pet-anchored goes free at once.
+    private var claimChipAnchorMode: ClaimChipAnchorMode?
+    /// The mode last announced on stdout (`chip-anchor`), so one placement
+    /// change is one line and a steady tick is silent.
+    private var claimChipAnnouncedMode: ClaimChipAnchorMode?
+    /// When the pet panel was first missed in the current pet-anchored run.
+    private var claimChipPetMissingSince: Date?
+    /// Remembered free-standing origin in AppKit coordinates (bottom-left
+    /// origin), loaded lazily from the companion's preferences.
+    private var claimChipFreeAnchorOrigin: NSPoint?
+    /// A free-standing hat is being dragged to a new place: the same press
+    /// moves the window instead of arming INSPECT MODE.
+    private var claimChipFreeMoveActive = false
     /// True between "drag begins" and mouseUp: the placement timer must not
     /// snap the hat out from under the cursor while the user is aiming.
     private var claimChipDragging = false
@@ -3572,6 +3678,14 @@ private final class OverlayController {
             claimChipTimer = nil
             claimChipTimerInterval = 0.0
             stopPetObservation()
+            // Explicit disarm (this is the ONLY reason the hat goes away).
+            // The next arm starts from a cold anchor again, so a fresh
+            // companion with no pop-out shows the hat at the free point
+            // immediately instead of waiting out the pet grace.
+            claimChipAnchorMode = nil
+            claimChipAnnouncedMode = nil
+            claimChipPetMissingSince = nil
+            claimChipFreeMoveActive = false
             hideClaimChip()
             return
         }
@@ -4528,6 +4642,17 @@ private final class OverlayController {
         return nil
     }
 
+    /// Place the hat from the best anchor available, in this order:
+    ///
+    ///   a. the popped-out pet panel, beside its sprite (unchanged);
+    ///   b. the free anchor — a remembered screen point — used whenever no pet
+    ///      panel has been found for `ClaimChipFreeAnchor.petGrace` seconds.
+    ///
+    /// The free anchor is the answer when neither resolves, so the hat (LOOK,
+    /// the ask field, the watch menu) is reachable even in the fresh-install
+    /// state where the pet is docked inside the Hermes window and no pet panel
+    /// exists at all. Before this, `hermesPetWindowFrame` returned nil there and
+    /// the chip was created and destroyed forever.
     private func positionClaimChip() {
         // The slow reconciliation tick also heals the attach set: a window
         // created while the observer was not running, or an element that went
@@ -4542,26 +4667,48 @@ private final class OverlayController {
         guard !inspectMode else { return }
         guard claimChipEnabled, !isShuttingDown,
               let primaryHeight = primaryScreenHeight() else {
+            // Explicit disarm (or shutdown, or no screen at all) is the only
+            // correct reason to hide: an unresolved PET must never hide the
+            // hat, because the free anchor is always underneath it.
             hideClaimChip()
             return
         }
-        guard let petWindow = hermesPetWindowFrame(primaryHeight: primaryHeight) else {
-            // Unknown/renamed pet window: stay hidden rather than guess.
-            hideClaimChip()
+        if let petWindow = hermesPetWindowFrame(primaryHeight: primaryHeight) {
+            claimChipPetMissingSince = nil
+            applyClaimChipFrame(petWindow: petWindow, primaryHeight: primaryHeight)
             return
         }
-        applyClaimChipFrame(petWindow: petWindow, primaryHeight: primaryHeight)
+        // No pet panel found. A hat already anchored to the pet waits out the
+        // grace so a pop-out being dragged, resized or created does not flicker
+        // it to the corner; a hat that has never been pet-anchored (fresh
+        // install, docked pet) goes free at once — the hat must never vanish.
+        let now = Date()
+        if claimChipAnchorMode == .pet {
+            let missingSince = claimChipPetMissingSince ?? now
+            claimChipPetMissingSince = missingSince
+            if now.timeIntervalSince(missingSince) < ClaimChipFreeAnchor.petGrace {
+                return
+            }
+        }
+        applyFreeAnchorFrame()
     }
 
     /// Place (or move) the chip from a known pet-panel frame. `positionClaimChip`
     /// feeds it the polled anchor; the AX move/resize path feeds it the frame
     /// straight off the observed element, so a drag costs no enumeration.
+    ///
+    /// Both callers guarantee the frame is pet-shaped: the poll filters inside
+    /// `hermesPetWindowFrame`, and the notification path filters with
+    /// `isPetShapedFrame` before it schedules a placement (a docked pet means
+    /// the Hermes main window is what moves, and that frame is dropped there).
     private func applyClaimChipFrame(petWindow: CGRect, primaryHeight: CGFloat) {
         recoverLostPressIfNeeded()
         guard !claimChipDragging else { return }
         // The overlay owns the frame while the mode is up.
         guard !inspectMode else { return }
         guard claimChipEnabled, !isShuttingDown else {
+            // Explicit disarm/shutdown only: a missing anchor never hides the
+            // hat, it moves it to the free point instead.
             hideClaimChip()
             return
         }
@@ -4574,12 +4721,102 @@ private final class OverlayController {
                                   padBottom: claimChipPadBottom)
         guard let frame = claimChipFrame(nextTo: pet, size: size,
                                          primaryHeight: primaryHeight) else {
+            // The pet is off-screen (another Space, minimised) or every
+            // candidate overlaps the sprite: the hat goes free rather than
+            // disappearing, so its doors stay one gesture away.
+            applyFreeAnchorFrame()
+            return
+        }
+        presentClaimChipFrame(appKitFrame: appKitRect(fromQuartz: frame,
+                                                      primaryHeight: primaryHeight),
+                              mode: .pet)
+    }
+
+    /// The free-standing hat: a remembered screen point the user can drag.
+    /// With nothing remembered it sits at the main screen's bottom-right
+    /// corner, 40 pt in from each edge (see `ClaimChipFreeAnchor`).
+    private func applyFreeAnchorFrame() {
+        recoverLostPressIfNeeded()
+        guard !claimChipDragging, !inspectMode else { return }
+        guard claimChipEnabled, !isShuttingDown else {
             hideClaimChip()
             return
         }
-        let appKitFrame = appKitRect(fromQuartz: frame, primaryHeight: primaryHeight)
+        let size = claimChipSize()
+        guard let origin = freeHatOrigin(size: size) else {
+            // No screen geometry at all: leave the hat exactly where it is
+            // rather than hiding a door the user may be looking at.
+            return
+        }
+        presentClaimChipFrame(appKitFrame: NSRect(origin: origin, size: size),
+                              mode: .free)
+    }
 
+    /// The remembered free anchor, clamped onto a visible screen so a display
+    /// change can never strand the hat off the desktop. The clamp is not
+    /// persisted: only the user's own drag rewrites the remembered point.
+    private func freeHatOrigin(size: CGSize) -> NSPoint? {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else {
+            return nil
+        }
+        let remembered = claimChipFreeAnchorOrigin
+            ?? ClaimChipFreeAnchor.remembered(from: UserDefaults.standard)
+        let preferred: NSPoint
+        if let remembered = remembered {
+            preferred = remembered
+        } else if let fallback = ClaimChipFreeAnchor.defaultOrigin(size: size) {
+            preferred = fallback
+        } else {
+            return nil
+        }
+        claimChipFreeAnchorOrigin = preferred
+        return clampHatOrigin(preferred, size: size)
+    }
+
+    /// Keep the free hat fully inside the visible frame of the screen it is on,
+    /// by the same 4 pt margin the pet-relative placement uses. Without this a
+    /// display change (or a drag to the edge) could park the hat off the
+    /// desktop and make its doors unreachable again.
+    private func clampHatOrigin(_ origin: NSPoint, size: CGSize) -> NSPoint? {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else {
+            return nil
+        }
+        let probe = NSRect(x: origin.x, y: origin.y,
+                           width: size.width, height: size.height)
+        let host = screens.first { $0.frame.intersects(probe) }
+            ?? primaryScreen()
+            ?? screens[0]
+        let visible = host.visibleFrame
+        let margin = ClaimChipFreeAnchor.edgeMargin
+        return NSPoint(x: min(max(origin.x, visible.minX + margin),
+                              visible.maxX - size.width - margin),
+                       y: min(max(origin.y, visible.minY + margin),
+                              visible.maxY - size.height - margin))
+    }
+
+    /// Put the hat window at a resolved AppKit frame and report the anchor mode
+    /// once per change. Both anchors land here, so the window's creation, its
+    /// click wiring and the unchanged-frame guard exist exactly once.
+    private func presentClaimChipFrame(appKitFrame: NSRect,
+                                       mode: ClaimChipAnchorMode) {
+        guard claimChipEnabled, !isShuttingDown else {
+            return
+        }
+        claimChipAnchorMode = mode
+        if mode == .pet {
+            // Both placement paths land here, so the grace timer is cleared on
+            // the event-driven path too: a pop-out that closes, reopens (AX
+            // move/created) and closes again must not inherit the old miss and
+            // expire the grace instantly.
+            claimChipPetMissingSince = nil
+        }
+        announceClaimChipAnchor(mode)
         if let window = claimChipWindow, let view = claimChipView {
+            // A free hat is moved by its drag, so the eye glyph would be a lie
+            // ("I am reading the pointer"); it keeps the hat glyph instead.
+            view.dragMovesTheHat = (mode == .free)
             if window.frame != appKitFrame {
                 window.setFrame(appKitFrame, display: true)
                 view.frame = NSRect(origin: .zero, size: appKitFrame.size)
@@ -4609,6 +4846,7 @@ private final class OverlayController {
         let view = ClaimChipView(frame: NSRect(origin: .zero,
                                                size: appKitFrame.size))
         view.autoresizingMask = [.width, .height]
+        view.dragMovesTheHat = (mode == .free)
         view.onClick = { [weak self] in
             self?.claimChipClicked()
         }
@@ -4631,6 +4869,18 @@ private final class OverlayController {
         claimChipWindow = window
         claimChipView = view
         window.orderFrontRegardless()
+    }
+
+    /// One stdout line per placement CHANGE, so the Python side can report the
+    /// state instead of inferring it: `mode` is `pet` while the hat sits beside
+    /// the popped-out pet, `free` when it is the free-standing hat. A steady
+    /// tick is silent, so this costs one line per real transition.
+    private func announceClaimChipAnchor(_ mode: ClaimChipAnchorMode) {
+        guard claimChipAnnouncedMode != mode else {
+            return
+        }
+        claimChipAnnouncedMode = mode
+        writeEventLine(["op": "chip-anchor", "mode": mode.rawValue])
     }
 
     private func hideClaimChip() {
@@ -4695,6 +4945,11 @@ private final class OverlayController {
         }
         claimChipDragging = false
         claimChipView?.cancelPendingPress()
+        // A lost free-hat drag keeps the place it reached: the release is gone,
+        // but the user's last position is the honest remembered point.
+        if claimChipFreeMoveActive {
+            endHatFreeMove()
+        }
         chipJournal("look-press-recovered")
     }
 
@@ -4709,14 +4964,23 @@ private final class OverlayController {
                                       y: window.frame.minY - screenPoint.y)
     }
 
-    /// The press crossed `dragThreshold`: the grab is already latched. The drag
-    /// arms the SAME INSPECT MODE a right-click arms, only with the release as
-    /// the confirmation, so both gestures offer one read-out and one ask field.
+    /// The press crossed `dragThreshold`: the grab is already latched.
+    ///
+    /// Pet-anchored, the drag arms the SAME INSPECT MODE a right-click arms,
+    /// only with the release as the confirmation, so both gestures offer one
+    /// read-out and one ask field. Free-standing, the same gesture MOVES the
+    /// hat instead: there is no pet to read against, and a user's first instinct
+    /// with a loose badge is to place it. INSPECT MODE is still one right-click
+    /// away, and the plain click still opens the ask field.
     private func beginLookDrag(at screenPoint: NSPoint) {
         if !claimChipDragging, let window = claimChipWindow {
             claimChipDragging = true
             claimChipDragOffset = NSPoint(x: window.frame.minX - screenPoint.x,
                                           y: window.frame.minY - screenPoint.y)
+        }
+        if claimChipAnchorMode == .free {
+            beginHatFreeMove()
+            return
         }
         armInspectMode(releaseToAsk: true)
         // The arm can refuse (an ask field already open, the chip not live, no
@@ -4728,8 +4992,12 @@ private final class OverlayController {
 
     /// Nothing to drag any more: INSPECT MODE owns the pointer and the hat is
     /// hidden for the duration, so moving the window here would move something
-    /// nobody can see.
+    /// nobody can see. The free hat has no such mode, so IT is what moves.
     private func moveLookDrag(to screenPoint: NSPoint) {
+        if claimChipFreeMoveActive {
+            hatFreeMove(to: screenPoint)
+            return
+        }
         guard !inspectMode, claimChipDragging, let window = claimChipWindow else {
             return
         }
@@ -4742,6 +5010,16 @@ private final class OverlayController {
     /// parking, the deferred AX read and the ask field are one path. Nothing
     /// here activates the app, focuses Hermes or types.
     private func endLookDrag(at screenPoint: NSPoint) {
+        // The free move owns its own latch: ending it must not depend on the
+        // drag latch, so a lost press can never leave it stuck on.
+        if claimChipFreeMoveActive {
+            // The free hat was being placed, not read: remember the drop. The
+            // two latches are disjoint by construction (a free hat never arms
+            // inspect), so clearing the drag latch here is belt-and-braces.
+            claimChipDragging = false
+            endHatFreeMove()
+            return
+        }
         guard claimChipDragging else { return }
         claimChipDragging = false
         // The mode may already be gone (Esc, timeout, a lost grab): disarm put
@@ -4751,6 +5029,45 @@ private final class OverlayController {
             return
         }
         resolveInspectRelease(at: screenPoint)
+    }
+
+    /// A free-standing hat is MOVED by the drag. This is deliberately NOT the
+    /// inspect arm: a hat floating on its own has no pet to point at, and the
+    /// user's ask is "put the butler where I can see it". Journaled so the mode
+    /// is visible in `chip-events.log`.
+    private func beginHatFreeMove() {
+        claimChipFreeMoveActive = true
+        chipJournal("hat-free-move")
+    }
+
+    /// Move the free hat with the pointer, using the offset captured at press so
+    /// the hat never jumps under the cursor. Nothing is persisted here: a drag
+    /// that ends in a cancel must not rewrite the remembered point.
+    private func hatFreeMove(to screenPoint: NSPoint) {
+        guard claimChipFreeMoveActive, !inspectMode,
+              let window = claimChipWindow else { return }
+        let raw = NSPoint(x: screenPoint.x + claimChipDragOffset.x,
+                          y: screenPoint.y + claimChipDragOffset.y)
+        guard raw.x.isFinite, raw.y.isFinite,
+              let origin = clampHatOrigin(raw, size: claimChipSize()) else {
+            return
+        }
+        window.setFrameOrigin(origin)
+    }
+
+    /// The release persisted the free hat: the window stays exactly where the
+    /// user dropped it and that point becomes the remembered anchor, in the
+    /// companion's own preferences, so it survives a restart. The window origin
+    /// is authoritative: `hatFreeMove` already clamped it, so what is stored is
+    /// exactly what the user sees.
+    private func endHatFreeMove() {
+        guard claimChipFreeMoveActive else { return }
+        claimChipFreeMoveActive = false
+        guard let window = claimChipWindow else { return }
+        let origin = window.frame.origin
+        claimChipFreeAnchorOrigin = origin
+        ClaimChipFreeAnchor.remember(origin, in: UserDefaults.standard)
+        chipJournal("hat-free-anchored")
     }
 
     /// Park the overlays, then resolve on the next run-loop turn — exactly the
