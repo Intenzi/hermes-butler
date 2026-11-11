@@ -1177,6 +1177,71 @@ test('an active watch rides the pet line as a count, and the hit once fired', as
   env.dispose()
 })
 
+test('a live watch outranks a dead guide block on the pet line', async () => {
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument()
+  })
+  const watch = { app: 'Opera GX', events: 596, stopped: null }
+  const watchLine = '⏲ Watch · Opera GX · 596 changes'
+
+  // The measured defect: a guide stopped long ago left `stalled` + a note on
+  // disk, and the pet kept speaking it over the live watch.
+  assert.equal(env.api.petStatusLine({
+    status: 'stalled',
+    note: 'step 1 unverified for 600s; expect=expectation_unmet',
+    instruction: 'Click Settings',
+    watch
+  }), watchLine, 'a live watch beats a dead stalled guide')
+  // A live step still leads the watch while the guide is being walked.
+  assert.equal(env.api.petStatusLine({
+    status: 'running', instruction: 'Click Export', watch
+  }), 'Click Export')
+  // Every terminal status is dead weight: never mask the watch line.
+  assert.equal(env.api.petStatusLine({
+    status: 'stopped', note: 'stopped by agent',
+    instruction: 'Click Export', watch
+  }), watchLine)
+  assert.equal(env.api.petStatusLine({
+    status: 'abandoned', note: 'step 1 was never verified',
+    instruction: 'Click Export', watch
+  }), watchLine)
+  assert.equal(env.api.petStatusLine({
+    status: 'done', instruction: 'Click Export', watch
+  }), watchLine)
+  // No watch: the stalled note is unchanged (the guide is the only status).
+  assert.equal(env.api.petStatusLine({
+    status: 'stalled',
+    note: 'step 1 unverified for 600s; expect=expectation_unmet',
+    instruction: 'Click Settings'
+  }), 'step 1 unverified for 600s; expect=expectation_unmet')
+  env.dispose()
+})
+
+test('a dead guide step does not steal the watch keep-alive', async () => {
+  const said = []
+  const pet = {
+    say(text, options) { said.push({ text, options }) },
+    clear() {}
+  }
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument(), pet
+  })
+  const cur = {
+    status: 'stalled',
+    instruction: 'Click Settings',
+    note: 'step 1 unverified for 600s; expect=expectation_unmet',
+    watch: { app: 'Opera GX', events: 596, started_at: 1_800_000_000 }
+  }
+
+  assert.equal(env.api.petSpeechBeat(cur, 1000), 'status')
+  assert.equal(said[0].text, '⏲ Watch · Opera GX · 596 changes')
+  assert.equal(said[0].options.ttlMs, 30000)
+  // The watch line, not the dead guide's instruction, owns the keep-alive.
+  assert.equal(env.api.petSpeechBeat(cur, 26000), 'status')
+  assert.equal(said.length, 2)
+  env.dispose()
+})
+
 test('the pane status row names the chip and in-app pet, and flashes once', async () => {
   const env = await loadPlugin({
     host: defaultHost(), rest: async () => ({}), document: makeDocument()

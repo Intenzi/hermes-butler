@@ -289,6 +289,93 @@ def test_history_reason_is_only_exposed_for_terminal_rows() -> None:
     assert entry["reason"] == "replaced by a new guide"
 
 
+def test_stop_guide_terminalises_the_shared_state_and_keeps_the_watch(
+        engine_state, tmp_path) -> None:
+    eng, fake, _tmp = engine_state
+    watched = {"app": "Opera GX", "events": 596, "stopped": None,
+               "started_at": time.time()}
+    session = _session(status="stalled", session_id="stale-guide")
+    session["state"]["note"] = "step 1 unverified for 600s; expect=expectation_unmet"
+    session["state"]["stalled_at"] = time.time() - 5
+    eng._session = session
+    # Isolate from every other watch/summon row a test may have left behind.
+    eng._watch = None
+    eng._watch_ring.clear()
+    eng._summon_pending = None
+    # The row on disk is the stale stalled block the defect measured; a
+    # concurrent process owns the watch block.
+    (tmp_path / "state.json").write_text(json.dumps({
+        "guide": session,
+        "overlay": "waiting",
+        "watch": watched,
+    }), encoding="utf-8")
+
+    result = eng.stop_guide("stopped by agent")
+
+    assert result["status"] == "stopped"
+    assert fake.quit_calls == 1
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["guide"]["state"]["status"] == "stopped"
+    assert state["guide"]["state"]["note"] is None
+    assert state["guide"]["state"]["say"] is None
+    assert isinstance(state["guide"]["state"]["stopped_at"], float)
+    assert state["guide"]["state"]["stopped_at"] <= time.time()
+    assert state["guide"]["id"] == "stale-guide"
+    # The stop writes a terminal block; it must not clobber the other owner's
+    # watch row (or the summon row, tested elsewhere).
+    assert state["watch"] == watched
+    # The guide stays in history, in the same terminal shape.
+    saved = json.loads((tmp_path / "guides" / "stale-guide.json")
+                       .read_text(encoding="utf-8"))
+    assert saved["state"]["status"] == "stopped"
+    assert saved["state"]["note"] is None
+    assert saved["state"]["say"] is None
+    assert eng._session is None
+
+
+def test_get_state_drops_a_stale_terminal_guide_and_keeps_a_fresh_one(
+        tmp_path, monkeypatch) -> None:
+    from dashboard import plugin_api
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "plugin-data" / "butler" / "state.json"
+    path.parent.mkdir(parents=True)
+    now = time.time()
+    watch = {"app": "Opera GX", "events": 596, "stopped": None}
+
+    def _guide(stopped_at: float) -> dict:
+        return {
+            "id": "old-guide",
+            "title": "Old",
+            "state": {"status": "stopped", "note": None, "say": None,
+                      "stopped_at": stopped_at},
+            "steps": [{"say": "Click Settings"}],
+            "verifications": [],
+        }
+
+    path.write_text(json.dumps({"guide": _guide(now - 601),
+                                "watch": watch,
+                                # A republished envelope must not keep an old
+                                # block alive: the block's own stamp governs.
+                                "generated_at": now}), encoding="utf-8")
+    stale = plugin_api._read_state()
+    assert "guide" not in stale, "a terminal block older than 10 min is swept"
+    assert stale["watch"] == watch, "the sweep never touches the watch block"
+
+    path.write_text(json.dumps({"guide": _guide(now - 60),
+                                "watch": watch}), encoding="utf-8")
+    fresh = plugin_api._read_state()
+    assert fresh["guide"]["state"]["status"] == "stopped"
+    assert fresh["watch"] == watch
+
+    # A legacy block with no stamp of its own falls back to the envelope's
+    # last publication time.
+    legacy = {"id": "legacy", "title": "Legacy", "state": {"status": "done"}}
+    path.write_text(json.dumps({"guide": legacy, "generated_at": now - 601}),
+                    encoding="utf-8")
+    assert "guide" not in plugin_api._read_state()
+
+
 def test_guide_start_schema_documents_replace(tmp_path) -> None:
     class _Ctx:
         def __init__(self):

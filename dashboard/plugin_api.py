@@ -451,6 +451,29 @@ def _read_say() -> dict[str, Any] | None:
     return {"id": say_id.strip(), "text": text, "at": row.get("at")}
 
 
+def _drop_stale_guide(data: dict[str, Any]) -> dict[str, Any]:
+    """Drop a terminal guide block left behind by a crashed/old process.
+
+    The guide itself stays in the guides folder (and therefore in /history);
+    only the live-status block stops talking after the engine's sweep age.
+    A block with no readable timestamp is kept: there is no evidence it is old.
+    """
+    guide = data.get("guide")
+    if not isinstance(guide, dict):
+        return data
+    try:
+        from butler_core import engine as bp_engine
+
+        stale = bp_engine.guide_block_is_stale(
+            guide, updated_at=data.get("generated_at"))
+    except Exception:  # never let the sweep break GET /state
+        logger.exception("butler stale-guide sweep failed")
+        return data
+    if stale:
+        data.pop("guide", None)
+    return data
+
+
 def _read_state() -> dict[str, Any]:
     data: dict[str, Any] = {}
     for path in _state_candidates():
@@ -464,6 +487,10 @@ def _read_state() -> dict[str, Any]:
         if isinstance(state, dict):
             data = state
             break
+    # A terminal block older than the sweep age must not outlive the process
+    # that wrote it. Read-time sweep, so no writer has to run for the pet to
+    # stop carrying a dead guide's line.
+    data = _drop_stale_guide(data)
     # The companion's ask field is a file spool, not a pipe event: merge the
     # newest unacked row in so the desktop sees it through the same /state row
     # it already polls.

@@ -1988,7 +1988,28 @@ function petStatusLine(cur) {
   const status = asText(cur && cur.status)
   const note = asText(cur && cur.note)
   const instruction = asText(cur && cur.instruction)
+  const watchLine = watchStatusLine(cur && cur.watch)
+  // Precedence, in one place (round 19): a live watch beats every DEAD guide
+  // block. `stalled` is only live while no watch is running; done / stopped /
+  // abandoned / superseded are never live. Without this, a stale stall note
+  // from a guide stopped long ago masks the watch line forever.
+  if (status === 'running' && instruction) {
+    // 1. A live step the user is being walked through.
+    return instruction
+  }
+  if (status === 'capture_failed') {
+    // A live guide that cannot read the screen: keep this above the watch (the
+    // guide cannot verify anything until Accessibility comes back).
+    return note && note !== instruction
+      ? `Capture failed: ${note}`
+      : 'Capture failed — butler could not read the screen'
+  }
+  if (watchLine) {
+    // 2. The ambient watch the pet carries while the user is in another app.
+    return watchLine
+  }
   if (status === 'done') {
+    // 3. Terminal guide lines: spoken once by the beat's dedupe.
     const total = asNumber(cur.total)
     const verified = asNumber(cur.verified)
     return `Guide complete · ${verified} of ${total} verified`
@@ -1997,21 +2018,11 @@ function petStatusLine(cur) {
     return note && note !== instruction ? `Butler stopped: ${note}` : 'Butler stopped'
   }
   if (status === 'stalled') {
+    // 4. Only when no watch is live (a live watch returned above).
     return note || `Butler stalled on step ${asNumber(cur.currentStep) + 1}`
   }
-  if (status === 'capture_failed') {
-    return note && note !== instruction
-      ? `Capture failed: ${note}`
-      : 'Capture failed — butler could not read the screen'
-  }
-  // A live guide instruction outranks an ambient watch; with no guide running,
-  // the watch is the status the pet carries while the user is in another app.
-  if (!instruction) {
-    const watchLine = watchStatusLine(cur && cur.watch)
-    if (watchLine) return watchLine
-  }
-  // Live step: speak the current instruction (restored by user request).
-  return instruction
+  // 5. Idle: abandon/superseded/unknown blocks are dead weight and say nothing.
+  return null
 }
 
 /**
@@ -2260,9 +2271,11 @@ function petSpeechBeat(cur, now = Date.now()) {
   }
   // Is this line the ambient watch count? Only then does it get a keep-alive;
   // every other status line still speaks once (a guide instruction is already
-  // carried by the ring and the pane).
-  const watching = watchIsActive(cur && cur.watch) && !asText(cur && cur.instruction)
-    ? watchStatusLine(cur.watch) : null
+  // carried by the ring and the pane). Compare the WINNING line to the watch
+  // line instead of testing the instruction: a dead guide may still carry a
+  // stale step while the watch line is the one the pet is speaking.
+  const watchLine = watchIsActive(cur && cur.watch) ? watchStatusLine(cur.watch) : null
+  const watching = watchLine && line === watchLine ? line : null
   if (lastSaid === line) {
     const due = watching && line === watching && now - lastSaidAt >= WATCH_KEEPALIVE_MS
     if (!due) return 'repeat'

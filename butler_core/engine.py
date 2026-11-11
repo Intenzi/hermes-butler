@@ -60,6 +60,13 @@ WATCH_JSONL_MAX = 500    # <plugin data dir>/watch.jsonl tail cap
 WATCH_STATUS_EVENTS = 10 # event lines watch_status() prints
 WATCH_REQUEST_TIMEOUT = 5.0
 
+# A guide block on the shared snapshot is LIVE status only while the guide is
+# actually being walked (running/capture_failed/stalled). Once terminal, the
+# block is kept just long enough for the pet to say its one ending line; a row
+# a crashed or replaced process left behind must not speak forever.
+GUIDE_TERMINAL_STATUSES = ("done", "stopped", "abandoned", "superseded")
+GUIDE_STALE_SECONDS = 600.0
+
 _lock = threading.Lock()
 _last_deep_capture_at = None  # monotonic timestamp of the last deep walk
 _session = None           # latest guide dict
@@ -247,6 +254,57 @@ def _normalize_steps(args_steps):
     return steps
 
 
+def _guide_last_update(guide):
+    """Newest epoch second on a guide block, or None when it carries none.
+
+    ``stopped_at`` is the stamp a clean stop writes; older/foreign blocks may
+    only have a start or an update time, so every known stamp is considered and
+    the newest wins (a last verification is an update too).
+    """
+    if not isinstance(guide, dict):
+        return None
+    state = guide.get("state") if isinstance(guide.get("state"), dict) else {}
+    stamps = []
+    for row in (state, guide):
+        for key in ("stopped_at", "updated_at", "ended_at", "generated_at",
+                    "step_opened_at", "started_at"):
+            value = row.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                stamps.append(float(value))
+    for row in guide.get("verifications") or []:
+        if isinstance(row, dict):
+            value = row.get("verified_at")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                stamps.append(float(value))
+    return max(stamps) if stamps else None
+
+
+def guide_block_is_stale(guide, now=None, updated_at=None):
+    """True when ``guide`` is a TERMINAL block older than the sweep age.
+
+    Only terminal blocks are swept: a running/capture_failed/stalled guide is
+    live status whatever its age (its own stall deadline stops it). The block's
+    own newest stamp (``stopped_at`` first) governs; the envelope's
+    ``generated_at`` is only a fallback for a block that carries no stamp at
+    all. It must NOT extend an old block's life: an ``abandoned`` row can stay
+    in memory while later state writes republish the envelope, and a block with
+    no timestamp is not swept — there is no evidence it is stale.
+    """
+    if not isinstance(guide, dict):
+        return False
+    state = guide.get("state") if isinstance(guide.get("state"), dict) else {}
+    status = state.get("status") or guide.get("status")
+    if status not in GUIDE_TERMINAL_STATUSES:
+        return False
+    stamp = _guide_last_update(guide)
+    if stamp is None and isinstance(updated_at, (int, float)) \
+            and not isinstance(updated_at, bool):
+        stamp = float(updated_at)
+    if stamp is None:
+        return False
+    return (time.time() if now is None else now) - stamp > GUIDE_STALE_SECONDS
+
+
 def _write_state(clear_summon=False, clear_watch=False):
     """Publish the shared snapshot. Never raises.
 
@@ -255,7 +313,9 @@ def _write_state(clear_summon=False, clear_watch=False):
     part of ``state.json``, so a write merges the other owner's block instead of
     dropping it — otherwise a click silently erases a running guide, and a guide
     poll erases a click the desktop has not consumed yet. The ambient ``watch``
-    block merges the same way (stop_watch clears it explicitly).
+    block merges the same way (stop_watch clears it explicitly). A terminal
+    guide block older than ``GUIDE_STALE_SECONDS`` is not carried forward: the
+    guide stays in history, but the live-status row stops talking.
     """
     if not DATA_DIR:
         return
@@ -277,7 +337,10 @@ def _write_state(clear_summon=False, clear_watch=False):
         with open(path, "r", encoding="utf-8") as f:
             existing = json.load(f)
         if isinstance(existing, dict):
-            if _session is None and "guide" in existing:
+            if _session is None and "guide" in existing \
+                    and not guide_block_is_stale(
+                        existing.get("guide"),
+                        updated_at=existing.get("generated_at")):
                 snap["guide"] = existing["guide"]
                 for key in ("overlay", "generated_at"):
                     if key in existing:
@@ -1157,15 +1220,31 @@ def guide_stop(reason="stopped"):
     with _lock:
         if not _session:
             return {"status": "idle"}
+        stopped_at = time.time()
         _session["state"]["status"] = "stopped"
-        _session["state"]["note"] = reason
+        # A terminal block must not carry the live stall note or the current
+        # instruction: the pet's dead-guide precedence and the /state sweep
+        # both key off a terminal row being quiet.
+        _session["state"]["note"] = None
+        _session["state"]["say"] = None
+        _session["state"]["stopped_at"] = stopped_at
         _session["reason"] = reason
         _session["current_box"] = None
         stopped = dict(_session)
         _OVERLAY.quit()
         stopped["overlay"] = "stopped"
         _save_session()
-        _session = None
+        # Publish BEFORE dropping the in-memory session. ``_write_state`` only
+        # carries the guide block forward from disk when this process owns no
+        # session, so releasing first resurrected the stale ``stalled`` row
+        # (round 19: butler_stop said stopped while state.json kept the note).
+        # The write still merges the watch / summon_pending blocks.
         _write_state()
+        _session = None
         return {"status": "stopped", "reason": reason,
                 "verified": stopped.get("verifications", [])}
+
+
+#: Round 19 names the writer behind ``butler_stop`` ``stop_guide``; keep the
+#: historical spelling as the implementation so existing call sites stay put.
+stop_guide = guide_stop
