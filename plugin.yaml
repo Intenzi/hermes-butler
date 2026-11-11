@@ -17,6 +17,7 @@ provides_tools:
   - butler_watch_start
   - butler_watch_status
   - butler_watch_stop
+  - butler_watch_ack
 provides_hooks: []
 config_schema:
   poll_seconds:

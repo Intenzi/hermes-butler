@@ -208,9 +208,14 @@ text only when the work calls for it.
 
 Plain statements about what this plugin does when it runs.
 
-1. The bundled Swift overlay source ships inside the plugin at
-   `butler_core/services/ButlerOverlay` and is compiled on first use with
-   `swiftc`. It is local source, not a fetched binary.
+1. **No binary is committed.** The companion ships as Swift source
+   (`butler_core/overlay_swift/ButlerOverlay.swift`, readable in the repo) and is
+   compiled locally by `scripts/build-companion.sh` — or automatically on first
+   use when the compiled helper is absent. Compiling needs Apple's Command Line
+   Tools (`xcode-select --install`); a machine without them cannot run the
+   companion, and `hermes butler doctor` says so instead of blaming a permission.
+   Nothing is downloaded: no fetched binary, no remote artifact, no checksum to
+   trust.
 2. Overlay rendering runs in a spawned local companion process, driven by a
    JSON-over-stdin protocol. The same shared process serves guides, captures,
    the summon double, and the pop-out hat badge; it exits when idle (a roughly
@@ -220,10 +225,14 @@ Plain statements about what this plugin does when it runs.
    and geometry boxes only. No screenshots are stored or transmitted. Element
    text goes to the chat's own model provider, same as any other tool output in
    the session.
-4. Guide plans, live state, the summon config, and transcripts are small JSON
-   files under `plugin-data/butler` (`guides/*.json`, `state.json`,
+4. Guide plans, live state, the summon config, the spoken answer
+   (`say.json`), the watch log (`watch.jsonl`, capped at 500 lines) and the
+   guide history under `plugin-data/butler` (`guides/*.json`, `state.json`,
    `config.json`); nothing else is written outside the plugin's own data
-   directory. There is no second runtime config path in the plugin install dir.
+   directory. The only other thing Butler stores is the free-standing hat's
+   screen position, in this companion's own `UserDefaults` domain
+   (`~/Library/Preferences/ButlerOverlay.plist`). There is no second runtime
+   config path in the plugin install dir.
 5. No network destination other than the model provider. No telemetry, no
    auto-updater, no phoning home.
 6. Guides fail closed under unattended runs. From cron or a headless context,
@@ -250,6 +259,17 @@ Plain statements about what this plugin does when it runs.
    selector is re-glued. This receiver needs no Accessibility, Screen
    Recording, or other TCC grant beyond the companion that already exists for
    capture.
+
+9. **Watch runs while you are in another app.** It reads the Accessibility tree
+   of one named app in the background (no screenshots, no OCR, no Screen
+   Recording) and appends what changed to `watch.jsonl` in the plugin data
+   directory. One watch at a time; `Esc`/acknowledgement/stop end it.
+10. **Two private Hermes fallbacks.** The dashboard API prefers documented
+   plugin APIs; where injection needs the running gateway it reads
+   `PluginContext._manager` first and falls back to `hermes_cli.plugins` /
+   `gateway.session`. `hermes plugins validate` reports this as a warning (rule
+   9), not a failure: it is a read to locate the live runner, never a rebind of
+   core behaviour. If Hermes grows a documented seam for it, this drops out.
 
 ## Platform
 

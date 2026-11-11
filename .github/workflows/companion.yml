@@ -1,0 +1,44 @@
+name: companion
+
+# Rule 17 of the plugin catalog: a native helper must be built by this repo's own
+# public workflow, from source, and carry a build attestation. The catalog build
+# ships source only; this workflow exists so an attested universal binary can be
+# offered from a release if a user wants one without Command Line Tools.
+
+on:
+  push:
+    paths:
+      - 'butler_core/overlay_swift/**'
+      - 'scripts/build-companion.sh'
+      - '.github/workflows/companion.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal companion
+        run: bash scripts/build-companion.sh
+
+      - name: Verify architectures
+        run: lipo -archs butler_core/services/ButlerOverlay
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: butler_core/services/ButlerOverlay
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ButlerOverlay-universal
+          path: |
+            butler_core/services/ButlerOverlay
+            butler_core/services/.buildinfo

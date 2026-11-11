@@ -5,3 +5,8 @@ spike/out.json
 data/state.json
 data/guides/
 .DS_Store
+
+# Built companion (rule 17: no committed machine code). Rebuild with
+# scripts/build-companion.sh or let the plugin compile from Swift source.
+butler_core/services/ButlerOverlay
+butler_core/services/.buildinfo
