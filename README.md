@@ -204,6 +204,14 @@ text only when the work calls for it.
      plugin's own bundled Swift companion so TCC grants stay stable across
      updates.
 
+## Offering a guide
+
+When a reply is itself a step-by-step screen procedure, Butler offers to walk it:
+*"Want me to walk you through this on screen instead? Reply yes"* — and a yes
+starts the guide from those same steps. The policy lives in the bundled
+`butler:usage` skill, so the agent decides by context (one offer per procedure,
+never mid-guide, never for shell commands) instead of a hook guessing.
+
 ## Disclosure
 
 Plain statements about what this plugin does when it runs.
