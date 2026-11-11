@@ -212,6 +212,19 @@ def test_done_sends_the_farewell_op() -> None:
     assert [json.loads(line) for line in lines] == [{"op": "done"}]
 
 
+def test_guide_end_sends_the_terminal_op_with_its_reason() -> None:
+    proc = _FakeProc()
+    controller = overlay.Overlay()
+    controller.proc = proc
+
+    controller.guide_end("abandoned")
+
+    lines = [line for line in proc.stdin.data.decode("utf-8").splitlines() if line]
+    assert [json.loads(line) for line in lines] == [
+        {"op": "guide_end", "reason": "abandoned"},
+    ]
+
+
 def test_claim_chip_op_is_sent_when_armed() -> None:
     proc = _FakeProc()
     controller = overlay.Overlay()
@@ -423,6 +436,53 @@ def _swift_function_body(source: str, start_marker: str, end_marker: str) -> str
     end = source.find(end_marker, start + len(start_marker))
     assert end != -1, f"missing Swift marker: {end_marker}"
     return source[start:end]
+
+
+def test_guide_end_fades_the_double_and_a_later_pet_op_rearms_it() -> None:
+    """The terminal guide op must exist, fade, be idempotent, and re-arm.
+
+    The measured ghost was the walker double still drawn after abandonment:
+    "second ghost pet butler is still on my screen". The companion owns the
+    fade, so these source facts pin the contract the engine's ``guide_end``
+    op relies on.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    # 1. The op is parsed and dispatched (not an unknown-op rejection).
+    assert 'case "guide_end"' in source
+    assert "case guideEnd" in source
+    assert "case .guideEnd(let reason):" in source
+
+    # 2. It fades the double through the existing farewell path and journals
+    #    the hop so a ghost traces to a missed end.
+    end = _swift_function_body(source, "private func petGuideEnd(",
+                               "private func petDone(")
+    assert "petGuideEnded" in end
+    assert "petDone()" in end
+    assert 'chipJournal("guide-end:\\(reason)")' in end
+
+    # 3. Idempotent: a second end returns before touching the double.
+    assert "guard !isShuttingDown, !petGuideEnded else" in end
+
+    # 4. A later guide start (the pet op) clears the flag and the farewell
+    #    state, re-arming the walk exactly as before.
+    show = _swift_function_body(source, "private func showPet(",
+                                "private func createPetWindow(")
+    assert "petGuideEnded = false" in show
+    assert "petFarewell = false" in show
+    assert "petFading = false" in show
+
+    # 5. No other work means no lingering: the post-farewell exit and the
+    #    idle watchdog both refuse to retire a companion that still owns a
+    #    watch, look card or ask field.
+    exit_body = _swift_function_body(source, "private func scheduleExitAfterFarewell(",
+                                     "// MARK: Teardown")
+    assert "lookCardWindow == nil" in exit_body
+    assert "!summonFieldOpen" in exit_body
+    watchdog = _swift_function_body(source, "private func watchdogFired(",
+                                    "/// Invalidate any scheduled post-farewell exit.")
+    assert "lookCardWindow == nil" in watchdog
+    assert "!summonFieldOpen" in watchdog
 
 
 def test_claim_chip_anchors_the_chip_to_the_sprite_not_the_window() -> None:

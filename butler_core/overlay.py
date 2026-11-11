@@ -18,6 +18,7 @@ Protocol: one JSON line per op on stdin -
   {"op":"watch_stop"}
   {"op":"launcher"}
   {"op":"done"}
+  {"op":"guide_end","reason":"abandoned"}
   {"op":"idle"}
   {"op":"quit"}
 
@@ -1006,6 +1007,20 @@ class Overlay:
     def done(self):
         """Tell the companion the guide finished so its double can wave off."""
         self._send({"op": "done"})
+
+    def guide_end(self, reason="ended"):
+        """Tell the companion the guide is over so its walking double leaves.
+
+        This is the terminal-state door (done / stopped / abandoned /
+        superseded / a capture-failed give-up): the companion fades the double
+        and, when it has no other work (no watch, no look card, no ask field),
+        retires through its idle watchdog instead of lingering. Idempotent on
+        the companion, so a duplicate end is harmless; a later guide start
+        re-arms the double with the ordinary pet op. ``reason`` only feeds the
+        companion's ``guide-end:<reason>`` journal line.
+        """
+        text = " ".join(str(reason or "ended").split())[:40]
+        self._send({"op": "guide_end", "reason": text or "ended"})
 
     def quit(self):
         with self._io_lock:

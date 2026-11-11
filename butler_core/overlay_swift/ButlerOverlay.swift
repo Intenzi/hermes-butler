@@ -16,6 +16,7 @@
 //    {"op":"claim_chip","enabled":true,"sprite_w":63,"sprite_h":69,"pad_bottom":24}
 //    {"op":"launcher"}
 //    {"op":"done"}
+//    {"op":"guide_end","reason":"abandoned"}
 //    {"op":"axtrusted","prompt":true}
 //    {"op":"axcapture","target":null,"max_elements":150,"depth":10}
 //    {"op":"idle"}
@@ -1299,10 +1300,33 @@ private enum OverlayCommand {
     case watchStop
     case launcher
     case done
+    case guideEnd(String)
     case axtrusted(prompt: Bool)
     case axcapture(AXCaptureSpec)
     case idle
     case quit
+}
+
+/// One safe token for the `guide-end:<reason>` journal line.
+///
+/// The reason is producer-supplied and the journal is newline-delimited, so a
+/// hostile/broken value must not be able to inject lines. Anything outside
+/// `[A-Za-z0-9_-]` is dropped; an empty result falls back to "ended".
+private func guideEndReason(_ raw: Any?) -> String {
+    guard let text = stringValue(raw) else {
+        return "ended"
+    }
+    var cleaned = ""
+    for scalar in text.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars {
+        if CharacterSet.alphanumerics.contains(scalar)
+            || scalar == "_" || scalar == "-" {
+            cleaned.append(Character(scalar))
+        }
+        if cleaned.count >= 40 {
+            break
+        }
+    }
+    return cleaned.isEmpty ? "ended" : cleaned
 }
 
 private func parseCommand(line: String) -> OverlayCommand? {
@@ -1497,6 +1521,11 @@ private func parseCommand(line: String) -> OverlayCommand? {
 
     case "done":
         return .done
+
+    case "guide_end":
+        // The double leaves on ANY terminal guide state. `reason` only feeds
+        // the companion's journal; a missing/malformed one is "ended".
+        return .guideEnd(guideEndReason(object["reason"]))
 
     case "axtrusted":
         var prompt = false
@@ -3354,6 +3383,10 @@ private final class OverlayController {
     private let petFadeDuration: TimeInterval = 1.5
     private var petFarewell = false
     private var petFading = false
+    /// A terminal `guide_end` already retired the double. Makes the op
+    /// idempotent (a second end is a no-op); a later `pet` op — what a guide
+    /// start sends — clears it and re-arms the walk as before.
+    private var petGuideEnded = false
     private var petFadeStartTime: TimeInterval = 0.0
     private var petFadeFromAlpha: CGFloat = 1.0
 
@@ -3431,6 +3464,8 @@ private final class OverlayController {
             showLauncher()
         case .done:
             petDone()
+        case .guideEnd(let reason):
+            petGuideEnd(reason: reason)
         case .axtrusted(let prompt):
             writeAXResponse(axTrustedResponse(prompt: prompt))
         case .axcapture(let spec):
@@ -6349,6 +6384,8 @@ private final class OverlayController {
         petLastFrameAdvance = ProcessInfo.processInfo.systemUptime
         petFarewell = false
         petFading = false
+        // A new guide start re-arms the double after a previous guide_end.
+        petGuideEnded = false
         petOpacity = petParkedOpacity
         petOpacityStart = petParkedOpacity
         petOpacityTarget = petParkedOpacity
@@ -6528,6 +6565,29 @@ private final class OverlayController {
     }
 
     // MARK: Pet farewell
+
+    /// End the walking double because the GUIDE is over, at most once.
+    ///
+    /// Every terminal guide state (done / stopped / abandoned / superseded /
+    /// a capture-failed give-up) sends this. It reuses the farewell fade, so
+    /// abandonment cannot leave the "ghost pet" drawn. When the companion has
+    /// no other work (no watch, no look card, no ask field), the normal
+    /// post-farewell/idle-watchdog path retires the process instead of
+    /// lingering; a later pet op (a new guide start) re-arms the double.
+    private func petGuideEnd(reason: String) {
+        guard !isShuttingDown, !petGuideEnded else {
+            return
+        }
+        petGuideEnded = true
+        chipJournal("guide-end:\(reason)")
+        guard petWindow != nil, petSheet != nil, !petFarewell, !petFading else {
+            // Nothing is drawn (pet disabled, already gone, or already
+            // waving off): the idle watchdog retires a companion that has no
+            // other work.
+            return
+        }
+        petDone()
+    }
 
     private func petDone() {
         guard !isShuttingDown, petWindow != nil, petSheet != nil else {
@@ -6875,7 +6935,12 @@ private final class OverlayController {
               // An ambient watch is work: it may legitimately idle for hours
               // between two changes, so the idle watchdog must not retire the
               // observer (and silently end the watch) after 10 minutes.
-              watchObserver == nil else {
+              watchObserver == nil,
+              // A look card or an open ask field is live work too: a guide_end
+              // must not let the watchdog retire the companion out from under
+              // the user's question.
+              lookCardWindow == nil,
+              !summonFieldOpen else {
             return
         }
         shutdown()
@@ -6890,8 +6955,13 @@ private final class OverlayController {
     }
 
     private func scheduleExitAfterFarewell() {
+        // The double may leave while the companion still owns other work. Only
+        // a companion with nothing left to draw/observe retires itself; a
+        // watch, a look card or an open ask field keeps it alive (the idle
+        // watchdog retires it once that work is done).
         guard !isShuttingDown, activeRing == nil, chipWindow == nil,
-              watchObserver == nil else {
+              watchObserver == nil, lookCardWindow == nil,
+              !summonFieldOpen else {
             return
         }
         cancelPendingExit()
@@ -6902,7 +6972,9 @@ private final class OverlayController {
                   self.pendingExitGeneration == generation,
                   self.activeRing == nil,
                   self.chipWindow == nil,
-                  self.watchObserver == nil else {
+                  self.watchObserver == nil,
+                  self.lookCardWindow == nil,
+                  !self.summonFieldOpen else {
                 return
             }
             self.shutdown()

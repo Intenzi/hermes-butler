@@ -52,6 +52,26 @@ DEEP_MAX_ELEMENTS = 900
 DEEP_DEPTH = 24
 DEEP_CAPTURE_INTERVAL = 1.0  # seconds between deep walks, even if poll is faster
 
+#: The Hermes desktop app, matched by app name. A guide must never match a
+#: control inside this window unless its own plan targets Hermes: the chat
+#: transcript is rendered as AXStaticText rows, so a user who is looking at
+#: Hermes while reading the instructions can otherwise "ring" their own words
+#: and never verify. One place changes the name.
+HERMES_APP_NAMES = ("Hermes",)
+#: Titles of the Hermes main window. The second capture filter drops elements
+#: that claim both a Hermes app and this window, before ``best_match`` runs.
+HERMES_MAIN_WINDOW_TITLES = ("Hermes",)
+#: An AX box at or below this width/height is the "below the fold" sentinel
+#: macOS reports for a control that is in the tree but scrolled out of view
+#: (the measured row was [0, 832, 0, 0]). Ringing it draws a highlight at the
+#: origin, so the engine explains the scroll instead.
+DEGENERATE_BOX_MAX = 1.0
+#: Fallback visible screen frames ``(x, y, w, h)`` in AX coordinates, used only
+#: when a capture snapshot does not carry its own ``screens`` list. Empty means
+#: "unknown"; the engine then treats only a degenerate box as off-screen rather
+#: than guessing a display layout.
+SCREEN_VISIBLE_FRAMES = ()
+
 # Ambient WATCH (passive Accessibility observation). The companion owns the AX
 # observer; this process only keeps a bounded tail for the agent and the desktop.
 WATCH_RING = 40          # in-memory ring of the newest events
@@ -172,6 +192,247 @@ def _deep_capture():
     global _last_deep_capture_at
     _last_deep_capture_at = time.monotonic()
     return bp_capture.capture(max_elements=DEEP_MAX_ELEMENTS, depth=DEEP_DEPTH)
+
+
+def _is_hermes_app(value):
+    """True when an app name is the Hermes desktop app (case-insensitive)."""
+    if not isinstance(value, str):
+        return False
+    text = value.strip().lower()
+    return bool(text) and any(text == name.strip().lower()
+                              for name in HERMES_APP_NAMES)
+
+
+def _is_hermes_window_title(value):
+    """True when a window title is the Hermes main window title."""
+    if not isinstance(value, str):
+        return False
+    text = value.strip().lower()
+    return bool(text) and any(text == title.strip().lower()
+                              for title in HERMES_MAIN_WINDOW_TITLES)
+
+
+def _step_app_names(step):
+    """The app names a single step explicitly targets (app / app_frontmost)."""
+    expect = step.get("expect") if isinstance(step, dict) else None
+    if not isinstance(expect, dict):
+        return []
+    names = []
+    for key in ("app", "app_frontmost"):
+        value = expect.get(key)
+        if isinstance(value, str) and value.strip():
+            names.append(value.strip())
+    return names
+
+
+def _guide_names_hermes_without_apps(session):
+    """True when a plan with no app expectations is about the Hermes app.
+
+    This is the narrow fallback for a hands-off guide ("Open Hermes
+    settings"): with no ``expect.app`` anywhere, the title/instruction/find
+    label is the only statement of intent. When ANY step verifies something
+    (a window, a visible control) that does not name Hermes, a title mention is
+    the SUBJECT of the task — the measured "Allow Screen Recording for Hermes"
+    expects System Settings — and the plan is not a Hermes plan.
+    """
+    steps = session.get("steps") if isinstance(session, dict) else None
+    steps = steps if isinstance(steps, list) else []
+    if any(_step_app_names(step) for step in steps):
+        # An explicit app expectation decides per step; never guide-wide.
+        return False
+    expect_texts = []
+    any_expect = False
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        expect = step.get("expect") if isinstance(step.get("expect"), dict) else {}
+        if expect:
+            any_expect = True
+        expect_texts.extend(value for value in expect.values()
+                            if isinstance(value, str))
+    if any("hermes" in text.lower() for text in expect_texts):
+        return True
+    if any_expect:
+        return False
+    texts = [session.get("title")]
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        texts.append(step.get("say"))
+        find = step.get("find") if isinstance(step.get("find"), dict) else {}
+        texts.append(find.get("label"))
+    return any(isinstance(text, str) and "hermes" in text.lower()
+               for text in texts)
+
+
+def _guide_names_app_hermes(session):
+    """True when any step explicitly targets Hermes as its app."""
+    steps = session.get("steps") if isinstance(session, dict) else None
+    for step in steps if isinstance(steps, list) else []:
+        if any(_is_hermes_app(name) for name in _step_app_names(step)):
+            return True
+    return False
+
+
+def _guide_hermes_guard_applies(session, step):
+    """True when a Hermes capture must not be matched for THIS step.
+
+    Per-step, not guide-wide: a mixed plan (step 1 System Settings, step 2
+    Hermes) still protects step 1, because a step that names its own app is
+    judged only by that app. An app-less step inherits the guide's intent: a
+    plan that names Hermes as an app anywhere keeps its app-less steps
+    working; a hands-off plan is judged by its title/instruction.
+    """
+    names = _step_app_names(step)
+    if any(_is_hermes_app(name) for name in names):
+        return False
+    if names:
+        # This step explicitly targets another app; the guide-wide intent must
+        # not unguard it (the measured mixed-guide regression).
+        return True
+    if _guide_names_app_hermes(session):
+        return False
+    return not _guide_names_hermes_without_apps(session)
+
+
+def _guide_target_app(session, step):
+    """The app a blocked Hermes step is really about, for the switch note.
+
+    Precedence: this step's ``expect.app``, then the last app the guide
+    verified, then the first step that names an app, else None (the caller
+    says "the app the step is about").
+    """
+    names = _step_app_names(step)
+    if names:
+        return names[0]
+    if isinstance(session, dict):
+        last = session.get("last_verified_app")
+        if isinstance(last, str) and last.strip():
+            return last.strip()
+        for other in session.get("steps") or []:
+            other_names = _step_app_names(other)
+            if other_names:
+                return other_names[0]
+    return None
+
+
+def _snapshot_without_hermes_window(snap):
+    """Drop captured rows that belong to the Hermes main window.
+
+    A capture's elements normally only carry role/label/box, so this is the
+    second layer of the Hermes guard: when a row DOES claim its app/window
+    (older helpers, synthetic captures), the chat transcript must never reach
+    ``best_match``. Missing per-element app/window fall back to the capture's
+    own, which is what every row in a single-app walk belongs to.
+    """
+    elements = snap.get("elements") if isinstance(snap, dict) else None
+    if not isinstance(elements, list) or not elements:
+        return snap
+    kept = []
+    dropped = False
+    snap_app = snap.get("app")
+    snap_window = snap.get("window")
+    for element in elements:
+        if not isinstance(element, dict):
+            kept.append(element)
+            continue
+        app = element.get("app")
+        window = element.get("window")
+        if app is None:
+            app = snap_app
+        if window is None and _is_hermes_app(app):
+            window = snap_window
+        if _is_hermes_app(app) and _is_hermes_window_title(window):
+            dropped = True
+            continue
+        kept.append(element)
+    if not dropped:
+        return snap
+    filtered = dict(snap)
+    filtered["elements"] = kept
+    filtered["count"] = len(kept)
+    # Keep the diagnostics honest: both counters describe the rows that reach
+    # best_match/expect_pending, not the raw walk.
+    filtered["with_box"] = sum(
+        1 for element in kept
+        if isinstance(element, dict)
+        and isinstance(element.get("box"), (list, tuple))
+        and len(element["box"]) == 4
+        and element["box"][0] is not None)
+    return filtered
+
+
+def _guard_capture(session, step, snap):
+    """Return a screenshot safe to match for this step, or None when blocked.
+
+    None means "the frontmost capture is the Hermes window and this step is
+    about another app": nothing in that window may be rung, and the user is
+    told to switch. A guide that legitimately targets Hermes never blocks.
+    """
+    if not _guide_hermes_guard_applies(session, step):
+        return snap
+    if _is_hermes_app(snap.get("app")):
+        return None
+    return _snapshot_without_hermes_window(snap)
+
+
+def _box_value(value):
+    """A finite float from an AX scalar, or None when it is not a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return None if number != number else number
+
+
+def _visible_screen_frames(snapshot=None):
+    """Visible frames ``(x, y, w, h)`` reported by the capture, best-effort.
+
+    A companion snapshot may carry them under ``screens``; when it does not,
+    the module-level ``SCREEN_VISIBLE_FRAMES`` is the testable escape hatch.
+    An empty result means the layout is unknown (no off-screen guess is made
+    beyond the degenerate-box sentinel).
+    """
+    candidates = []
+    if isinstance(snapshot, dict):
+        raw = snapshot.get("screens")
+        if isinstance(raw, (list, tuple)):
+            candidates.extend(raw)
+    if not candidates:
+        candidates.extend(SCREEN_VISIBLE_FRAMES)
+    frames = []
+    for item in candidates:
+        if not isinstance(item, (list, tuple)) or len(item) != 4:
+            continue
+        values = [_box_value(value) for value in item]
+        if any(value is None for value in values):
+            continue
+        x, y, width, height = values
+        if width <= 0.0 or height <= 0.0:
+            continue
+        frames.append((x, y, width, height))
+    return frames
+
+
+def _box_is_offscreen(box, snapshot=None):
+    """True when a matched box is degenerate or anchored outside every screen.
+
+    The degenerate case is the measured defect: a sidebar row scrolled below
+    the fold reports ``[0, 832, 0, 0]``, which the companion cannot ring, so a
+    bare highlight used to land at the origin with no explanation.
+    """
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return False
+    values = [_box_value(value) for value in box]
+    if any(value is None for value in values):
+        return False
+    x, y, width, height = values
+    if width <= DEGENERATE_BOX_MAX or height <= DEGENERATE_BOX_MAX:
+        return True
+    frames = _visible_screen_frames(snapshot)
+    if not frames:
+        return False
+    return not any(fx <= x <= fx + fw and fy <= y <= fy + fh
+                   for fx, fy, fw, fh in frames)
 
 
 def _as_bool(value, default=False):
@@ -1186,6 +1447,86 @@ def _loop():
             _write_state()
 
 
+def _set_guard_note(s, note, reset_clock=True):
+    """Publish a guard note and keep the step's timeout from firing under it.
+
+    The note is stable (never carries a changing counter), so the pet's speech
+    dedupe can suppress repeats. ``guard_note`` records that the note belongs
+    to a guard (Hermes capture / off-screen control) so a normal poll can clear
+    it without ever clobbering a real stall note. The clock is reset only when
+    the note FIRST appears, so a user who is plausibly scrolling is not
+    abandoned at 120 s while they read it.
+    """
+    state = s.setdefault("state", {})
+    first = state.get("guard_note") != note
+    if first and reset_clock:
+        state["step_opened_at"] = time.time()
+    # Re-assert on EVERY poll while the guard holds, not only on first
+    # appearance: if the stall block ran between two guarded polls, the
+    # actionable note must replace the generic stall note and the guide must
+    # leave `stalled` instead of escalating to the 180 s abandonment.
+    state.pop("stalled_at", None)
+    if state.get("status") == "stalled":
+        state["status"] = "running"
+    state["guard_note"] = note
+    state["note"] = note
+
+
+def _clear_guard_note(s):
+    """Drop a guard note once its condition no longer holds."""
+    state = s.get("state") if isinstance(s, dict) else None
+    if not isinstance(state, dict):
+        return
+    guard = state.pop("guard_note", None)
+    if guard and state.get("note") == guard:
+        state["note"] = None
+
+
+def _journal_token(value, limit=40):
+    """A single space-free journal token (same rule as the companion).
+
+    The journal is one event per line; a multi-word reason would otherwise
+    break a consumer that tokenizes it. Reads the same as ``guide-end:<token>``
+    on both sides of the pipe.
+    """
+    text = "".join(ch for ch in str(value or "") if ch.isalnum() or ch in "_-")
+    return text[:limit] or "stopped"
+
+
+def _end_guide_overlay(s, reason):
+    """Tell the companion this guide is over, at most once per guide.
+
+    Every terminal path (done / stopped / abandoned / superseded / a
+    capture-failed give-up) funnels through here. The ``guide_end`` op fades
+    the walking double so abandonment cannot leave the "ghost pet" that the
+    measured session did. The journal line traces a ghost back to a missed
+    end. Returns True only for the first end of this guide.
+    """
+    if not isinstance(s, dict) or s.get("guide_end"):
+        return False
+    # One safe token: the journal is newline-delimited and the companion
+    # sanitizes the same way, so a reason can never inject a log line.
+    reason = " ".join(str(reason or "stopped").split())[:40] or "stopped"
+    s["guide_end"] = reason
+    try:
+        bp_overlay.journal_click("engine-guide-end:%s" % _journal_token(reason))
+    except Exception:  # noqa: BLE001 - tracing must not fail a terminal path
+        pass
+    end = getattr(_OVERLAY, "guide_end", None)
+    if callable(end):
+        try:
+            end(reason)
+        except TypeError:
+            # Older/simple test doubles may only accept no argument.
+            try:
+                end()
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001 - overlay cleanup is best-effort
+            pass
+    return True
+
+
 def _abandon_stalled(s, idx):
     """Stop a guide that stayed stalled past the auto-stop deadline.
 
@@ -1203,10 +1544,20 @@ def _abandon_stalled(s, idx):
     s["current_box"] = None
     s["current_label"] = None
     s["overlay"] = "idle"
+    # This is the measured ghost: the walker double stayed on screen because
+    # abandonment only idled the ring. End it (once) before the state write.
+    _end_guide_overlay(s, "abandoned")
+    # Exactly one pet line per abandonment: the say row is spoken once by id,
+    # and the terminal block's precedence no longer repeats it afterwards.
+    # Gate on its OWN flag, not the guide_end latch, so a guide that was
+    # already ended under another reason still speaks the promised line once;
+    # set it BEFORE the save so a reloaded session cannot speak it again.
+    if not s.get("abandon_said"):
+        s["abandon_said"] = True
+        say("Guide stopped — step %d never verified" % (idx + 1))
     _save_session(s)
     _OVERLAY.idle()
     _write_state()
-    say("Guide stopped — step %d never verified" % (idx + 1))
     _stop_flag = True
 
 
@@ -1226,10 +1577,24 @@ def _supersede_active(reason="replaced by a new guide"):
     active["current_box"] = None
     active["current_label"] = None
     active["overlay"] = "idle"
+    _end_guide_overlay(active, "superseded")
     _save_session(active)
     _OVERLAY.idle()
     say("Replaced the previous guide")
     return active
+
+
+def _note_hermes_blocked(s, step, snap):
+    """Explain that this step cannot be read inside the Hermes window."""
+    target = _guide_target_app(s, step) or "the app the step is about"
+    note = "Butler can't read the Hermes window for this step — switch to %s" % target
+    _set_guard_note(s, note)
+    s["current_box"] = None
+    s["current_label"] = None
+    s["overlay"] = "waiting"
+    s["last_capture_app"] = snap.get("app")
+    s["last_captured_at"] = time.time()
+    _OVERLAY.idle()
 
 
 def _poll_once(s):
@@ -1241,7 +1606,19 @@ def _poll_once(s):
         s["state"] = dict(s["state"], status="capture_failed")
         s["capture_note"] = snap.get("note") or snap.get("error")
         s["fix"] = snap.get("fix")
+        # A guide that cannot read the screen is a give-up: the poll loop will
+        # not retry a capture_failed row, so end the walk instead of leaving
+        # the pet double parked forever.
+        _OVERLAY.idle()
+        _end_guide_overlay(s, "capture_failed")
         return
+    # Fix 1: the frontmost app may be Hermes while this step is about another
+    # app. Its chat transcript is AXStaticText and must never be a target.
+    guarded = _guard_capture(s, step, snap)
+    if guarded is None:
+        _note_hermes_blocked(s, step, snap)
+        return
+    snap = guarded
     label_needle, best, verdict = _evaluate_step(step, snap)
     # Deep pass: Electron overlays/pages nest their real controls below the
     # shallow walk's depth. Re-walk once, and only when the shallow snapshot
@@ -1250,7 +1627,11 @@ def _poll_once(s):
     if _step_needs_deep(step, best, verdict) and _deep_capture_allowed():
         deep = _deep_capture()
         if not deep.get("error") and deep.get("trusted") is not False:
-            snap = deep
+            guarded = _guard_capture(s, step, deep)
+            if guarded is None:
+                _note_hermes_blocked(s, step, deep)
+                return
+            snap = guarded
             label_needle, best, verdict = _evaluate_step(step, snap)
     s["last_capture_app"] = snap.get("app")
     s["last_captured_at"] = time.time()
@@ -1265,6 +1646,19 @@ def _poll_once(s):
             if app_snap.get("app") and (app_snap.get("window")
                                         or int(app_snap.get("count") or 0) > 0):
                 verdict = {"verified": True, "reason": "app_open_targeted"}
+    # Fix 2: a control scrolled below the fold reports a degenerate box (often
+    # at the origin), or its origin is outside every visible screen. Ringing it
+    # would draw a highlight over nothing, so explain the scroll instead and
+    # leave the step unresolved without starting the stall clock again.
+    if best is not None and _box_is_offscreen(best.get("box"), snap):
+        label = best.get("label") or label_needle or "the control"
+        _set_guard_note(s, "Scroll to bring %s into view" % label)
+        s["current_box"] = None
+        s["current_label"] = None
+        s["overlay"] = "waiting"
+        _OVERLAY.idle()
+        return
+    _clear_guard_note(s)
     if best is not None and best.get("box"):
         s["current_box"] = best["box"]
         s["current_label"] = best.get("label")
@@ -1289,6 +1683,10 @@ def _poll_once(s):
         s["state"]["status"] = "running"
         s["state"]["note"] = None
         s["state"].pop("stalled_at", None)
+        # Remember the app this guide last proved: a later Hermes capture names
+        # it instead of guessing "the app the step is about".
+        if isinstance(snap.get("app"), str) and snap["app"].strip():
+            s["last_verified_app"] = snap["app"].strip()
         s["verifications"].append({"step": idx, "reason": verdict["reason"],
                                    "verified_at": time.time()})
         idx += 1
@@ -1302,6 +1700,7 @@ def _poll_once(s):
             s["current_label"] = None
             _OVERLAY.idle()
             _OVERLAY.done()
+            _end_guide_overlay(s, "done")
         else:
             nxt = s["steps"][idx]
             s["state"]["say"] = nxt["say"]
@@ -1378,6 +1777,8 @@ def guide_start(args, unattended=False):
         except Exception as exc:  # capture must never orphan a live guide
             guide["state"] = dict(guide["state"], status="capture_failed")
             guide["capture_note"] = "startup capture raised: %r" % exc
+            _OVERLAY.idle()
+            _end_guide_overlay(guide, "capture_failed")
             _save_session()
             _write_state()
             return {"guide_id": guide["id"], "title": guide["title"],
@@ -1387,11 +1788,27 @@ def guide_start(args, unattended=False):
             guide["state"] = dict(guide["state"], status="capture_failed")
             guide["capture_note"] = first.get("note") or first.get("error")
             guide["fix"] = first.get("fix")
+            _OVERLAY.idle()
+            _end_guide_overlay(guide, "capture_failed")
             _save_session()
             _write_state()
             return {"guide_id": guide["id"], "title": guide["title"],
                     "state": guide["state"], "capture_note": guide["capture_note"],
                     "fix": guide["fix"], "total_steps": len(steps)}
+        guarded = _guard_capture(guide, steps[0], first)
+        if guarded is None:
+            # Same Hermes protection as the poll: never ring the chat
+            # transcript just because the user is reading the guide there.
+            _note_hermes_blocked(guide, steps[0], first)
+            _save_session()
+            _write_state()
+            return {"guide_id": guide["id"], "title": guide["title"],
+                    "step": {"idx": 1, "say": guide["state"]["say"]},
+                    "overlay": guide["overlay"],
+                    "note": guide["state"].get("note"),
+                    "replaced": replaced_id,
+                    "total_steps": len(steps)}
+        first = guarded
         find0 = steps[0].get("find") or {}
         best = bp_capture.best_match(first.get("elements", []),
                                      find0.get("label"), find0.get("role"))
@@ -1401,12 +1818,32 @@ def guide_start(args, unattended=False):
         if find0.get("label") and best is None and _deep_capture_allowed():
             deep = _deep_capture()
             if not deep.get("error") and deep.get("trusted") is not False:
-                first = deep
+                guarded = _guard_capture(guide, steps[0], deep)
+                if guarded is None:
+                    _note_hermes_blocked(guide, steps[0], deep)
+                    _save_session()
+                    _write_state()
+                    return {"guide_id": guide["id"], "title": guide["title"],
+                            "step": {"idx": 1, "say": guide["state"]["say"]},
+                            "overlay": guide["overlay"],
+                            "note": guide["state"].get("note"),
+                            "replaced": replaced_id,
+                            "total_steps": len(steps)}
+                first = guarded
                 best = bp_capture.best_match(first.get("elements", []),
                                              find0.get("label"), find0.get("role"))
         guide["last_capture_app"] = first.get("app")
         guide["last_captured_at"] = time.time()
-        if best is not None and best.get("box"):
+        if best is not None and _box_is_offscreen(best.get("box"), first):
+            # A first-step control below the fold: explain the scroll rather
+            # than parking a ring at the origin.
+            label = best.get("label") or find0.get("label") or "the control"
+            _set_guard_note(guide, "Scroll to bring %s into view" % label)
+            guide["current_box"] = None
+            guide["current_label"] = None
+            guide["overlay"] = "waiting"
+            _OVERLAY.idle()
+        elif best is not None and best.get("box"):
             guide["current_box"] = best["box"]
             guide["current_label"] = best.get("label")
             guide["overlay"] = "ringing"
@@ -1451,6 +1888,10 @@ def guide_stop(reason="stopped"):
         _session["state"]["stopped_at"] = stopped_at
         _session["reason"] = reason
         _session["current_box"] = None
+        # End the walk before the companion is quit: the journal line makes a
+        # missing/present guide_end traceable even though quit tears the
+        # process down. Idempotent, so a guide already ended calls nothing.
+        _end_guide_overlay(_session, reason)
         stopped = dict(_session)
         _OVERLAY.quit()
         stopped["overlay"] = "stopped"

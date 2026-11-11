@@ -64,11 +64,11 @@ def _element(label, box=(10, 20, 30, 40), role="AXButton"):
     return {"role": role, "label": label, "box": list(box), "id": 0}
 
 
-def _snapshot(elements, app="Hermes"):
+def _snapshot(elements, app="System Settings"):
     return {
         "trusted": True,
         "app": app,
-        "window": "Hermes",
+        "window": "Settings",
         "count": len(elements),
         "with_box": len(elements),
         "elements": list(elements),
