@@ -66,6 +66,12 @@ def _element(label, box=(10, 20, 30, 40), role="AXButton"):
     return {"role": role, "label": label, "box": list(box), "id": 0}
 
 
+def _windowed_element(label, window, box=(10, 20, 30, 40), role="AXButton"):
+    element = _element(label, box=box, role=role)
+    element["window"] = window
+    return element
+
+
 def _step(find_label, expect=None, say="Do the thing"):
     step = {"say": say}
     if find_label is not None:
@@ -133,8 +139,8 @@ def test_hermes_capture_never_advances_a_step_about_another_app(
     assert session["state"]["idx"] == 0, "the transcript must not verify a step"
     assert session["verifications"] == []
     assert session["state"]["note"] == (
-        "Butler can't read the Hermes window for this step — "
-        "switch to System Settings")
+        "Switch to System Settings — this step happens in System Settings")
+    assert session["scope_app"] == "System Settings"
     assert fake.published == [], "nothing inside the Hermes window may ring"
     assert fake.idled >= 1
     assert session["state"]["status"] != "stalled"
@@ -143,8 +149,10 @@ def test_hermes_capture_never_advances_a_step_about_another_app(
 
 def test_the_switch_note_names_the_last_verified_app(
         engine_state, monkeypatch) -> None:
+    # No declared app anywhere: the step is unscoped, so the round-24 Hermes
+    # guard still applies and its note names the app the guide last proved.
     eng, _fake, _tmp = engine_state
-    session = _session([_step("Screen Recording", {"app": "System Settings"})])
+    session = _session([_step("Screen Recording", {"visible": "Screen Recording"})])
     session["last_verified_app"] = "System Settings"
     monkeypatch.setattr(eng.bp_capture, "capture",
                         lambda **kwargs: _snapshot([], app="Hermes",
@@ -152,6 +160,7 @@ def test_the_switch_note_names_the_last_verified_app(
 
     eng._poll_once(session)
 
+    assert session["scope_app"] is None
     assert session["state"]["note"].endswith("switch to System Settings")
 
 
@@ -193,7 +202,8 @@ def test_a_mixed_guide_keeps_the_guard_on_its_non_hermes_step(
     eng._poll_once(session)
 
     assert session["state"]["idx"] == 0
-    assert session["state"]["note"].endswith("switch to System Settings")
+    assert session["state"]["note"] == (
+        "Switch to System Settings — this step happens in System Settings")
     assert fake.published == []
 
     # Step 2 is a Hermes step and must still match inside Hermes.
@@ -414,8 +424,7 @@ def test_guide_start_in_hermes_returns_the_switch_note_without_ringing(
 
     assert result["overlay"] == "waiting"
     assert result["note"] == (
-        "Butler can't read the Hermes window for this step — "
-        "switch to System Settings")
+        "Switch to System Settings — this step happens in System Settings")
     assert fake.published == []
     assert fake.guide_ends == [], "a live guide has not ended"
 
@@ -455,3 +464,353 @@ def test_capture_failed_start_ends_the_walk(engine_state, monkeypatch) -> None:
 
     assert result["state"]["status"] == "capture_failed"
     assert fake.guide_ends == ["capture_failed"]
+
+
+# ------------------------------------------- Round 25: every step has a scope
+#
+# The shipped guard only blocked the Hermes window. The general rule is wider:
+# a step scoped to an app may not match a capture of any other app, and Hermes
+# is one instance of "the wrong app". These tests pin the scope resolution, the
+# app-scoped matching, the window PREFERENCE (never a hard filter) and the
+# unscoped fallback with its one-time journal line.
+
+
+def test_a_capture_of_another_app_never_matches_and_resets_the_clock_once(
+        engine_state, monkeypatch) -> None:
+    eng, fake, _tmp = engine_state
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_element("Privacy & Security",
+                                      box=(331, 149, 126, 17),
+                                      role="AXStaticText")],
+                            app="Hermes", window="Hermes"))
+    opened_at = time.time() - eng.step_timeout() - 50
+    session = _session(
+        [_step("Privacy & Security", {"app": "System Settings"})],
+        opened_at=opened_at)
+
+    eng._poll_once(session)
+
+    assert session["scope_app"] == "System Settings"
+    assert session["state"]["idx"] == 0
+    assert session["verifications"] == []
+    assert session["state"]["note"] == (
+        "Switch to System Settings — this step happens in System Settings")
+    assert fake.published == [], "another app must never ring"
+    assert fake.idled >= 1
+    assert session["state"]["status"] == "running"
+    assert "stalled_at" not in session["state"], \
+        "switching apps is not a stall"
+    reset_at = session["state"]["step_opened_at"]
+    assert reset_at > opened_at
+
+    eng._poll_once(session)
+
+    assert session["state"]["note"] == (
+        "Switch to System Settings — this step happens in System Settings")
+    assert session["state"]["step_opened_at"] == reset_at, \
+        "the clock resets only the first time the note appears"
+
+
+def test_a_capture_of_the_scoped_app_matches_normally(
+        engine_state, monkeypatch) -> None:
+    eng, fake, _tmp = engine_state
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_element("Privacy & Security",
+                                      box=(100, 200, 30, 30))],
+                            app="System Settings", window="Screen Recording"))
+    session = _session(
+        [_step("Privacy & Security", {"app": "System Settings"})])
+
+    eng._poll_once(session)
+
+    assert session["scope_app"] == "System Settings"
+    assert session["state"]["idx"] == 1
+    assert session["state"]["status"] == "done"
+    assert session["state"]["note"] is None
+    assert [row["reason"] for row in session["verifications"]] == ["app_focused"]
+    assert fake.published and fake.published[-1]["current_box"] == [100, 200, 30, 30]
+
+
+def test_an_app_less_step_inherits_the_nearest_earlier_scope(
+        engine_state, monkeypatch) -> None:
+    eng, fake, _tmp = engine_state
+    session = _session([
+        _step("Keyboard", {"app": "System Settings"}),
+        _step("Network", {"visible": "Network"}),
+    ])
+    session["state"]["idx"] = 1
+    session["state"]["step_opened_at"] = time.time()
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_element("Network")], app="Hermes",
+                            window="Hermes"))
+
+    assert eng._resolve_scope_app(session, 1) == "System Settings"
+
+    eng._poll_once(session)
+
+    assert session["scope_app"] == "System Settings"
+    assert session["state"]["idx"] == 1, "an inherited scope still hard-filters"
+    assert session["state"]["note"] == (
+        "Switch to System Settings — this step happens in System Settings")
+    assert fake.published == []
+
+
+def test_expect_app_alone_sets_the_step_scope(
+        engine_state, monkeypatch) -> None:
+    eng, fake, _tmp = engine_state
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_element("Keyboard")], app="Preview",
+                            window="Keyboard"))
+    session = _session([_step("Keyboard", {"app": "System Settings"})])
+
+    eng._poll_once(session)
+
+    assert session["scope_app"] == "System Settings"
+    assert session["state"]["idx"] == 0
+    assert session["state"]["note"] == (
+        "Switch to System Settings — this step happens in System Settings")
+    assert fake.published == []
+
+
+def test_a_window_hint_prefers_but_never_hard_filters_a_menu_of_the_same_app(
+        engine_state, monkeypatch) -> None:
+    eng, fake, _tmp = engine_state
+    # The menu row is a different window of the same app: it must still match.
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_windowed_element("Network", "Menubar menu",
+                                               box=(10, 20, 30, 40))],
+                            app="System Settings", window="System Settings"))
+    step = {"say": "Open Network",
+            "find": {"label": "Network", "app": "System Settings"},
+            "expect": {"window": "Network"}}
+    session = _session([step])
+
+    eng._poll_once(session)
+
+    assert session["scope_app"] == "System Settings"
+    assert fake.published and fake.published[-1]["current_box"] == [10, 20, 30, 40]
+    # The window title differs, so the expect is not satisfied — but the find
+    # still matched, which is what proves the hint is not a filter.
+    assert session["state"]["idx"] == 0
+
+
+def test_a_window_hint_prefers_the_named_window_on_a_tie(
+        engine_state, monkeypatch) -> None:
+    eng, fake, _tmp = engine_state
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_windowed_element("Network", "System Settings",
+                                               box=(1, 2, 3, 4)),
+                             _windowed_element("Network", "Network",
+                                               box=(10, 20, 30, 40))],
+                            app="System Settings", window="System Settings"))
+    step = {"say": "Open Network", "find": {"label": "Network"},
+            "expect": {"window": "Network"}}
+    session = _session([step])
+
+    eng._poll_once(session)
+
+    assert fake.published and fake.published[-1]["current_box"] == [10, 20, 30, 40], \
+        "the named window ranks first among equal matches"
+
+
+def test_a_step_naming_hermes_matches_hermes_content(
+        engine_state, monkeypatch) -> None:
+    """The guard is a scope, not a blanket ban on any capture."""
+    eng, fake, _tmp = engine_state
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_element("Settings")], app="Hermes",
+                            window="Hermes"))
+    session = _session([
+        {"say": "Open Settings",
+         "find": {"label": "Settings", "app": "Hermes"},
+         "expect": {"visible": "Settings"}},
+    ])
+
+    eng._poll_once(session)
+
+    assert session["scope_app"] == "Hermes"
+    assert session["state"]["idx"] == 1
+    assert session["state"]["status"] == "done"
+    assert fake.published and fake.published[-1]["current_label"] == "Settings"
+
+
+def test_an_unresolved_scope_matches_unscoped_and_journals_once(
+        engine_state, monkeypatch) -> None:
+    eng, fake, _tmp = engine_state
+    journaled = []
+    monkeypatch.setattr(eng.bp_overlay, "journal_click", journaled.append)
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_element("Keyboard"), _element("Network")],
+                            app="Preview", window="Keyboard"))
+    session = _session([
+        _step("Keyboard", {"visible": "Keyboard"}),
+        _step("Network", {"visible": "Network"}),
+    ])
+
+    eng._poll_once(session)
+    assert session["state"]["idx"] == 1
+    assert session["scope_app"] is None
+
+    eng._poll_once(session)
+
+    assert session["state"]["idx"] == 2
+    assert session["state"]["status"] == "done"
+    assert session["scope_app"] is None
+    assert journaled.count("guide-scope:unresolved") == 1, \
+        "one journal line per guide, not per step/poll"
+    assert fake.published, "an unscoped step still matches, exactly as before"
+
+
+def test_normalize_step_keeps_find_app_and_window() -> None:
+    clean = engine._normalize_step({
+        "say": "Open Network",
+        "find.label": "Network",
+        "find.app": "System Settings",
+        "find.window": "Network",
+    })
+
+    assert clean["find"] == {"label": "Network", "app": "System Settings",
+                             "window": "Network"}
+
+
+def test_scope_only_keys_do_not_make_a_dead_step_verifiable() -> None:
+    assert engine._normalize_step({"say": "Open System Settings",
+                                   "find.app": "System Settings"}) is None
+
+
+def test_an_inherited_hermes_scope_still_matches_hermes_content(
+        engine_state, monkeypatch) -> None:
+    """Inheritance must not trip the round-24 Hermes title heuristic.
+
+    Step 2 declares no app and inherits Hermes from step 1: the capture IS the
+    scoped app, so the belt-and-braces Hermes guard has nothing to block.
+    """
+    eng, fake, _tmp = engine_state
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_element("Send")], app="Hermes", window="Hermes"))
+    session = _session([
+        {"say": "Open Settings",
+         "find": {"label": "Settings", "app": "Hermes"}},
+        _step("Send", {"visible": "Send"}),
+    ])
+    session["state"]["idx"] = 1
+    session["state"]["step_opened_at"] = time.time()
+
+    eng._poll_once(session)
+
+    assert session["scope_app"] == "Hermes"
+    assert session["state"]["idx"] == 2
+    assert session["state"]["status"] == "done"
+    assert fake.published and fake.published[-1]["current_label"] == "Send"
+
+
+def test_a_second_blocked_step_in_the_same_scope_resets_its_own_clock(
+        engine_state, monkeypatch) -> None:
+    """Each switch note is a NEW guard note, so step 2 gets a fresh clock."""
+    eng, fake, _tmp = engine_state
+    blocked = _snapshot(
+        [_element("Privacy & Security", box=(331, 149, 126, 17))],
+        app="Hermes", window="Hermes")
+    allowed = _snapshot(
+        [_element("Privacy & Security", box=(100, 200, 30, 30))],
+        app="System Settings", window="Screen Recording")
+    calls = {"n": 0}
+
+    def capture(**kwargs):
+        calls["n"] += 1
+        return blocked if calls["n"] in (1, 3) else allowed
+
+    monkeypatch.setattr(eng.bp_capture, "capture", capture)
+    session = _session([
+        _step("Privacy & Security", {"app": "System Settings"}),
+        _step("Privacy & Security", {"app": "System Settings"}),
+    ])
+
+    eng._poll_once(session)
+    assert session["state"]["note"] == (
+        "Switch to System Settings — this step happens in System Settings")
+
+    eng._poll_once(session)
+    assert session["state"]["idx"] == 1, "the scoped capture advances"
+    assert session["state"]["note"] is None
+
+    old = time.time() - eng.step_timeout() - 50
+    session["state"]["step_opened_at"] = old
+    eng._poll_once(session)
+
+    assert session["state"]["idx"] == 1
+    assert session["state"]["step_opened_at"] > old, \
+        "a repeated note on a NEW step must reset the clock again"
+    assert session["state"]["status"] == "running"
+    assert "stalled_at" not in session["state"]
+
+
+def test_a_capture_that_only_carries_per_row_apps_is_still_scoped(
+        engine_state, monkeypatch) -> None:
+    """The companion sets ``app`` per snapshot; a row-only capture still works."""
+    eng, fake, _tmp = engine_state
+    row = dict(_element("Privacy & Security", box=(100, 200, 30, 30)),
+               app="System Settings")
+    snapshot = {"trusted": True, "app": None, "window": "Screen Recording",
+                "count": 1, "with_box": 1, "elements": [row]}
+    monkeypatch.setattr(eng.bp_capture, "capture", lambda **kwargs: snapshot)
+    session = _session([
+        {"say": "Open Screen Recording",
+         "find": {"label": "Privacy & Security", "app": "System Settings"},
+         "expect": {"visible": "Privacy & Security"}},
+    ])
+
+    eng._poll_once(session)
+
+    assert session["scope_app"] == "System Settings"
+    assert session["state"]["idx"] == 1
+    assert fake.published and fake.published[-1]["current_box"] == [100, 200, 30, 30]
+
+
+def test_a_broad_scope_name_does_not_match_a_longer_app_name(
+        engine_state, monkeypatch) -> None:
+    """A hard filter must not widen "Mail" into "Gmail"."""
+    eng, fake, _tmp = engine_state
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_element("Inbox")], app="Gmail",
+                            window="Inbox"))
+    session = _session([
+        {"say": "Open the Inbox", "find": {"label": "Inbox", "app": "Mail"},
+         "expect": {"visible": "Inbox"}},
+    ])
+
+    eng._poll_once(session)
+
+    assert session["state"]["idx"] == 0
+    assert session["state"]["note"] == (
+        "Switch to Mail — this step happens in Mail")
+    assert fake.published == []
+
+
+def test_a_short_scope_name_matches_the_localized_app_name(
+        engine_state, monkeypatch) -> None:
+    """The plan may spell "Settings" for "System Settings" (whole-word)."""
+    eng, fake, _tmp = engine_state
+    monkeypatch.setattr(eng.bp_capture, "capture",
+                        lambda **kwargs: _snapshot(
+                            [_element("Keyboard")], app="System Settings",
+                            window="Keyboard"))
+    session = _session([
+        {"say": "Open Keyboard", "find": {"label": "Keyboard", "app": "Settings"},
+         "expect": {"visible": "Keyboard"}},
+    ])
+
+    eng._poll_once(session)
+
+    assert session["state"]["idx"] == 1
+    assert fake.published

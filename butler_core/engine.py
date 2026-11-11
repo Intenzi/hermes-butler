@@ -165,7 +165,12 @@ def _evaluate_step(step, snap):
     label_needle = find.get("label")
     best = None
     if label_needle:
-        best = bp_capture.best_match(snap.get("elements", []), label_needle,
+        # The app filter already ran (``_scope_capture``); the window hint only
+        # PREFERS rows, so a control in a menu/sheet of the same app still wins.
+        elements = _prefer_window(snap.get("elements", []),
+                                  _step_window_hint(step),
+                                  snap.get("window"))
+        best = bp_capture.best_match(elements, label_needle,
                                      find.get("role"))
     verdict = bp_capture.expect_pending(step.get("expect") or {}, snap, best)
     return label_needle, best, verdict
@@ -212,16 +217,248 @@ def _is_hermes_window_title(value):
                               for title in HERMES_MAIN_WINDOW_TITLES)
 
 
+# --- guide scope: a step may only match inside the app it is about ----------
+#
+# The shipped guard only blocked the Hermes window. The general rule is wider:
+# a step about System Settings must never match anything captured from another
+# app, and the Hermes case is one instance of it. Every step therefore resolves
+# a scope app (find.app, else expect.app, else the nearest earlier step that
+# names one). An unresolved step keeps the old unscoped behavior — the scope is
+# never invented from a title or a capture.
+
+def _clean_app_name(value):
+    """A non-empty app name from a step or a capture, or None."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _step_declared_app(step):
+    """The app a single step names for its own scope, or None.
+
+    ``find.app`` wins over ``expect.app``: locating is what the step is about.
+    ``expect.app_frontmost`` is accepted as the same explicit declaration (it
+    names an app, it does not infer one), so a "Focus System Settings" step is
+    scoped even though its only app key is the focus one.
+    """
+    if not isinstance(step, dict):
+        return None
+    for key in ("find", "expect"):
+        source = step.get(key)
+        if not isinstance(source, dict):
+            continue
+        for app_key in ("app", "app_frontmost"):
+            app = _clean_app_name(source.get(app_key))
+            if app:
+                return app
+    return None
+
+
+def _resolve_scope_app(session, idx):
+    """The app the step at ``idx`` may match inside, or None (unscoped).
+
+    The step's own declared app wins; otherwise it inherits the NEAREST EARLIER
+    step that resolves to one, so a guide that says "System Settings" once keeps
+    the following app-less steps there. Nothing is inferred from a title, a say
+    line or a capture.
+    """
+    steps = session.get("steps") if isinstance(session, dict) else None
+    if not isinstance(steps, list) or not steps:
+        return None
+    try:
+        start = int(idx)
+    except (TypeError, ValueError):
+        return None
+    start = min(max(start, 0), len(steps) - 1)
+    for back in range(start, -1, -1):
+        app = _step_declared_app(steps[back])
+        if app:
+            return app
+    return None
+
+
+def _record_scope_app(session, idx):
+    """Publish ``session["scope_app"]`` for the current step.
+
+    An unresolved step records ``None`` (the guide then matches unscoped,
+    exactly as before) and journals ``guide-scope:unresolved`` ONCE per guide,
+    so the log says the guard is off instead of implying every capture was
+    checked against an app.
+    """
+    scope = _resolve_scope_app(session, idx)
+    session["scope_app"] = scope
+    if scope is None and not session.get("scope_unresolved_journaled"):
+        session["scope_unresolved_journaled"] = True
+        try:
+            bp_overlay.journal_click("guide-scope:unresolved")
+        except Exception:  # noqa: BLE001 - diagnosis must not break a poll
+            pass
+    return scope
+
+
+def _app_names_match(expected, actual):
+    """True when both names denote the same app.
+
+    Case-insensitive, and the scope name may be a whole-word segment of the
+    capture's ``NSRunningApplication.localizedName`` ("Settings" vs "System
+    Settings"), the same spelling latitude ``expect.app`` already gives. WORD
+    boundaries only: a hard filter that accepted any substring would let scope
+    "Mail" match a capture of "Gmail" and ring the wrong app. The reverse
+    (scope longer than the capture) is not accepted either: a broad capture
+    name must not widen the scope.
+    """
+    left = _clean_app_name(expected)
+    right = _clean_app_name(actual)
+    if not left or not right:
+        return False
+    wanted = left.lower().split()
+    have = right.lower().split()
+    if not wanted or len(wanted) > len(have):
+        return False
+    if wanted == have:
+        return True
+    return any(have[i:i + len(wanted)] == wanted
+               for i in range(len(have) - len(wanted) + 1))
+
+
+def _snapshot_app(snap):
+    """The app a capture actually carries, or None when it carries none.
+
+    The companion reports ``app`` PER SNAPSHOT; an older/synthetic capture may
+    only carry per-row ``app`` values, so the first declared one stands in. A
+    capture with no app information at all returns None and fails closed.
+    """
+    if not isinstance(snap, dict):
+        return None
+    app = _clean_app_name(snap.get("app"))
+    if app:
+        return app
+    elements = snap.get("elements")
+    if isinstance(elements, list):
+        for element in elements:
+            if isinstance(element, dict):
+                app = _clean_app_name(element.get("app"))
+                if app:
+                    return app
+    return None
+
+
+def _element_app(element, snap_app):
+    """The app of one captured row: its own ``app`` wins over the snapshot's."""
+    app = _clean_app_name(element.get("app")) if isinstance(element, dict) else None
+    return app or snap_app
+
+
+def _snapshot_for_app(snap, scope_app):
+    """Hard-filter captured rows to ``scope_app`` before ``best_match``.
+
+    The companion reports the app PER SNAPSHOT (``app`` at the top level, one
+    walk of one app) and every row inherits it; an older/synthetic capture may
+    carry a per-row ``app``, which wins. A row that claims another app is
+    dropped, so a mixed capture can never ring a control from a different app.
+    """
+    elements = snap.get("elements") if isinstance(snap, dict) else None
+    if not isinstance(elements, list) or not elements:
+        return snap
+    snap_app = _snapshot_app(snap)
+    kept = [element for element in elements
+            if not isinstance(element, dict)
+            or _app_names_match(scope_app, _element_app(element, snap_app))]
+    if len(kept) == len(elements):
+        return snap
+    filtered = dict(snap)
+    filtered["elements"] = kept
+    filtered["count"] = len(kept)
+    # Keep the diagnostics honest: the counters describe the rows that reach
+    # best_match/expect_pending, not the raw walk.
+    filtered["with_box"] = sum(
+        1 for element in kept
+        if isinstance(element, dict)
+        and isinstance(element.get("box"), (list, tuple))
+        and len(element["box"]) == 4
+        and element["box"][0] is not None)
+    return filtered
+
+
+def _scope_capture(session, idx, snap):
+    """Return the app-scoped snapshot, or None when the capture is another app.
+
+    None means "this step happens in ``scope_app`` and the capture is not it":
+    nothing in the capture may be matched or rung, the step must not advance,
+    and the user is told which app to switch to. A snapshot with no app at all
+    fails closed (it cannot prove it is the right app).
+    """
+    scope = _record_scope_app(session, idx)
+    if not scope:
+        return snap
+    if not _app_names_match(scope, _snapshot_app(snap)):
+        return None
+    return _snapshot_for_app(snap, scope)
+
+
+def _step_window_hint(step):
+    """The window title a step PREFERS (find.window first, then expect.window)."""
+    if not isinstance(step, dict):
+        return None
+    for key in ("find", "expect"):
+        source = step.get(key)
+        value = source.get("window") if isinstance(source, dict) else None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _element_window(element, snap_window):
+    """One row's window title: its own ``window`` wins over the snapshot's."""
+    value = element.get("window") if isinstance(element, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return snap_window if isinstance(snap_window, str) and snap_window.strip() else None
+
+
+def _prefer_window(elements, window_hint, snap_window=None):
+    """Rank rows whose window equals ``window_hint`` first — PREFERENCE ONLY.
+
+    Rows of the same app in another window stay eligible: a menu, sheet or
+    alert is a different window of the same app, and menu steps must keep
+    verifying. best_match's scores still decide; this order only breaks ties,
+    so the scope stays the app and never hardens into the window title.
+    """
+    if not window_hint or not isinstance(elements, list):
+        return elements
+    hint = window_hint.strip().lower()
+    if not hint:
+        return elements
+    preferred, others = [], []
+    for element in elements:
+        window = _element_window(element, snap_window)
+        if window and window.lower() == hint:
+            preferred.append(element)
+        else:
+            others.append(element)
+    return preferred + others
+
+
 def _step_app_names(step):
-    """The app names a single step explicitly targets (app / app_frontmost)."""
-    expect = step.get("expect") if isinstance(step, dict) else None
-    if not isinstance(expect, dict):
+    """The app names a single step explicitly targets.
+
+    Both halves count: ``find.app`` names the app the step locates a control
+    in, ``expect.app``/``expect.app_frontmost`` the app it verifies. A step
+    that names Hermes in either place IS a Hermes step, so the round-24 guard
+    must not fall back to its title heuristic and block it.
+    """
+    if not isinstance(step, dict):
         return []
     names = []
-    for key in ("app", "app_frontmost"):
-        value = expect.get(key)
-        if isinstance(value, str) and value.strip():
-            names.append(value.strip())
+    for source_key in ("find", "expect"):
+        source = step.get(source_key)
+        if not isinstance(source, dict):
+            continue
+        for key in ("app", "app_frontmost"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                names.append(value.strip())
     return names
 
 
@@ -298,9 +535,9 @@ def _guide_hermes_guard_applies(session, step):
 def _guide_target_app(session, step):
     """The app a blocked Hermes step is really about, for the switch note.
 
-    Precedence: this step's ``expect.app``, then the last app the guide
-    verified, then the first step that names an app, else None (the caller
-    says "the app the step is about").
+    Precedence: this step's declared app (``find.app``, else ``expect.app``),
+    then the last app the guide verified, then the first step that names an
+    app, else None (the caller says "the app the step is about").
     """
     names = _step_app_names(step)
     if names:
@@ -495,10 +732,20 @@ def _normalize_step(step):
             find[key[len("find."):]] = value
     clean: dict = {"say": say.strip()}
     label = find.get("label")
+    clean_find: dict = {}
     if isinstance(label, str) and label.strip():
-        clean["find"] = {"label": label.strip()}
+        clean_find["label"] = label.strip()
         if isinstance(find.get("role"), str) and find["role"].strip():
-            clean["find"]["role"] = find["role"].strip()
+            clean_find["role"] = find["role"].strip()
+    # find.app is the step's scope and find.window its preferred window; the
+    # normalizer used to keep only label/role, which silently threw the scope
+    # away and left the step matching anything it saw.
+    for key in ("app", "window"):
+        value = find.get(key)
+        if isinstance(value, str) and value.strip():
+            clean_find[key] = value.strip()
+    if clean_find:
+        clean["find"] = clean_find
     # No key whitelist here: expect keys evolve (app/visible/window/focus...)
     # and silently dropping an unknown but valid key starves a step of its
     # verification (expect=no_expect_given). Anything present passes through,
@@ -506,8 +753,9 @@ def _normalize_step(step):
     kept_expect = {k: str(v) for k, v in expect.items() if v}
     if kept_expect:
         clean["expect"] = kept_expect
-    # A step the butler can neither locate nor verify is a dead step.
-    if not (clean.get("find") or clean.get("expect")):
+    # A step the butler can neither locate nor verify is a dead step. Scope and
+    # window keys do not count as locating: they scope an existing find.label.
+    if not (clean_find.get("label") or clean.get("expect")):
         return None
     return clean
 
@@ -1584,6 +1832,27 @@ def _supersede_active(reason="replaced by a new guide"):
     return active
 
 
+def _note_scope_blocked(s, snap):
+    """Explain that this step happens in another app than the capture.
+
+    The scope note replaces the Hermes-specific wording whenever the step
+    resolves a scope app: "Switch to System Settings" is the actionable line,
+    and the round-24 Hermes guard is the special case of this general rule, not
+    a separate one. ``_set_guard_note`` resets the step clock the first time the
+    note appears, so the 120 s stall deadline does not run while the user is
+    switching apps.
+    """
+    scope = _clean_app_name(s.get("scope_app")) or "the app the step is about"
+    note = "Switch to %s — this step happens in %s" % (scope, scope)
+    _set_guard_note(s, note)
+    s["current_box"] = None
+    s["current_label"] = None
+    s["overlay"] = "waiting"
+    s["last_capture_app"] = snap.get("app")
+    s["last_captured_at"] = time.time()
+    _OVERLAY.idle()
+
+
 def _note_hermes_blocked(s, step, snap):
     """Explain that this step cannot be read inside the Hermes window."""
     target = _guide_target_app(s, step) or "the app the step is about"
@@ -1614,6 +1883,13 @@ def _poll_once(s):
         return
     # Fix 1: the frontmost app may be Hermes while this step is about another
     # app. Its chat transcript is AXStaticText and must never be a target.
+    # Scope first: a step that names its app may only match a capture of THAT
+    # app, so a Hermes capture is just one instance of "the wrong app".
+    scoped = _scope_capture(s, idx, snap)
+    if scoped is None:
+        _note_scope_blocked(s, snap)
+        return
+    snap = scoped
     guarded = _guard_capture(s, step, snap)
     if guarded is None:
         _note_hermes_blocked(s, step, snap)
@@ -1627,9 +1903,13 @@ def _poll_once(s):
     if _step_needs_deep(step, best, verdict) and _deep_capture_allowed():
         deep = _deep_capture()
         if not deep.get("error") and deep.get("trusted") is not False:
-            guarded = _guard_capture(s, step, deep)
+            scoped = _scope_capture(s, idx, deep)
+            if scoped is None:
+                _note_scope_blocked(s, deep)
+                return
+            guarded = _guard_capture(s, step, scoped)
             if guarded is None:
-                _note_hermes_blocked(s, step, deep)
+                _note_hermes_blocked(s, step, scoped)
                 return
             snap = guarded
             label_needle, best, verdict = _evaluate_step(step, snap)
@@ -1706,6 +1986,9 @@ def _poll_once(s):
             s["state"]["say"] = nxt["say"]
             s["current_box"] = None
             s["current_label"] = None
+            # The next step may name another app (or inherit this one); publish
+            # its scope now so status and the next poll agree.
+            _record_scope_app(s, idx)
             # clear any stale ring now; the next step re-rings when found.
             _OVERLAY.idle()
         return
@@ -1766,6 +2049,10 @@ def guide_start(args, unattended=False):
         }
         _session = guide
         _stop_flag = False
+        # Publish step 1's scope before the startup capture: an unresolved plan
+        # has to journal its one-time line even if the first capture is another
+        # app, and status must carry the scope from the very first response.
+        _record_scope_app(guide, 0)
         if _thread is None or not _thread.is_alive():
             _thread = threading.Thread(target=_loop, name="butler-poll", daemon=True)
             _thread.start()
@@ -1795,6 +2082,20 @@ def guide_start(args, unattended=False):
             return {"guide_id": guide["id"], "title": guide["title"],
                     "state": guide["state"], "capture_note": guide["capture_note"],
                     "fix": guide["fix"], "total_steps": len(steps)}
+        scoped = _scope_capture(guide, 0, first)
+        if scoped is None:
+            # The first capture is another app than the step's scope: say which
+            # app to switch to instead of ringing something from the wrong one.
+            _note_scope_blocked(guide, first)
+            _save_session()
+            _write_state()
+            return {"guide_id": guide["id"], "title": guide["title"],
+                    "step": {"idx": 1, "say": guide["state"]["say"]},
+                    "overlay": guide["overlay"],
+                    "note": guide["state"].get("note"),
+                    "replaced": replaced_id,
+                    "total_steps": len(steps)}
+        first = scoped
         guarded = _guard_capture(guide, steps[0], first)
         if guarded is None:
             # Same Hermes protection as the poll: never ring the chat
@@ -1810,17 +2111,30 @@ def guide_start(args, unattended=False):
                     "total_steps": len(steps)}
         first = guarded
         find0 = steps[0].get("find") or {}
-        best = bp_capture.best_match(first.get("elements", []),
-                                     find0.get("label"), find0.get("role"))
+        best = bp_capture.best_match(
+            _prefer_window(first.get("elements", []),
+                           _step_window_hint(steps[0]), first.get("window")),
+            find0.get("label"), find0.get("role"))
         # Same two-pass treatment as the poll: a first-step target inside an
         # Electron overlay lives below the shallow walk. Try one deep walk
         # before telling the agent the plan is wrong with overlay "no_match".
         if find0.get("label") and best is None and _deep_capture_allowed():
             deep = _deep_capture()
             if not deep.get("error") and deep.get("trusted") is not False:
-                guarded = _guard_capture(guide, steps[0], deep)
+                scoped = _scope_capture(guide, 0, deep)
+                if scoped is None:
+                    _note_scope_blocked(guide, deep)
+                    _save_session()
+                    _write_state()
+                    return {"guide_id": guide["id"], "title": guide["title"],
+                            "step": {"idx": 1, "say": guide["state"]["say"]},
+                            "overlay": guide["overlay"],
+                            "note": guide["state"].get("note"),
+                            "replaced": replaced_id,
+                            "total_steps": len(steps)}
+                guarded = _guard_capture(guide, steps[0], scoped)
                 if guarded is None:
-                    _note_hermes_blocked(guide, steps[0], deep)
+                    _note_hermes_blocked(guide, steps[0], scoped)
                     _save_session()
                     _write_state()
                     return {"guide_id": guide["id"], "title": guide["title"],
@@ -1830,8 +2144,11 @@ def guide_start(args, unattended=False):
                             "replaced": replaced_id,
                             "total_steps": len(steps)}
                 first = guarded
-                best = bp_capture.best_match(first.get("elements", []),
-                                             find0.get("label"), find0.get("role"))
+                best = bp_capture.best_match(
+                    _prefer_window(first.get("elements", []),
+                                   _step_window_hint(steps[0]),
+                                   first.get("window")),
+                    find0.get("label"), find0.get("role"))
         guide["last_capture_app"] = first.get("app")
         guide["last_captured_at"] = time.time()
         if best is not None and _box_is_offscreen(best.get("box"), first):

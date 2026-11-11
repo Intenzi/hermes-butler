@@ -48,6 +48,16 @@ before advancing.
   label - a hands-off step. The butler does not ring anything; it verifies
   the transition through `expect` (`{"app": "System Settings"}`) once the app
   is actually open. Never hunt for app icons inside other apps' windows.
+- `find.app`: the app this step happens in. Name it once (usually on the first
+  step) and every later app-less step inherits the nearest earlier app, so one
+  `find.app: "System Settings"` scopes the whole walk; `expect.app` alone scopes
+  its own step too. A scoped step matches ONLY controls captured from that app,
+  so silently verifying content from another app (another app's window, this
+  chat's transcript) is now impossible, and `find.window`/`expect.window` only
+  PREFERS that title — a menu or sheet is another window of the same app, so it
+  must stay eligible. If a guide stalls with "Switch to X — this step happens
+  in X", the plan is right and the window is wrong: tell the user to switch to
+  X and leave the guide running; do not rewrite the step.
 - `expect`: any observable change (`expect` keys pass through unfiltered):
   `{"app": "..."}` for app opens (open counts, focus not required),
   `{"window": "..."}` for pane navigation — the frontmost window's TITLE
