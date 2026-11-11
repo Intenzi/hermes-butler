@@ -576,3 +576,34 @@ def test_the_watch_tools_answer_even_without_a_companion(tmp_path: Path) -> None
         "status": "idle"}
     assert json.loads(tools["butler_watch_start"]["handler"]({})) == {
         "error": "app is required"}
+
+
+def test_a_watch_request_gets_its_own_frame() -> None:
+    """"watch <app> for …" must not be framed as a guide.
+
+    Measured: the Option-right-click menu prefills exactly that sentence and it
+    went through the summon frame, which orders a follow-mode guide — the agent
+    was told to do the opposite of what the user asked.
+    """
+    from butler_core.summon import frame_for
+
+    framed = frame_for("watch Preview for Export complete", "")
+    assert framed.startswith("[butler watch] watch Preview for Export complete")
+    assert "butler_watch_start" in framed
+    assert "[butler summon]" not in framed
+    assert "butler_guide_start" not in framed
+
+    # An explicit origin wins even without the prefix.
+    assert frame_for("Preview, tell me when the export lands", "watch").startswith("[butler watch]")
+    # Ordinary requests keep the guidance frame.
+    assert frame_for("open wifi settings", "").startswith("[butler summon]")
+
+
+def test_both_other_frames_know_watch_exists() -> None:
+    from butler_core.summon import frame_for
+
+    summon = frame_for("tell me when the build finishes", "")
+    assert "butler_watch_start" in summon
+
+    look = frame_for("[butler look] App: Preview\nQuestion: is it done?", "look")
+    assert "butler_watch_start" in look

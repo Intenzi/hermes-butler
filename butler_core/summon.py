@@ -15,7 +15,9 @@ SUMMON_FRAMING_TEMPLATE = (
     "(butler:follow skill) and start it with butler_guide_start; if it is too vague "
     "to ground one first step, ask exactly ONE short clarifying question and wait. "
     "Only one guide runs at a time: if a guide is already active, stop it with "
-    "butler_stop or pass replace=true — never leave two running."
+    "butler_stop or pass replace=true — never leave two running. If the request is "
+    "to be TOLD when something appears or finishes rather than to be shown where "
+    "to click, use butler_watch_start instead of a guide."
 )
 
 #: The slash command returns only this small acknowledgement. The real answer is
@@ -32,10 +34,27 @@ LOOK_FRAMING_TEMPLATE = (
     "line of at most 90 characters (a dozen words — the pet bubble truncates "
     "past 120) giving the short answer, so the user "
     "sees it beside their pointer instead of opening the chat. Keep the full "
-    "explanation for the chat. Only one guide runs at a time: if a guide is "
+    "explanation for the chat. If the answer depends on something that has not "
+    "happened yet, say so and start a watch with butler_watch_start instead of "
+    "guessing. Only one guide runs at a time: if a guide is "
     "already active, stop it with butler_stop or pass replace=true — never leave "
     "two running."
 )
+
+#: A WATCH turn sets up background monitoring instead of planning a guide. The
+#: Option-right-click menu prefills "watch <app> for …" into the ask field, and a
+#: user typing the same thing means the same thing — both route here.
+WATCH_FRAMING_TEMPLATE = (
+    "[butler watch] {text}\n\n"
+    "Set up a watch rather than a guide: call butler_watch_start with the app named "
+    "in the request (or the frontmost app) and the condition the user wants "
+    "announced. Only one watch runs at a time. If the user wants to know what "
+    "already changed, read it with butler_watch_status instead of starting a new "
+    "one, and use butler_watch_stop when they ask to stop."
+)
+
+#: Text prefixes that mean "this is a watch request" when no origin is posted.
+WATCH_TEXT_PREFIXES = ("watch ", "/watch ")
 
 #: The two pieces the desktop's LOOK row already carries (lookPendingText):
 #: ``[butler look] <context>`` on the first line, ``Question: <question>`` next.
@@ -79,8 +98,25 @@ def frame_look_text(text: str) -> str:
     return LOOK_FRAMING_TEMPLATE.format(context=context, text=question)
 
 
+def frame_watch_text(text: str) -> str:
+    """Wrap one watch request in the frame that asks for monitoring, not a guide."""
+    return WATCH_FRAMING_TEMPLATE.format(text=str(text or "").strip())
+
+
 def frame_for(text: str, origin: str = "") -> str:
-    """Pick the frame for a posted summon body: LOOK rows get the answer frame."""
-    if str(origin or "").strip().lower() == "look":
+    """Pick the frame for a posted summon body.
+
+    LOOK rows get the answer frame, WATCH rows the monitoring frame; everything
+    else is a guidance request. A typed "watch <app> for …" counts as a watch
+    even without an origin, because the menu prefill and the typed sentence are
+    the same words.
+    """
+    kind = str(origin or "").strip().lower()
+    if kind == "look":
         return frame_look_text(text)
+    stripped = str(text or "").strip()
+    if stripped.startswith(LOOK_TAG):
+        stripped = stripped[len(LOOK_TAG):].strip()
+    if kind == "watch" or stripped.lower().startswith(WATCH_TEXT_PREFIXES):
+        return frame_watch_text(text)
     return frame_summon_text(text)

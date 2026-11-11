@@ -141,7 +141,9 @@ def test_slash_injects_into_the_current_session_with_the_exact_frame() -> None:
         "(butler:follow skill) and start it with butler_guide_start; if it is too vague "
         "to ground one first step, ask exactly ONE short clarifying question and wait. "
         "Only one guide runs at a time: if a guide is already active, stop it with "
-        "butler_stop or pass replace=true — never leave two running."
+        "butler_stop or pass replace=true — never leave two running. If the request is "
+        "to be TOLD when something appears or finishes rather than to be shown where "
+        "to click, use butler_watch_start instead of a guide."
     )
     assert call["role"] == "user"
     # Current-session injection: no explicit session_key is invented by the handler.
