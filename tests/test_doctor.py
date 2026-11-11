@@ -277,3 +277,19 @@ def test_overlay_archs_is_null_when_lipo_prints_nothing(tmp_path, monkeypatch):
         run=lambda *a, **k: types.SimpleNamespace(stdout=" \n")))
 
     assert doctor._overlay_archs(str(exe)) is None
+
+
+def test_doctor_forgets_a_cached_download_failure(tmp_path, monkeypatch):
+    """Doctor is the user asking "is it fixed now" — a cached failure must not
+    answer that. It clears the stamp before resolving and never waits on it."""
+    from butler_core import doctor, overlay
+
+    stamp = tmp_path / "companion-download.json"
+    stamp.write_text('{"failed_at": 1, "detail": "download_failed: offline"}')
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(overlay, "_download_failure_stamp_path", lambda: str(stamp))
+    monkeypatch.setattr(overlay, "build_if_needed", lambda: (True, "present"))
+
+    doctor.doctor()
+
+    assert not stamp.exists(), "doctor must retry instead of trusting the cache"
