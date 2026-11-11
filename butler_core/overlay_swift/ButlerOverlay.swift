@@ -6068,14 +6068,11 @@ private final class OverlayController {
             cancelInspectMode(reason: "right-click")
             return
         }
-        // The user's gesture, literally: right-click the hat and a click catcher
-        // covers the screens until you click something. The watch actions moved
-        // behind Option-right-click so the primary click is not a menu.
-        if NSEvent.modifierFlags.contains(.option) {
-            presentHatMenu(at: point)
-            return
-        }
-        armInspectMode()
+        // A menu, because a hidden chord is not a UI: "Option-right-click" was
+        // undiscoverable in practice. Right-click lists every action with
+        // `Look at this…` first; dragging the hat is the direct LOOK gesture, so
+        // the one-move path stays a drag rather than a lost shortcut.
+        presentHatMenu(at: point)
     }
 
     /// `Look at this…` arms INSPECT MODE; the three watch items open the SAME

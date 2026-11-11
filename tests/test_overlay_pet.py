@@ -1996,24 +1996,22 @@ def test_inspect_arm_survives_teardown_and_the_ask_field_is_unchanged() -> None:
     assert "guard !inspectMode else { return }" in apply_body
 
 
-def test_right_click_arms_inspect_mode_and_option_right_click_is_the_menu() -> None:
-    """The gesture is literally "right-click the hat → the click I mean lands on
-    the butler". The watch menu moved behind Option-right-click so the primary
-    gesture is not a menu.
+def test_right_click_opens_the_hat_menu() -> None:
+    """Right-click shows the menu, because a hidden Option chord is not a UI.
+
+    The direct LOOK gesture is the drag; inspect-by-click remains available from
+    the menu's first item, and right-click still cancels an armed picker.
     """
     source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
 
     handler = _swift_function_body(
         source, "private func claimChipRightClicked(at point: NSPoint) {",
         "/// `Look at this…` arms INSPECT MODE")
-    assert "modifierFlags.contains(.option)" in handler
     assert "presentHatMenu(at: point)" in handler
-    assert "armInspectMode()" in handler
+    assert "modifierFlags.contains(.option)" not in handler, \
+        "no hidden chord: the menu is the plain right-click"
     assert 'cancelInspectMode(reason: "right-click")' in handler
-    # A plain right-click must arm, not open the menu: the unmodified path ends
-    # with a bare arm call (index-of fails here, "disarmInspectMode()" contains
-    # the same substring).
-    assert "\n        armInspectMode()\n" in handler
+    assert "\n        armInspectMode()\n" not in handler
 
     menu = _swift_function_body(source, "private func presentHatMenu(",
                                 "/// The app a watch would attach to")
@@ -2218,7 +2216,7 @@ def test_free_hat_drag_moves_the_hat_and_never_arms_inspect_mode() -> None:
                                    "private func claimChipRightClicked(at point: NSPoint) {",
                                    "/// `Look at this…` arms INSPECT MODE")
     assert "claimChipAnchorMode" not in handler
-    assert "\n        armInspectMode()\n" in handler
+    assert "presentHatMenu(at: point)" in handler
     click = _swift_function_body(source, "private func claimChipClicked() {",
                                  "// MARK: Pointer LOOK gesture")
     assert "claimChipAnchorMode" not in click
