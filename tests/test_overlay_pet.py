@@ -1989,3 +1989,267 @@ def test_ask_field_sits_above_inspect_overlays_and_asserts_focus() -> None:
         "the ask field must outrank the inspect overlays"
     assert "ask-focus active=" in source, "focus is asserted, not assumed"
     assert "NSRunningApplication.current.activate(options:" in source
+
+
+# --- The hat exists even when the pet is docked -----------------------------
+#
+# Round 18B: the hat used to be anchored ONLY to the popped-out pet panel. In
+# the fresh-install default the pet is docked inside the Hermes window, there is
+# no 240x300 NSPanel, `hermesPetWindowFrame` returns nil and `positionClaimChip`
+# called `hideClaimChip()` every tick — the chip window was created and destroyed
+# forever, so LOOK, the ask field and the watch menu were all unreachable. The
+# fix is a third placement source: a free-standing remembered point.
+
+
+def test_hat_falls_back_to_a_free_anchor_after_a_three_second_grace() -> None:
+    """Placement order: pet panel, then the free anchor; the hat never hides.
+
+    The grace is what keeps a pet that is being dragged, resized or created from
+    flickering the hat to the corner. A hat that was never pet-anchored (fresh
+    install, docked pet) goes free at once, because an invisible hat is worse
+    than a misplaced one.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    anchor = _swift_function_body(source, "private enum ClaimChipFreeAnchor {",
+                                  "/// A borderless window cannot become key")
+    assert 'static let defaultsKey = "butlerHatFreeAnchor"' in anchor
+    assert "static let petGrace: TimeInterval = 3.0" in anchor
+    assert "static let inset: CGFloat = 40.0" in anchor
+    assert "UserDefaults" in anchor, "the point lives in the companion's prefs"
+    # "x,y" is the stored form, and a malformed value means "never placed".
+    assert 'defaults.set("\\(point.x),\\(point.y)"' in anchor
+    assert "return nil" in anchor
+
+    position = _swift_function_body(source, "private func positionClaimChip() {",
+                                    "private func applyClaimChipFrame(")
+    pet_branch = position.find("if let petWindow = hermesPetWindowFrame(")
+    free_branch = position.find("applyFreeAnchorFrame()")
+    assert pet_branch != -1 and free_branch != -1
+    assert pet_branch < free_branch, "the popped-out pet panel is still first"
+    # A pet-anchored tick places and RETURNS. Without the return every tick
+    # would also run the free placement and yank the hat to the corner while a
+    # pet sits on screen (219 tests stayed green when it was deleted).
+    pet_place = position.find("applyClaimChipFrame(petWindow: petWindow", pet_branch)
+    pet_return = position.find("\n            return\n", pet_place)
+    assert pet_place != -1 and pet_place <= pet_return < free_branch, (
+        "the pet branch must return before the free fallback")
+    assert "ClaimChipFreeAnchor.petGrace" in position
+    assert "claimChipPetMissingSince" in position
+    assert "claimChipPetMissingSince = nil" in position, (
+        "finding a pet clears the miss, or the grace counts from a stale point")
+    assert "timeIntervalSince(missingSince) < ClaimChipFreeAnchor.petGrace" in position
+
+    # The event-driven AX path skips positionClaimChip, so the choke point both
+    # anchors go through must clear the miss as well.
+    present = _swift_function_body(source, "private func presentClaimChipFrame(",
+                                   "private func announceClaimChipAnchor(")
+    # Bind every find first: `-1 < x` is always true, so an inline comparison
+    # would go green when the guard or the reset line was deleted.
+    guard_at = present.find("if mode == .pet {")
+    reset_at = present.find("claimChipPetMissingSince = nil")
+    announce_at = present.find("announceClaimChipAnchor(mode)")
+    assert 0 <= guard_at < reset_at < announce_at, (
+        "the pet-mode choke point clears the miss before announcing")
+    # The old "unknown/renamed pet window: stay hidden" gate is what made the
+    # hat unreachable; it must not come back in any form.
+    assert "stay hidden rather than guess" not in position
+    assert position.count("hideClaimChip()") == 1, (
+        "only the disarm/shutdown/no-screen guard may hide the hat")
+    assert (position.find("guard claimChipEnabled, !isShuttingDown,")
+            < position.find("hideClaimChip()"))
+
+    # A pet frame that resolves to no usable screen also falls back to the free
+    # anchor instead of hiding.
+    apply_body = _swift_function_body(source, "private func applyClaimChipFrame(",
+                                      "private func applyFreeAnchorFrame()")
+    assert "applyFreeAnchorFrame()" in apply_body
+    assert apply_body.count("hideClaimChip()") == 1
+    assert (apply_body.find("guard claimChipEnabled, !isShuttingDown else {")
+            < apply_body.find("hideClaimChip()"))
+
+    # The free placement itself: clamp onto a visible screen so a display change
+    # cannot strand the hat, and report mode `.free`.
+    free = _swift_function_body(source, "private func applyFreeAnchorFrame() {",
+                                "private func freeHatOrigin(")
+    assert "freeHatOrigin(size: size)" in free
+    assert "mode: .free" in free
+    # No screen geometry at all leaves the hat alone rather than hiding it.
+    assert "guard let origin = freeHatOrigin(size: size) else {" in free
+    assert free.count("hideClaimChip()") == 1
+    assert (free.find("guard claimChipEnabled, !isShuttingDown else {")
+            < free.find("hideClaimChip()"))
+
+
+def test_free_hat_defaults_to_the_main_screens_bottom_right_corner() -> None:
+    """No remembered point: main screen's visibleFrame, 40 pt in on two edges.
+
+    `visibleFrame` (not `frame`) already excludes the menu bar and the Dock, and
+    the 40 pt inset keeps the hat clear of the Dock on a default layout.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    anchor = _swift_function_body(source, "private enum ClaimChipFreeAnchor {",
+                                  "/// A borderless window cannot become key")
+    assert "static let inset: CGFloat = 40.0" in anchor
+
+    default = _swift_function_body(
+        source, "static func defaultOrigin(size: CGSize) -> NSPoint? {",
+        "/// A borderless window cannot become key")
+    assert "primaryScreen()" in default
+    assert "screen.visibleFrame" in default
+    assert "visible.maxX - inset - size.width" in default, \
+        "40 pt in from the right edge (the hat's right edge clears the edge)"
+    assert "visible.minY + inset" in default, "40 pt up from the bottom edge"
+    assert "screen.frame" not in default, "visibleFrame, never the full frame"
+
+    # A remembered point wins over the default and is persisted on release only.
+    origin = _swift_function_body(source, "private func freeHatOrigin(size: CGSize) -> NSPoint? {",
+                                  "/// Put the hat window at a resolved AppKit frame")
+    assert "ClaimChipFreeAnchor.remembered(from: UserDefaults.standard)" in origin
+    assert "ClaimChipFreeAnchor.defaultOrigin(size: size)" in origin
+    assert "visible.minX + margin" in origin and "visible.maxY - size.height - margin" in origin
+
+
+def test_free_hat_drag_moves_the_hat_and_never_arms_inspect_mode() -> None:
+    """Free: press-and-drag MOVES the hat. Pet-anchored: it still drags-to-LOOK.
+
+    The mode decides the gesture: the same press cannot mean both "read the
+    element under the pointer" and "put the butler where I can see it". The
+    plain click and the right-click keep their meanings in both modes.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    begin = _swift_function_body(source,
+                                 "private func beginLookDrag(at screenPoint: NSPoint) {",
+                                 "/// Nothing to drag any more")
+    free_branch = begin.find("if claimChipAnchorMode == .free")
+    move_call = begin.find("beginHatFreeMove()")
+    branch_return = begin.find("return", move_call)
+    arm_call = begin.find("armInspectMode(releaseToAsk: true)")
+    assert 0 <= free_branch < move_call < branch_return < arm_call, (
+        "the free branch returns before the inspect arm")
+
+    begin_move = _swift_function_body(
+        source, "private func beginHatFreeMove() {",
+        "/// Move the free hat with the pointer")
+    assert "claimChipFreeMoveActive = true" in begin_move
+    assert 'chipJournal("hat-free-move")' in begin_move
+
+    move = _swift_function_body(source,
+                                "private func moveLookDrag(to screenPoint: NSPoint) {",
+                                "/// Release: a drag-armed mode confirms HERE")
+    assert "hatFreeMove(to: screenPoint)" in move
+    assert move.find("claimChipFreeMoveActive") < move.find("guard !inspectMode"), (
+        "the free hat moves before the inspect-mode guard can swallow the drag")
+
+    free_move = _swift_function_body(source,
+                                     "private func hatFreeMove(to screenPoint: NSPoint) {",
+                                     "/// The release persisted the free hat")
+    assert "window.setFrameOrigin(origin)" in free_move
+    assert "claimChipDragOffset" in free_move, "the grab offset stops a jump"
+
+    end = _swift_function_body(source,
+                               "private func endLookDrag(at screenPoint: NSPoint) {",
+                               "/// Park the overlays, then resolve on the next run-loop turn")
+    assert "endHatFreeMove()" in end
+    assert "resolveInspectRelease(at: screenPoint)" in end, (
+        "the pet-anchored drag still confirms LOOK on release")
+    assert end.find("endHatFreeMove()") < end.find(
+        "guard inspectMode, inspectReleaseToAsk else")
+
+    free_end = _swift_function_body(
+        source, "private func endHatFreeMove() {",
+        "/// Park the overlays, then resolve on the next run-loop turn")
+    assert "ClaimChipFreeAnchor.remember(origin, in: UserDefaults.standard)" in free_end
+    assert 'chipJournal("hat-free-anchored")' in free_end
+    assert "window.frame.origin" in free_end
+
+    # The doors the user needs are mode-independent: neither the plain click nor
+    # the right-click asks which anchor the hat is on.
+    handler = _swift_function_body(source,
+                                   "private func claimChipRightClicked(at point: NSPoint) {",
+                                   "/// `Look at this…` arms INSPECT MODE")
+    assert "claimChipAnchorMode" not in handler
+    assert "\n        armInspectMode()\n" in handler
+    click = _swift_function_body(source, "private func claimChipClicked() {",
+                                 "// MARK: Pointer LOOK gesture")
+    assert "claimChipAnchorMode" not in click
+
+
+def test_no_free_hat_drag_path_arms_inspect_mode() -> None:
+    """The free-hat move path must never reach the inspect arm.
+
+    Round 18B's regression risk is exactly this: a drag on the free hat that
+    still raises the screen-sized click catchers would make the hat unplaceable
+    and LOOK unreachable from the pet at the same time.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    for marker, end_marker in (
+        ("private func beginHatFreeMove() {",
+         "/// Move the free hat with the pointer"),
+        ("private func hatFreeMove(to screenPoint: NSPoint) {",
+         "/// The release persisted the free hat"),
+        ("private func endHatFreeMove() {",
+         "/// Park the overlays, then resolve on the next run-loop turn"),
+    ):
+        body = _swift_function_body(source, marker, end_marker)
+        assert "armInspectMode" not in body, f"{marker} arms INSPECT MODE"
+        assert "inspectReleaseToAsk = true" not in body, f"{marker} fakes a drag arm"
+
+    # And the view's drag state is what tells the glyph the truth: a free hat
+    # keeps the hat glyph instead of claiming to read the pointer.
+    chip_view = _swift_function_body(source,
+                                     "private final class ClaimChipView: NSView {",
+                                     "// MARK: - Pointer LOOK card")
+    assert "var dragMovesTheHat = false" in chip_view
+    assert "lookMode = !dragMovesTheHat" in chip_view
+
+
+def test_hat_announces_its_anchor_mode_on_stdout() -> None:
+    """`{"op":"chip-anchor","mode":"pet"|"free"}` once per placement change.
+
+    The Python side reads every stdout line, so the companion says which anchor
+    it is on instead of the plugin guessing. Docs/reporting live on the Python
+    side; this half only emits the line.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert "private enum ClaimChipAnchorMode: String {" in source
+    assert "case pet" in source
+    assert "case free" in source
+    assert '["op": "chip-anchor", "mode": mode.rawValue]' in source
+
+    announce = _swift_function_body(source,
+                                    "private func announceClaimChipAnchor(",
+                                    "private func hideClaimChip()")
+    assert "claimChipAnnouncedMode != mode" in announce, "one line per CHANGE"
+    assert "claimChipAnnouncedMode = mode" in announce
+    assert "writeEventLine(" in announce
+
+    # Both placement sources feed the one announcer, so a pet appearing or
+    # disappearing is reported exactly once.
+    present = _swift_function_body(source,
+                                   "private func presentClaimChipFrame(",
+                                   "private func announceClaimChipAnchor(")
+    assert "announceClaimChipAnchor(mode)" in present
+    assert "claimChipAnchorMode = mode" in present
+    assert "mode: .free" in source
+    assert "mode: .pet" in source
+
+    # A fresh arm starts from a cold anchor, so the first placement announces
+    # again instead of staying silent from the previous arm.
+    disarm = _swift_function_body(
+        source, "private func setClaimChip(_ spec: ClaimChipSpec)",
+        "// MARK: Pet AX observation")
+    for reset in ("claimChipAnchorMode = nil", "claimChipAnnouncedMode = nil",
+                  "claimChipPetMissingSince = nil"):
+        assert reset in disarm, f"an explicit disarm resets {reset}"
+
+    # The event line rides the shared writer, not a private print path.
+    writer = _swift_function_body(source, "private func writeEventLine(",
+                                  "private func writeWatchLine(")
+    assert "JSONSerialization.data(withJSONObject: payload" in writer
+    # One write per line: two writes could split the JSON line on the pipe.
+    assert "FileHandle.standardOutput.write(data + Data([0x0a]))" in writer
