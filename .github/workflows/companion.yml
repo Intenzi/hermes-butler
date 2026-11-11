@@ -75,5 +75,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" --generate-notes \
             ButlerOverlay-universal \
-            ButlerOverlay-universal.sha256 \
-            butler_core/services/.buildinfo
+            ButlerOverlay-universal.sha256
