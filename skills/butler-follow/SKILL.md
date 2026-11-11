@@ -44,6 +44,23 @@ before advancing.
   "open settings", but "Click Network".
 - `find.label`: the exact expected control text; fall back with a second
   short guide if the capture reports a stall.
+- Scrolling: the engine already covers controls that ARE in the tree but scrolled
+  out of view - macOS reports those with a degenerate box (`DEGENERATE_BOX_MAX`,
+  box `[0, 832, 0, 0]`), so the ring is suppressed and the note "Scroll to bring
+  <label> into view" appears with the stall clock reset. Do not duplicate that in
+  `say`, and do not read silence there as a missing plan.
+- Scrolling the agent MUST cover: a target that is absent from the AX tree
+  entirely (below) still needs the user told where to go, because no note can
+  fire for a control nobody captured. There, weave "Scroll down to <label>" into
+  the `say` - there is no scroll action and no ring to rely on.
+- Settings pane BODIES are unreadable: each pane runs as its own app extension
+  and appears in the tree as a childless `AXApplication`. A depth-24 walk of the
+  open Network pane returned the sidebar's elements and zero detail-side
+  children *while the pane was visible on screen*, and `target: "Network"` even
+  matched an unrelated app. So "unread" is not the same fault as "below the
+  fold": the rows were never captured at any scroll position. Sidebar rows and
+  the window title (which takes the pane name) are all you get, so a guide into
+  a pane body must be voice-led past that point.
 - Launch steps ("open System Settings first"): use `"find": {}` with no
   label - a hands-off step. The butler does not ring anything; it verifies
   the transition through `expect` (`{"app": "System Settings"}`) once the app
