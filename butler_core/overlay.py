@@ -132,7 +132,20 @@ def _write_buildinfo_best_effort(src, exe):
 
 
 #: Every request the helper download makes gets its own deadline, in seconds.
-DOWNLOAD_TIMEOUT = 20
+#: Six seconds, not twenty: an offline machine must not stall a guide for
+#: twenty seconds before falling back to compiling.
+DOWNLOAD_TIMEOUT = 6
+
+#: The release host, in code as well as in the shipped dotfile. An installer
+#: that drops dotfiles would otherwise turn the download into a silent no-op.
+COMPANION_URL_TEMPLATE = (
+    "https://github.com/Intenzi/hermes-butler/releases/download/"
+    "v{version}/ButlerOverlay-universal"
+)
+
+#: A failed download is remembered for this long, so every resolution in an
+#: offline session does not pay the timeout again.
+DOWNLOAD_FAILURE_TTL = 600
 #: Set BUTLER_NO_DOWNLOAD=1 to refuse the release download and compile instead.
 NO_DOWNLOAD_ENV = "BUTLER_NO_DOWNLOAD"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -174,15 +187,45 @@ def download_url():
         with open(companion_url_path(), "r", encoding="utf-8") as handle:
             template = handle.readline().strip()
     except OSError:
-        return None
+        template = COMPANION_URL_TEMPLATE
     if not template:
-        return None
+        template = COMPANION_URL_TEMPLATE
     if "{version}" in template:
         version = plugin_version()
         if not version:
             return None
         template = template.replace("{version}", version)
     return template
+
+
+def _download_failure_stamp_path():
+    """Where a failed download is remembered (plugin data dir, not the install)."""
+    return os.path.join(hermes_home(), "plugin-data", "butler", "companion-download.json")
+
+
+def _recent_download_failure():
+    """True when a download failed within ``DOWNLOAD_FAILURE_TTL`` seconds."""
+    try:
+        with open(_download_failure_stamp_path(), "r", encoding="utf-8") as handle:
+            stamp = json.load(handle).get("failed_at")
+        return isinstance(stamp, (int, float)) and (time.time() - stamp) < DOWNLOAD_FAILURE_TTL
+    except Exception:  # noqa: BLE001 - a corrupt stamp must not break the guide
+        return False
+
+
+def _remember_download_failure(detail):
+    """Record (or clear, with None) the last download failure."""
+    path = _download_failure_stamp_path()
+    try:
+        if detail is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"failed_at": time.time(), "detail": str(detail)[:200]}, handle)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _journal(message):
@@ -386,14 +429,20 @@ def ensure_binary():
         _journal("download disabled by %s" % NO_DOWNLOAD_ENV)
     elif url is None:
         _journal("download unavailable (no .companion_url / version)")
+    elif _recent_download_failure():
+        # An offline machine must not pay the timeout on every single use.
+        _journal("download skipped (recent failure)")
+        download_failure = "download_failed: recent failure"
     else:
         ok, detail = fetch_binary()
         if ok:
             _journal("downloaded %s" % url)
+            _remember_download_failure(None)
             return True, "downloaded"
         download_failure = (
             detail if str(detail).startswith("download_failed")
             else "download_failed: %s" % detail)
+        _remember_download_failure(download_failure)
         _journal(download_failure)
 
     if not os.path.exists(src):

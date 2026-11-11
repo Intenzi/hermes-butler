@@ -55,6 +55,14 @@ def _layout(tmp_path, monkeypatch, *, buildinfo, executable=True,
             info.write_text(buildinfo, encoding="utf-8")
         else:
             info.write_text(json.dumps(buildinfo), encoding="utf-8")
+    # The download-failure stamp lives in the real plugin data dir; isolate it or
+    # one genuine failure in a live session silently disables every later test.
+    monkeypatch.setattr(overlay, "_download_failure_stamp_path",
+                        lambda: str(tmp_path / "companion-download.json"))
+    # No test may reach the network by accident: the shipped URL template is a
+    # live GitHub release, so every layout starts with the fetch disabled and
+    # only the download tests opt back in.
+    monkeypatch.setenv(overlay.NO_DOWNLOAD_ENV, "1")
     monkeypatch.setattr(overlay, "binary_path", lambda: str(exe))
     monkeypatch.setattr(overlay, "binary_source_path", lambda: str(src))
     monkeypatch.setattr(overlay, "buildinfo_path", lambda: str(info))
@@ -76,6 +84,7 @@ def _download_layout(tmp_path, monkeypatch, *, buildinfo=None, source=SOURCE,
     if source is None:
         src.unlink()
     (tmp_path / ".companion_url").write_text(URL_TEMPLATE + "\n", encoding="utf-8")
+    monkeypatch.delenv(overlay.NO_DOWNLOAD_ENV, raising=False)
     manifest = tmp_path / "plugin.yaml"
     manifest.write_text("name: butler\nversion: 9.9.9\n", encoding="utf-8")
     monkeypatch.setattr(overlay, "plugin_yaml_path", lambda: str(manifest))

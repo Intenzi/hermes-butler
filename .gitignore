@@ -10,3 +10,6 @@ data/guides/
 # scripts/build-companion.sh or let the plugin compile from Swift source.
 butler_core/services/ButlerOverlay
 butler_core/services/.buildinfo
+
+# Partial helper download (always unlinked on failure)
+butler_core/services/*.download
