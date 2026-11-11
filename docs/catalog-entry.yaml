@@ -1,9 +1,9 @@
 name: butler
 repo: https://github.com/Intenzi/hermes-butler
-sha: "REPLACE_WITH_FULL_40_HEX_SHA_OF_THE_PINNED_COMMIT"
-version: "0.3.0"
+sha: "479300e5a24779f68a0d6a62be1386665730ffaa"
+version: "0.4.1"
 title: Butler
-description: "Supercharges the Hermes desktop pet into an on-screen operator. WALK plans a follow-mode guide from Accessibility facts, draws a ring on the control and verifies each step rather than describing it — the pet stays on the step until the OS confirms it. LOOK turns the pointer into the referent: drag the hat (or pick from its menu) and the next click lands on the plugin's overlay, never on the app, so any control can be read — role, label, enabled state, value — and asked about without leaving the window. WATCH reads one app's Accessibility tree in the background and announces a condition once, leaving the line on the pet until it is acknowledged. Everything runs on Accessibility only: no screenshots, no OCR, no Screen Recording, no Input Monitoring. The screen helper is Swift, built by this repository's GitHub Actions workflow, attested, and fetched at first use with its SHA-256 verified; it compiles locally only as a fallback."
+description: "Turns the Hermes desktop pet into an on-screen operator: WALK draws a guide on the real controls and verifies each step from the macOS Accessibility tree, DESCRIBE reads the control under your pointer (role, label, enabled state, value) without letting the click reach your app, and WATCH announces one condition from an app in the background and keeps it until you acknowledge it. Accessibility only: no screenshots, no OCR, no Screen Recording, no Input Monitoring."
 maintainer: Intenzi
 tier: community
 category: desktop
