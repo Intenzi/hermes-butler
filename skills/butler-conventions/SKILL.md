@@ -239,9 +239,25 @@ LOOK reads the control under a point the user chose with the pointer. Three
 rules keep it honest.
 
 - **No look hot key.** The user rejected ⌘⇧L outright: looking must be a
-  pointer gesture, never a chord and never a hop into the Hermes chat. The
-  shipped gesture is: drag the hat onto the thing → a non-key card at the drop
-  point → click the hat within 90 s to ask about *that* element.
+  pointer gesture, never a chord and never a hop into the Hermes chat.
+- **One LOOK UX: INSPECT MODE.** Right-click the hat (or drag it) → screen-sized
+  transparent overlays at `.screenSaver` capture the next click, cursor becomes a
+  crosshair, and a badge follows the pointer with the live target. Confirm by
+  **click** (right-click-armed) or **release** (drag-armed); `Esc` and right-click
+  cancel in every mode. Clicks land on our overlay, so a picker never activates
+  the control under the pointer — that is the whole point of a picker mode, and
+  it means clicks do not reach apps while it is on.
+- **A follower cannot be clicked.** A chip that tracks the cursor at a fixed
+  offset is unreachable by construction ("move toward it, it moves the same
+  amount") — that shipped once and the user called it idiotic, correctly. Never
+  make the confirm target follow the pointer; the confirm must be a stationary
+  surface (overlay click) or a release.
+- **The ask field must outrank the overlays.** It was at `.statusBar` while the
+  overlays sit at `.screenSaver`; a leftover overlay hid the field and the
+  user's Return fired in the app underneath while our own submit also ran. The
+  field is now `.screenSaver + 1`, activation is asserted 80 ms after opening
+  (`ask-focus active=… key=…`), and the focus restore is delayed 300 ms so the
+  Return keyDown cannot follow us back into the previous app.
 - **Our own window wins every AX hit-test.** The hat is a `.statusBar`-level
   window, so `AXUIElementCopyElementAtPosition` answers with it wherever it is:
   first as `Button · "Ask butler"` (the chip's accessibility label), then, once
