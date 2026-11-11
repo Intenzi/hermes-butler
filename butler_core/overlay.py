@@ -143,9 +143,15 @@ COMPANION_URL_TEMPLATE = (
     "v{version}/ButlerOverlay-universal"
 )
 
-#: A failed download is remembered for this long, so every resolution in an
-#: offline session does not pay the timeout again.
-DOWNLOAD_FAILURE_TTL = 600
+#: A failed download is remembered for this long so an offline session does not
+#: pay the 6 s timeout on every single use. This is a suppression window, not a
+#: wait: nothing is delayed, the attempt is simply skipped. Two minutes keeps a
+#: flaky network recoverable without a restart; doctor and
+#: ``BUTLER_FORCE_DOWNLOAD=1`` bypass it.
+DOWNLOAD_FAILURE_TTL = 120
+
+#: Set BUTLER_FORCE_DOWNLOAD=1 to ignore the failure cache once.
+FORCE_DOWNLOAD_ENV = "BUTLER_FORCE_DOWNLOAD"
 #: Set BUTLER_NO_DOWNLOAD=1 to refuse the release download and compile instead.
 NO_DOWNLOAD_ENV = "BUTLER_NO_DOWNLOAD"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -429,7 +435,7 @@ def ensure_binary():
         _journal("download disabled by %s" % NO_DOWNLOAD_ENV)
     elif url is None:
         _journal("download unavailable (no .companion_url / version)")
-    elif _recent_download_failure():
+    elif _recent_download_failure() and not os.environ.get(FORCE_DOWNLOAD_ENV):
         # An offline machine must not pay the timeout on every single use.
         _journal("download skipped (recent failure)")
         download_failure = "download_failed: recent failure"

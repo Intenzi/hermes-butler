@@ -126,7 +126,14 @@ def report(ask=False):
     # Check the companion before probing a grant: if the overlay itself is
     # unusable, a failed grant probe would just mirror that and send the user
     # to Accessibility - a toggle that cannot make a missing helper appear.
-    overlay_ok, overlay_detail = bp_overlay.build_if_needed()
+    # Doctor is the user asking "is it fixed now": never let a cached download
+    # failure answer that question.
+    try:
+        bp_overlay._remember_download_failure(None)
+    except Exception:  # noqa: BLE001
+        pass
+    resolve = getattr(bp_overlay, "ensure_binary", None) or bp_overlay.build_if_needed
+    overlay_ok, overlay_detail = resolve()
     status = _overlay_status(overlay_detail)
     exe = bp_overlay.binary_path()
     out["overlay"] = status
