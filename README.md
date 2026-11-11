@@ -39,29 +39,31 @@ installed, Butler compiles the bundled Swift source instead (7–14 s). See
 Three things, all from the same pet.
 
 ## Guide
-<img width="2054" height="1486" alt="image" src="https://github.com/user-attachments/assets/15e5ffdc-d6d1-46ee-9028-5cadea82ad55" />
-
 **Ask for help with a task.** The pet rings the next thing to click, says one
 line about it, and stays there until the screen actually changes. Click the wrong
 thing and it waits — it does not pretend you are done and it does not move on to
 step two.
 
+<img width="760" alt="image" src="https://github.com/user-attachments/assets/15e5ffdc-d6d1-46ee-9028-5cadea82ad55" />
+
 ## Look
-<img width="2452" height="1602" alt="image" src="https://github.com/user-attachments/assets/364931e2-ebab-4ecb-a98c-9b9d868f7826" />
-
-
 **Point at something and ask about it.** Right-click the hat beside the pet, then
 click whatever you are curious about. Butler tells you what that control is, what
 it does, and why it might be greyed out — and the click never reaches the app
 underneath, so nothing fires by accident.
 
+<img width="760" alt="image" src="https://github.com/user-attachments/assets/364931e2-ebab-4ecb-a98c-9b9d868f7826" />
+
+
+
 ## Watch
-<img width="384" height="242" alt="image" src="https://github.com/user-attachments/assets/48c1908c-bcc3-4885-a4d7-bac8ea5abd5f" />
-
-
 **Tell it to watch for one thing.** "Tell me when the build finishes." You go and
 do something else; when it happens the pet says so, and keeps saying so until you
 acknowledge it. Not a notification that scrolls away — a line that waits for you.
+
+
+<img width="384" height="242" alt="image" src="https://github.com/user-attachments/assets/48c1908c-bcc3-4885-a4d7-bac8ea5abd5f" />
+
 
 All three work the same way underneath: Butler reads the on-screen element data
 that macOS already publishes, the same information a screen reader uses. No
@@ -91,6 +93,60 @@ pictures, no OCR, no model looking at your screen.
   `plugin-data/butler/` and `desktop-plugins/butler/` (the watch log is capped at
   500 lines).
 
+## Performance
+
+Measured on my machine (macOS 26.3, Apple silicon) with a live companion — not
+estimates:
+
+- **No vision model anywhere.** The screen is never rendered to an image and
+  never sent to a model to be interpreted. Butler reads the same structured
+  element data a screen reader uses, so results come back in milliseconds, work
+  without a network round-trip, and add nothing to your token spend.
+- **Idle is idle.** 0.0% CPU and ~59 MB resident after 80 minutes running. There
+  is no frame loop in the companion and nothing redraws unless a guide is on
+  screen.
+- **Placement is event-driven, not polled.** The hat tracks the pet from
+  Accessibility move notifications, coalesced to one placement per 40 ms. A
+  single drag emits 86 of them, roughly 17 ms apart.
+- **Missed events heal on a slow tick.** A 3 s reconciliation pass covers windows
+  created while the observer was not running; without notifications the same code
+  falls back to a 0.5 s poll, so the badge is never stranded.
+- **The overlay only touches style when it moves.** The click target follows the
+  pet canvas each animation frame but writes to `style` only when the rectangle
+  changes by more than half a pixel — no layout thrash while dragging.
+- **A watch costs one tree walk per 3 s**, and nothing at all when no watch is
+  armed.
+
+## Under the hood
+
+Four moving parts, one rule: **the model decides what to do, deterministic code
+decides whether it actually happened.**
+
+| Part | What it is |
+|---|---|
+| `butler_core/engine.py` | The guide and watch state machines. Turns an intent into steps, asks for snapshots, evaluates each step's `expect`, and writes the spool the pet and the pane read. |
+| `butler_core/overlay_swift/ButlerOverlay.swift` | A single-file Swift companion — Accessibility observers, the ring, the hat, the ask field, the click-catcher, the hot key. ~7.9k lines, no dependencies. |
+| `desktop/plugin.js` | The Desktop SDK half: the pet's speech line, the summon and ask fields, and the polling that closes the loop back into the chat. |
+| `dashboard/plugin_api.py` | The `/butler` pane: start and stop a watch, guide history, the live transcript. |
+
+**The path of one request**
+
+1. A skill decides whether this is a guide moment at all (`butler:usage`), and how to run one (`butler:follow`). Both are prose loaded into the model's context — no logic, no privileges.
+2. `butler_guide_start` hands the engine a plan: each step carries a `find` (what to look for) and an `expect` (what must be true afterwards).
+3. The engine asks the companion for a snapshot of that app's Accessibility tree — a shallow walk first, then one re-walk to depth 24 when the app is Electron.
+4. `best_match` picks the element from the snapshot; the companion draws the ring on it and moves the pet beside it.
+5. The next snapshot is judged against `expect`. A pass advances the step. A miss stalls the guide and resets its clock — it does not tick, and it does not invent a new instruction.
+
+**What the Accessibility tree gives, and what it costs.** Role, label, value,
+enabled state and a geometry box for every element an app publishes. No pixels,
+no screenshot, no model call to interpret an image — a screen reader sees more
+than a vision model here, and it sees it in milliseconds for free.
+
+**The companion is a process, not a daemon.** One Swift binary per Hermes
+process, speaking JSON lines over stdout. No ports, no sockets, no background
+service; it exits when nothing is watching and the pet is gone.
+
+
 ## Troubleshooting
 
 - **The helper didn't download.** Run `hermes butler doctor`; its JSON says
@@ -113,6 +169,8 @@ pictures, no OCR, no model looking at your screen.
   (when to suggest one at all), `butler:conventions` (contributor rules).
 - Tests: `pytest` and `npm test`.
 - Screenshots live in `docs/img`.
+
+
 
 ## License
 
