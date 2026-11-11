@@ -50,7 +50,9 @@ step two.
 **Point at something and ask about it.** Right-click the hat beside the pet, then
 click whatever you are curious about. Butler tells you what that control is, what
 it does, and why it might be greyed out — and the click never reaches the app
-underneath, so nothing fires by accident.
+underneath, so nothing fires by accident. The cursor becomes a crosshair while
+you pick; `Esc` or a right-click cancels. The hat sits beside the **popped out**
+pet, so pop it out of the Hermes window first.
 
 <img width="760" alt="image" src="https://github.com/user-attachments/assets/364931e2-ebab-4ecb-a98c-9b9d868f7826" />
 
@@ -122,6 +124,8 @@ estimates:
 Four moving parts, one rule: **the model decides what to do, deterministic code
 decides whether it actually happened.**
 
+<img width="760" src="docs/img/architecture.svg" alt="Architecture: the model calls a tool, engine.py asks the Swift companion for an Accessibility snapshot of the target app, judges each step against its expect clause, and writes the state the surfaces read">
+
 | Part | What it is |
 |---|---|
 | `butler_core/engine.py` | The guide and watch state machines. Turns an intent into steps, asks for snapshots, evaluates each step's `expect`, and writes the spool the pet and the pane read. |
@@ -136,6 +140,12 @@ decides whether it actually happened.**
 3. The engine asks the companion for a snapshot of that app's Accessibility tree — a shallow walk first, then one re-walk to depth 24 when the app is Electron.
 4. `best_match` picks the element from the snapshot; the companion draws the ring on it and moves the pet beside it.
 5. The next snapshot is judged against `expect`. A pass advances the step. A miss stalls the guide and resets its clock — it does not tick, and it does not invent a new instruction.
+
+**Calls, and how a request reaches the model.** The three doors are framed
+turns — `[butler summon]`, `[butler look]`, `[butler watch]` — and a typed
+`watch <app> for …` routes to the watch frame. A watch is armed with
+`butler_watch_start`, inspected with `butler_watch_status` and cleared with
+`butler_watch_stop`; the pane shows `⏲ Watching <app> · <N> changes`.
 
 **What the Accessibility tree gives, and what it costs.** Role, label, value,
 enabled state and a geometry box for every element an app publishes. No pixels,

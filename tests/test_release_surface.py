@@ -46,8 +46,8 @@ DEAD_CONFIG_KEYS = (
 def test_readme_documents_look_and_watch() -> None:
     text = README.read_text(encoding="utf-8")
 
-    assert re.search(r"^## LOOK$", text, re.M), "LOOK has its own section"
-    assert re.search(r"^## WATCH$", text, re.M), "WATCH has its own section"
+    assert re.search(r"^## Look$", text, re.M), "Look has its own section"
+    assert re.search(r"^## Watch$", text, re.M), "Watch has its own section"
     assert "butler_watch_start" in text
     assert "butler_watch_status" in text
     assert "butler_watch_stop" in text
@@ -60,23 +60,30 @@ def test_readme_documents_look_and_watch() -> None:
 
 def test_look_section_states_the_picker_and_the_pop_out_requirement() -> None:
     text = README.read_text(encoding="utf-8")
-    look = text.split("## LOOK", 1)[1].split("\n## ", 1)[0]
+    look = text.split("## Look", 1)[1].split("\n## ", 1)[0]
 
     assert "Right-click" in look
     assert "crosshair" in look
     assert "Esc" in look
-    assert "clicks do not reach your apps" in look
+    assert "never reaches the app" in look
     assert "popped out" in look
 
 
-def test_readme_has_no_broken_screenshot_path() -> None:
-    text = README.read_text(encoding="utf-8")
+def test_readme_images_resolve() -> None:
+    """Every image the README embeds must exist: a broken figure renders as an
+    alt-text box on the docs page, which is worse than no figure at all."""
+    import re
 
-    # docs/img/ does not exist in the repo; an embed there renders broken.
-    assert "docs/img/" not in text
-    assert "![The pet hat badge" not in text
-    assert "## Screenshots" not in text
-    assert "docs/img" in text, "one line still says where screenshots land"
+    text = README.read_text(encoding="utf-8")
+    sources = re.findall(r'<img[^>]+src="([^"]+)"', text) + re.findall(r"!\[[^\]]*\]\(([^)]+)\)", text)
+    for src in sources:
+        if src.startswith(("http://", "https://")):
+            continue
+        assert (ROOT / src).is_file(), f"README embeds {src}, which is not in the repo"
+
+
+def test_readme_points_at_the_screenshot_folder() -> None:
+    assert "docs/img" in README.read_text(encoding="utf-8")
 
 
 # ------------------------------------------------------------------ schema

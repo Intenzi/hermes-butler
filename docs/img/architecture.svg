@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 620" width="980" height="620" role="img" aria-label="Butler architecture: the chat model calls a tool; the engine asks the Swift companion for an Accessibility snapshot of the target app and decides whether each step landed; the surfaces read the state the engine writes">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7c8492"/>
+    </marker>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f5c26b"/>
+    </marker>
+    <style>
+      .bg      { fill:#0d0f12; }
+      .panel   { fill:#14161a; stroke:#23262c; }
+      .card    { fill:#1a1d23; stroke:#2e333c; }
+      .hot     { fill:#20242c; stroke:#3c4352; }
+      .t       { font-family:-apple-system,"SF Pro Text","Helvetica Neue",Arial,sans-serif; fill:#eceef1; }
+      .title   { font-size:15px; font-weight:600; }
+      .sub     { font-size:12px; fill:#98a0ac; }
+      .mono    { font-family:"SF Mono",ui-monospace,Menlo,monospace; font-size:11.5px; fill:#c6ccd6; }
+      .hdr     { font-size:10.5px; letter-spacing:.1em; fill:#6b7280; font-weight:700; }
+      .lbl     { font-size:11px; fill:#8f97a3; }
+      .lblHot  { font-size:11px; fill:#f5c26b; }
+      .line    { stroke:#7c8492; stroke-width:1.4; fill:none; }
+      .lineHot { stroke:#f5c26b; stroke-width:1.6; fill:none; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="980" height="620"/>
+
+  <!-- panel: model -->
+  <rect class="panel" x="30" y="52" width="252" height="212" rx="12"/>
+  <text class="t hdr" x="46" y="78">MODEL</text>
+  <text class="t title" x="46" y="106">Hermes chat</text>
+  <text class="t sub"   x="46" y="126">reads skills — never pixels</text>
+  <text class="mono"  x="46" y="154">butler:usage</text>
+  <text class="t sub"   x="46" y="171">is this a guide moment?</text>
+  <text class="mono"  x="46" y="195">butler:follow</text>
+  <text class="t sub"   x="46" y="212">how to run one</text>
+  <text class="t sub"   x="46" y="242">The model proposes. It cannot verify.</text>
+
+  <!-- panel: deterministic -->
+  <rect class="panel" x="318" y="52" width="392" height="392" rx="12"/>
+  <text class="t hdr" x="334" y="78">DETERMINISTIC CODE</text>
+
+  <rect class="hot" x="334" y="92" width="360" height="104" rx="10"/>
+  <text class="t title" x="350" y="118">10 tools</text>
+  <text class="t sub"   x="350" y="137">the only way the model can act</text>
+  <text class="mono"  x="350" y="160">guide_start · look · watch_start · capture</text>
+  <text class="mono"  x="350" y="178">say · stop · watch_status · watch_ack</text>
+
+  <rect class="hot" x="334" y="246" width="360" height="178" rx="10"/>
+  <text class="t title" x="350" y="272">engine.py</text>
+  <text class="t sub"   x="350" y="291">guide and watch state machines</text>
+  <text class="mono"  x="350" y="316">find    what to look for</text>
+  <text class="mono"  x="350" y="335">expect  what must be true after</text>
+  <text class="mono"  x="350" y="354">best_match(snapshot) → the step</text>
+  <text class="t sub"   x="350" y="382">A pass advances. A miss stalls.</text>
+  <text class="t sub"   x="350" y="401">The model never decides this.</text>
+
+  <!-- companion -->
+  <rect class="hot" x="742" y="92" width="208" height="176" rx="10"/>
+  <text class="t title" x="758" y="118">Swift companion</text>
+  <text class="t sub"   x="758" y="137">one binary · JSON on stdout</text>
+  <text class="mono"  x="758" y="162">AX observer · overlays</text>
+  <text class="mono"  x="758" y="180">ring · hat · ask field</text>
+  <text class="mono"  x="758" y="198">hit test · hot key</text>
+  <text class="t sub"   x="758" y="224">Draws the ring, moves the pet.</text>
+  <text class="t sub"   x="758" y="242">No ports. No sockets. Exits idle.</text>
+
+  <!-- target app -->
+  <rect class="card" x="742" y="330" width="208" height="114" rx="10"/>
+  <text class="t title" x="758" y="356">Any macOS app</text>
+  <text class="t sub"   x="758" y="375">role · label · value · enabled · box</text>
+  <text class="t sub"   x="758" y="394">the tree a screen reader reads</text>
+  <text class="t sub"   x="758" y="418">no screenshot · no OCR</text>
+
+  <!-- surfaces -->
+  <rect class="panel" x="30" y="470" width="920" height="112" rx="12"/>
+  <text class="t hdr" x="46" y="496">SURFACES — they read the state engine.py writes</text>
+  <rect class="card" x="46" y="510" width="272" height="56" rx="9"/>
+  <text class="mono"  x="62" y="533">desktop/plugin.js</text>
+  <text class="t sub"   x="62" y="551">pet speech line, ask fields</text>
+  <rect class="card" x="338" y="510" width="272" height="56" rx="9"/>
+  <text class="mono"  x="354" y="533">dashboard/plugin_api.py</text>
+  <text class="t sub"   x="354" y="551">the /butler pane</text>
+  <rect class="card" x="630" y="510" width="304" height="56" rx="9"/>
+  <text class="mono"  x="646" y="533">plugin-data/butler/*.json</text>
+  <text class="t sub"   x="646" y="551">guide · watch · say · a 500-line log</text>
+
+  <!-- arrows -->
+  <path class="line" d="M156,264 L156,362 Q156,378 172,378 L196,378" marker-end="url(#a)" opacity="0"/>
+  <path class="line" d="M282,158 L318,158" marker-end="url(#a)"/>
+  <text class="lbl" x="286" y="148">tool call</text>
+
+  <path class="line" d="M514,196 L514,246" marker-end="url(#a)"/>
+  <text class="lbl" x="522" y="226">starts · stops</text>
+
+  <path class="lineHot" d="M694,268 L742,268" marker-end="url(#ah)"/>
+  <text class="lblHot" x="700" y="258">snapshot, please</text>
+
+  <path class="lineHot" d="M742,296 L694,296" marker-end="url(#ah)"/>
+  <text class="lblHot" x="700" y="316">elements + boxes</text>
+
+  <path class="line" d="M846,330 L846,268" marker-end="url(#a)"/>
+  <text class="lbl" x="854" y="304">AX elements</text>
+
+  <path class="line" d="M514,424 L514,470" marker-end="url(#a)"/>
+  <text class="lbl" x="522" y="452">writes the state</text>
+
+  <text class="t sub" x="30" y="606" style="font-size:11.5px">One rule: the model chooses what to do. Deterministic code decides whether it actually happened.</text>
+</svg>
