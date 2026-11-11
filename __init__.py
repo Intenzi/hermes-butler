@@ -273,11 +273,13 @@ def tool_watch_stop(args, **kwargs):
 
 
 def tool_watch_ack(args, **kwargs):
-    """Acknowledge a sticky watch hit; the watch keeps observing.
+    """Acknowledge the hit announcement that outlives its watch.
 
-    Clears the hit so the pet/pane line returns to the change count. Returns
-    ``acknowledged: false`` (never an error) when there is no hit or the watch
-    already ended. Unattended-safe: nothing on screen changes.
+    A hit publishes a top-level ``watch_hit`` row, so acknowledging works when
+    no watch is running — the normal case after a one-shot hit. The pet stops
+    saying it on the next beat; a sticky watch also returns to its change count
+    and keeps observing. Returns ``acknowledged: false`` (never an error) when
+    there is nothing to clear. Unattended-safe: nothing on screen changes.
     """
     try:
         return _out(bp_engine.acknowledge_watch_hit())
@@ -403,7 +405,7 @@ def register(ctx):
     ctx.register_tool(name="butler_watch_stop", toolset="butler", schema=WATCH_STOP_SCHEMA,
                       handler=tool_watch_stop, description="Stop the active watch and clear its state row.", emoji="⏲")
     ctx.register_tool(name="butler_watch_ack", toolset="butler", schema=WATCH_ACK_SCHEMA,
-                      handler=tool_watch_ack, description="Acknowledge a sticky watch hit: clear it and keep watching.", emoji="⏲")
+                      handler=tool_watch_ack, description="Acknowledge the hit announcement: stop the pet saying it (works after a one-shot watch ended).", emoji="⏲")
     ctx.register_command(
         BUTLER_SLASH_NAME,
         handler=lambda raw, _ctx=ctx: _handle_butler_slash(_ctx, raw),

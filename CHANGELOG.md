@@ -14,6 +14,17 @@ All notable changes to this plugin are documented here. The format follows
   the app/role/label/window/box to the Butler chat without planning a guide.
 - `butler_look` tool: a live capture of the app a LOOK question named, so the
   agent can answer with fresh neighbours without asking the user again.
+- A watch hit now publishes a top-level `watch_hit` row that outlives the watch
+  row: the pet keeps saying `⏲ Hit · <app>: <label>` every 25 s until the user
+  acknowledges it with `butler_watch_ack`, `POST /watch/ack`, or the hat menu's
+  new **Acknowledge watch hit** item.
+
+### Changed
+
+- Doctor names the right overlay remedy: a missing/non-executable helper says
+  reinstall the plugin (never a compiler), while a local source-hash mismatch
+  says rebuild with Command Line Tools. It no longer asks for a Screen Recording
+  grant and reports `ocr` as `optional, not used`.
 
 ## [0.2.0] - 2026-11-09
 

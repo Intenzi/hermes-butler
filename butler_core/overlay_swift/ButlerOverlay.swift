@@ -32,6 +32,7 @@
 //     "target":{"app":"Preview","role":"Button","label":"Export",
 //               "window":"receipt.pdf","doc":"file:///...","enabled":true,
 //               "box":[x,y,w,h]}}
+//    {"op":"watch_ack"}   the hat menu's Acknowledge watch hit button
 //
 //  One global Carbon hot key: ⌘⇧A opens the plain ask field.
 //
@@ -6089,6 +6090,9 @@ private final class OverlayController {
         // The `watch` row in state.json is the ground truth; the in-process
         // observer covers an unreadable file.
         let watchActive = watchIsActive()
+        // The announcement outlives the watch row, so its enablement comes from
+        // the top-level `watch_hit` block, not from `watch`.
+        let hitPending = unacknowledgedWatchHit()
         let menu = NSMenu()
         menu.autoenablesItems = false
 
@@ -6117,6 +6121,11 @@ private final class OverlayController {
         })
         menu.addItem(entry("What did the watch see?", enabled: watchActive) { [weak self] in
             self?.openSummonField(prefill: "what did the watch see?")
+        })
+        // The hat IS the acknowledgement button for a hit that outlived its
+        // watch; disabled only when there is nothing unacknowledged to clear.
+        menu.addItem(entry("Acknowledge watch hit", enabled: hitPending) { [weak self] in
+            self?.acknowledgeWatchHit()
         })
         menu.addItem(entry("Stop watching", enabled: watchActive) { [weak self] in
             self?.openSummonField(prefill: "stop watching")
@@ -6158,8 +6167,43 @@ private final class OverlayController {
         return watchObserver != nil
     }
 
+    /// One line on stdout: the hat's acknowledgement button. The Python side
+    /// routes it to the same engine door `butler_watch_ack` uses — no new
+    /// window, no new transport and no HTTP from this helper. The menu closes
+    /// itself when the item fires.
+    private func acknowledgeWatchHit() {
+        chipJournal("watch-ack:emit")
+        writeEventLine(["op": "watch_ack"])
+    }
+
     /// The `watch` row of the shared state snapshot, or nil when unreadable.
     private func readWatchStateRow() -> [String: Any]? {
+        guard let object = readButlerState() else {
+            return nil
+        }
+        return object["watch"] as? [String: Any]
+    }
+
+    /// Is there a `watch_hit` announcement the user has not acknowledged? The
+    /// engine writes the block on a hit and keeps it after the watch stops, so
+    /// one cheap file read on right-click is the whole gate.
+    private func unacknowledgedWatchHit() -> Bool {
+        guard let object = readButlerState(),
+              let hit = object["watch_hit"] as? [String: Any] else {
+            return false
+        }
+        let acknowledged = hit["acknowledged"]
+        if acknowledged == nil || acknowledged is NSNull {
+            return true
+        }
+        if let flag = acknowledged as? Bool {
+            return !flag
+        }
+        return true
+    }
+
+    /// The shared state snapshot from the plugin data dir, or nil.
+    private func readButlerState() -> [String: Any]? {
         let dir = (NSHomeDirectory() as NSString)
             .appendingPathComponent(".hermes/plugin-data/butler")
         let path = (dir as NSString).appendingPathComponent("state.json")
@@ -6167,7 +6211,7 @@ private final class OverlayController {
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return nil
         }
-        return object["watch"] as? [String: Any]
+        return object
     }
 
     // MARK: System-wide summon hot key

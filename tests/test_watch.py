@@ -65,6 +65,7 @@ def _reset() -> None:
     engine._session = None
     engine._summon_pending = None
     engine._watch = None
+    engine._watch_hit_id = None
     engine._watch_ring.clear()
 
 
@@ -483,7 +484,9 @@ def test_watch_ack_clears_the_hit_and_keeps_the_watch(
                       "app": "Slack", "events": 0}
     assert engine._watch["hit"] is None, "the hit is cleared, not remembered"
     assert engine._watch["stopped"] is None, "the watch is still live"
-    assert _state(tmp_path)["watch"]["hit"] is None
+    state = _state(tmp_path)
+    assert state["watch"]["hit"] is None
+    assert "watch_hit" not in state, "the announcement is gone too"
     # The watch still observes after the acknowledgement.
     engine._on_overlay_event(_event(1))
     assert engine._watch["events"] == 1
@@ -493,19 +496,218 @@ def test_watch_ack_clears_the_hit_and_keeps_the_watch(
     assert again["status"] == "no-hit"
 
 
-def test_watch_ack_is_false_for_a_one_shot_hit_and_when_idle(
+# ------------------------------------- the hit outlives the watch (round 21)
+
+
+def _hit(when: float = 1_794_330_012.0) -> dict:
+    return {"op": "watch-hit", "app": "Slack", "until": "Export complete",
+            "label": "Export complete", "window": "general — Slack",
+            "at": when}
+
+
+def test_a_hit_writes_a_top_level_watch_hit_that_outlives_the_watch(
+        tmp_path: Path, monkeypatch) -> None:
+    """The announcement is its own row: a one-shot watch stops, the row stays."""
+    _start(tmp_path, monkeypatch, until="Export complete")
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+
+    engine._on_overlay_event(_hit())
+
+    state = _state(tmp_path)
+    block = state["watch_hit"]
+    assert block["app"] == "Slack"
+    assert block["label"] == "Export complete"
+    assert block["window"] == "general — Slack"
+    assert block["at"] == 1_794_330_012.0
+    assert block["acknowledged"] is False
+    assert re.fullmatch(r"[0-9a-f]{8}", block["id"]), "8 hex id"
+    assert state["watch"]["stopped"]["reason"] == "hit", "the watch still ends"
+
+    # The desktop/pane clearing the ended watch row must not take the
+    # announcement with it.
+    engine.stop_watch()
+    state = _state(tmp_path)
+    assert "watch" not in state
+    assert state["watch_hit"] == block, "same row, same id: it survived"
+
+
+def test_the_outliving_hit_merges_with_the_other_state_blocks(
+        tmp_path: Path, monkeypatch) -> None:
+    """A later guide/watch write carries the hit row forward, never clobbers it."""
+    _start(tmp_path, monkeypatch, until="Export complete")
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    engine._on_overlay_event(_hit())
+    block = _state(tmp_path)["watch_hit"]
+
+    engine._session = {
+        "id": "g1", "overlay": "ringing",
+        "state": {"status": "running", "idx": 0},
+        "steps": [{"say": "Click Export"}], "verifications": [],
+    }
+    engine._write_state()
+
+    state = _state(tmp_path)
+    assert state["watch_hit"] == block
+    assert state["guide"]["id"] == "g1"
+    assert state["watch"]["stopped"]["reason"] == "hit"
+
+
+def test_a_sticky_hit_also_writes_the_top_level_announcement(
+        tmp_path: Path, monkeypatch) -> None:
+    _start(tmp_path, monkeypatch, until="Export complete", once=False)
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+
+    engine._on_overlay_event(_hit())
+
+    state = _state(tmp_path)
+    assert state["watch_hit"]["acknowledged"] is False
+    assert state["watch"]["hit"]["acknowledged"] is False
+    assert state["watch"]["stopped"] is None, "sticky keeps watching"
+
+
+def test_a_second_arm_replaces_the_announcement_id(
         tmp_path: Path, monkeypatch) -> None:
     _start(tmp_path, monkeypatch, until="Export complete")
     monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
-    engine._on_overlay_event({"op": "watch-hit", "app": "Slack",
-                              "label": "Export complete", "at": 5.0})
+    engine._on_overlay_event(_hit())
+    first = _state(tmp_path)["watch_hit"]["id"]
 
-    assert engine.acknowledge_watch_hit()["acknowledged"] is False
-    assert engine._watch["stopped"]["reason"] == "hit", "the ending still stands"
+    overlay, _result = _start(tmp_path, monkeypatch, until="Done")
+    overlay.replies = [{"op": "watch-started", "app": "Slack"}]
+    engine._on_overlay_event(dict(_hit(1_794_330_099.0), label="Done"))
 
+    second = _state(tmp_path)["watch_hit"]["id"]
+    assert second != first, "a fresh hit is a fresh announcement"
+    assert _state(tmp_path)["watch_hit"]["label"] == "Done"
+
+
+def test_ack_clears_the_announcement_when_no_watch_runs(
+        tmp_path: Path, monkeypatch) -> None:
+    """The normal case after a one-shot hit: the watch row is already gone."""
+    _start(tmp_path, monkeypatch, until="Export complete")
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    engine._on_overlay_event(_hit())
     engine.stop_watch()
+    assert "watch" not in _state(tmp_path)
+    assert _state(tmp_path)["watch_hit"]["acknowledged"] is False
+
+    result = engine.acknowledge_watch_hit()
+
+    assert result["acknowledged"] is True
+    assert result["status"] == "acknowledged"
+    assert result["app"] == "Slack"
+    assert "watch_hit" not in _state(tmp_path)
+    # A second ack is a no-op that never raises.
+    again = engine.acknowledge_watch_hit()
+    assert again == {"status": "idle", "acknowledged": False}
+    assert "watch_hit" not in _state(tmp_path)
+
+
+def test_ack_publishes_acknowledged_before_removing_the_block(
+        tmp_path: Path, monkeypatch) -> None:
+    """A poll between the two writes can never see an unacked hit."""
+    _start(tmp_path, monkeypatch, until="Export complete")
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    engine._on_overlay_event(_hit())
+    engine.stop_watch()
+    seen = []
+    real = engine._write_state
+
+    def recording(*args, **kwargs):
+        real(*args, **kwargs)
+        seen.append((_state(tmp_path) or {}).get("watch_hit"))
+
+    monkeypatch.setattr(engine, "_write_state", recording)
+
+    assert engine.acknowledge_watch_hit()["acknowledged"] is True
+
+    assert seen, "the ack wrote the shared snapshot"
+    assert seen[0]["acknowledged"] is True, "marked before removed"
+    assert seen[-1] is None, "then the block is gone"
+
+
+def test_ack_works_with_no_watch_and_no_file_row(
+        tmp_path: Path, monkeypatch) -> None:
+    """An ack on an idle engine is honest, never an exception."""
+    _reset()
+    engine.init(tmp_path)
+
     assert engine.acknowledge_watch_hit() == {"status": "idle",
                                               "acknowledged": False}
+
+
+def test_an_ack_in_another_process_is_reconciled_by_the_owner(
+        tmp_path: Path, monkeypatch) -> None:
+    """A sticky row acked elsewhere must not leave a stale hit (or swallow hits)."""
+    _start(tmp_path, monkeypatch, until="Export complete", once=False)
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    engine._on_overlay_event(_hit())
+    assert engine._watch["hit"] is not None
+    # Another process acknowledges: the top-level block disappears from the
+    # shared file, while this process still holds row.hit in memory.
+    path = tmp_path / "state.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    del state["watch_hit"]
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    # The owner's next write reconciles the row.
+    engine._on_overlay_event(_event(1))
+
+    assert engine._watch["hit"] is None, "the stale sticky hit is dropped"
+    assert _state(tmp_path)["watch"]["hit"] is None
+    assert "watch_hit" not in _state(tmp_path)
+    # The duplicate guard is re-armed: the next occurrence is announced again.
+    said = []
+    monkeypatch.setattr(engine, "say",
+                        lambda text: said.append(text) or {"ok": True})
+    engine._on_overlay_event(dict(_hit(1_794_330_099.0), label="Second"))
+    assert said == ["Slack: Second appeared"]
+    assert _state(tmp_path)["watch_hit"]["label"] == "Second"
+
+
+def test_ack_acknowledges_the_block_but_leaves_a_live_foreign_sticky_hit(
+        tmp_path: Path) -> None:
+    """The other process owns the row: ack the announcement, report honestly."""
+    _reset()
+    engine.init(tmp_path)
+    row = {"app": "Slack", "once": False, "owner_pid": 1, "events": 3,
+           "hit": {"label": "Export complete", "at": 5.0,
+                   "acknowledged": False},
+           "stopped": None, "recent": []}
+    block = {"app": "Slack", "label": "Export complete", "window": None,
+             "at": 5.0, "acknowledged": False, "id": "a1b2c3d4"}
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"watch": row, "watch_hit": block}),
+                    encoding="utf-8")
+
+    first = engine.acknowledge_watch_hit()
+
+    assert first["acknowledged"] is True
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert "watch_hit" not in state
+    assert state["watch"]["hit"] is not None, (
+        "the live owner reconciles its own row; this process must not lie about it")
+
+    # With the announcement gone, the legacy sticky row cannot be acked here:
+    # a second ack is an honest false and writes nothing.
+    second = engine.acknowledge_watch_hit()
+    assert second == {"status": "elsewhere", "acknowledged": False,
+                      "app": "Slack", "owner_pid": 1,
+                      "note": "another butler process owns this watch; "
+                              "acknowledge it from that process"}
+
+
+def test_watch_ack_is_false_when_the_one_shot_hit_was_already_acked(
+        tmp_path: Path, monkeypatch) -> None:
+    _start(tmp_path, monkeypatch, until="Export complete")
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    engine._on_overlay_event(_hit())
+
+    assert engine.acknowledge_watch_hit()["acknowledged"] is True
+    assert engine._watch["stopped"]["reason"] == "hit", "the ending still stands"
+    again = engine.acknowledge_watch_hit()
+    assert again["acknowledged"] is False
+    assert again["status"] == "stopped"
 
 
 # ------------------------------------------------------------------ status

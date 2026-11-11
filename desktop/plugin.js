@@ -1988,11 +1988,17 @@ function petStatusLine(cur) {
   const status = asText(cur && cur.status)
   const note = asText(cur && cur.note)
   const instruction = asText(cur && cur.instruction)
+  const hitLine = watchHitLine(watchHitValue(cur))
   const watchLine = watchStatusLine(cur && cur.watch)
   // Precedence, in one place (round 19): a live watch beats every DEAD guide
   // block. `stalled` is only live while no watch is running; done / stopped /
   // abandoned / superseded are never live. Without this, a stale stall note
   // from a guide stopped long ago masks the watch line forever.
+  // Round 21 adds the OUTLIVING hit announcement: a hit row is its own block,
+  // so it keeps speaking after a one-shot watch stopped (which is the normal
+  // case). It outranks the live watch line and every guide status including a
+  // dead stalled note and a terminal line; only a live guide instruction (the
+  // user is being walked through something) still leads it.
   if (status === 'running' && instruction) {
     // 1. A live step the user is being walked through.
     return instruction
@@ -2004,12 +2010,16 @@ function petStatusLine(cur) {
       ? `Capture failed: ${note}`
       : 'Capture failed — butler could not read the screen'
   }
+  if (hitLine) {
+    // 2. The announcement that outlives its watch, until acknowledged.
+    return hitLine
+  }
   if (watchLine) {
-    // 2. The ambient watch the pet carries while the user is in another app.
+    // 3. The ambient watch the pet carries while the user is in another app.
     return watchLine
   }
   if (status === 'done') {
-    // 3. Terminal guide lines: spoken once by the beat's dedupe.
+    // 4. Terminal guide lines: spoken once by the beat's dedupe.
     const total = asNumber(cur.total)
     const verified = asNumber(cur.verified)
     return `Guide complete · ${verified} of ${total} verified`
@@ -2018,12 +2028,44 @@ function petStatusLine(cur) {
     return note && note !== instruction ? `Butler stopped: ${note}` : 'Butler stopped'
   }
   if (status === 'stalled') {
-    // 4. Only when no watch is live (a live watch returned above).
+    // 5. Only when no watch is live (a live watch returned above).
     return note || `Butler stalled on step ${asNumber(cur.currentStep) + 1}`
   }
-  // 5. Idle: abandon/superseded/unknown blocks are dead weight and say nothing.
+  // 6. Idle: abandon/superseded/unknown blocks are dead weight and say nothing.
   return null
 }
+
+/**
+ * The hit announcement that outlives its watch.
+ *
+ * A one-shot hit ends the `watch` row per round 20, so the announcement cannot
+ * live there. The engine writes a top-level `watch_hit` block instead, and the
+ * pet says it every WATCH_KEEPALIVE_MS until the user acknowledges it — the
+ * user's words: "it just doesn't stop telling me that the hit has been
+ * reached, until I acknowledge it because sometimes I'm just not looking at my
+ * pet". Acknowledging removes the block; nothing else clears the line.
+ */
+function watchHitLine(watchHit) {
+  const row = watchHit && typeof watchHit === 'object' ? watchHit : null
+  if (!row) return null
+  if (row.acknowledged === true) return null
+  const label = asText(row.label)
+  if (!label) return null
+  const app = asText(row.app) || '?'
+  return `⏲ Hit · ${app}: ${label}`
+}
+
+/**
+ * The hit row from either shape: the raw `/state` key (`watch_hit`) or the
+ * camelCase slice `speechSnapshot` builds. Accepting both keeps the two
+ * speakers from drifting if one passes the state row straight through.
+ */
+function watchHitValue(cur) {
+  if (!cur || typeof cur !== 'object') return null
+  if (cur.watchHit !== undefined && cur.watchHit !== null) return cur.watchHit
+  return cur.watch_hit !== undefined ? cur.watch_hit : null
+}
+
 
 /**
  * The ambient WATCH line the pet carries while a watch is active.
@@ -2155,6 +2197,15 @@ function announceWatchEnded(cur) {
   const stopped = watch.stopped
   const key = `${asText(watch.app) || ''}|${asText(stopped.at) || ''}|${asText(stopped.reason) || ''}`
   if (key === lastWatchEndedKey) return false
+  // A one-shot hit ALSO publishes the top-level `watch_hit` announcement. That
+  // persistent line is the announcement, so "Watch ended — hit" would be a
+  // second, redundant speech. Clear the ended row once (silently) and let the
+  // hit line own the channel; the beat continues into petStatusLine.
+  if (watchHitLine(watchHitValue(cur))) {
+    lastWatchEndedKey = key
+    stopWatch()
+    return false
+  }
   // Mark the ending as spoken only once the line actually went out. A say that
   // throws must not burn the dedupe key: the next beat retries the one line
   // instead of losing it forever. A host with no pet channel burns the key on
@@ -2226,6 +2277,7 @@ function speechSnapshot(data) {
   const currentStep = steps.length > 0 ? Math.min(idx, steps.length - 1) : 0
   const rawAnswer = data && data.say
   const rawWatch = data && data.watch
+  const rawHit = data && data.watch_hit
   return {
     status: asText(state.status) || asText(guide && guide.status) || 'running',
     note: asText(state.note),
@@ -2234,7 +2286,10 @@ function speechSnapshot(data) {
     total: steps.length,
     verified: verifications.length,
     say: rawAnswer && typeof rawAnswer === 'object' && Object.keys(rawAnswer).length > 0 ? rawAnswer : null,
-    watch: rawWatch && typeof rawWatch === 'object' && Object.keys(rawWatch).length > 0 ? rawWatch : null
+    watch: rawWatch && typeof rawWatch === 'object' && Object.keys(rawWatch).length > 0 ? rawWatch : null,
+    // Top-level and independent of `watch` (the same key `/state` carries): a
+    // one-shot hit ends the watch row, and this announcement outlives it.
+    watch_hit: rawHit && typeof rawHit === 'object' && Object.keys(rawHit).length > 0 ? rawHit : null
   }
 }
 
@@ -2280,29 +2335,33 @@ function petSpeechBeat(cur, now = Date.now()) {
     lastSaid = null
     return 'idle'
   }
-  // Is this line the ambient watch count? Only then does it get a keep-alive;
+  // Is this line one of the two PERSISTENT rows? The live watch count and the
+  // top-level hit announcement that outlives its watch both get the keep-alive;
   // every other status line still speaks once (a guide instruction is already
-  // carried by the ring and the pane). Compare the WINNING line to the watch
-  // line instead of testing the instruction: a dead guide may still carry a
-  // stale step while the watch line is the one the pet is speaking.
+  // carried by the ring and the pane). Compare the WINNING line to each row
+  // instead of testing the instruction: a dead guide may still carry a stale
+  // step while the watch/hit line is the one the pet is speaking.
   const liveWatch = watchIsActive(cur && cur.watch) ? cur.watch : null
   const watchLine = liveWatch ? watchStatusLine(liveWatch) : null
+  const hitAnnouncement = watchHitLine(watchHitValue(cur))
+  const keptAliveHit = hitAnnouncement && line === hitAnnouncement
+    ? hitAnnouncement
+    : null
   const hit = liveWatch && liveWatch.hit && typeof liveWatch.hit === 'object'
     ? liveWatch.hit
     : null
   const hitPending = Boolean(asText(hit && hit.label)) && hit.acknowledged !== true
-  // A hit is announced ONCE, not every 25 s: only the live "watching" count is
-  // kept alive. A hit line still dedupes normally, so the beat never repeats it
-  // on its own; the pane row carries the hit label until the user acknowledges.
+  // A STICKY watch hit is announced once, not every 25 s: only the live
+  // "watching" count is kept alive there. The top-level announcement above is
+  // the round-21 exception — it must be re-said until acknowledged.
   const watching = watchLine && line === watchLine && !hitPending ? line : null
   if (lastSaid === line) {
-    const due = watching && line === watching && now - lastSaidAt >= WATCH_KEEPALIVE_MS
+    const due = Boolean(keptAliveHit || watching) && now - lastSaidAt >= WATCH_KEEPALIVE_MS
     if (!due) return 'repeat'
   }
-  // The host clamps a ttl to 30 s: the watch line asks for the clamp so the
-  // 25 s re-say lands before the previous line expires. A hit has no keep-alive,
-  // but still asks for a readable ttl for its one announcement.
-  const ttlMs = watchLine && line === watchLine ? WATCH_TTL_MS : 9000
+  // The host clamps a ttl to 30 s: a persistent line asks for the clamp so the
+  // 25 s re-say lands before the previous line expires.
+  const ttlMs = keptAliveHit || (watchLine && line === watchLine) ? WATCH_TTL_MS : 9000
   try {
     petCtx && typeof petCtx.say === 'function'
       && petCtx.say(line, { tone: 'info', ttlMs, id: 'butler-say' })

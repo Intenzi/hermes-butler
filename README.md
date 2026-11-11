@@ -19,12 +19,11 @@ Then quit and reopen the Hermes desktop app. The desktop half
 (`desktop/plugin.js`) is copied into `desktop-plugins/butler/` when the app
 starts; a running app keeps the copy it started with.
 
-`hermes butler doctor --ask` raises the real macOS permission dialogs —
-Accessibility is prompted by the plugin itself via
-`AXIsProcessTrustedWithOptions`, Screen Recording via
-`CGRequestScreenCaptureAccess` — and deep-links the two System Settings panes.
-The CLI prints a JSON report; `--ask` is the only form that also raises the
-dialogs.
+`hermes butler doctor --ask` raises the real macOS Accessibility dialog via
+`AXIsProcessTrustedWithOptions` and deep-links its System Settings pane. The CLI
+prints a JSON report; `--ask` is the only form that also raises the dialog. The
+Screen Recording grant is reported for transparency but never requested: this
+plugin does not read screen pixels (`ocr` is `optional, not used`).
 
 These three commands work today and print JSON:
 
@@ -39,7 +38,7 @@ hermes butler status
 | Grant | Subject | Without it |
 |---|---|---|
 | Accessibility | `Butler companion - the butler plugin's bundled helper` | No capture, no guide, no overlay: every step reports `capture_failed` |
-| Screen Recording | the Hermes host process | AX still works; the on-device OCR fallback (Chromium/gated pages) is unavailable |
+| Screen Recording | the Hermes host process | nothing — reported by the doctor for transparency only (`ocr` is `optional, not used`); AX capture never needs it |
 
 Accessibility is what makes the rings and the step verification work: the
 companion reads element labels and boxes through it. macOS requires the final
@@ -159,9 +158,8 @@ prefill does.
 
 Each step's arrival is read back from the OS before the guide advances: an
 Accessibility read of the foreground app, then — when the AX tree looks thin —
-one re-walk to depth 24 for Electron/Chromium content, then on-device OCR when
-the Screen Recording grant is present. The poll runs every 1.5 s per step and a
-step times out at 120 s. A guide that cannot verify a step stalls and says so;
+one re-walk to depth 24 for Electron/Chromium content. The poll runs every 1.5 s
+per step and a step times out at 120 s. A guide that cannot verify a step stalls and says so;
 it does not advance on assumption.
 
 ## Performance
@@ -217,10 +215,11 @@ Plain statements about what this plugin does when it runs.
    JSON-over-stdin protocol. The same shared process serves guides, captures,
    the summon double, and the pop-out hat badge; it exits when idle (a roughly
    10 min watchdog) or when the host closes its pipe.
-3. The plugin reads the foreground app via the Accessibility framework and,
-   where needed, Apple Vision OCR. It reads element text and geometry boxes
-   only. No screenshots are stored or transmitted. Element text goes to the
-   chat's own model provider, same as any other tool output in the session.
+3. The plugin reads the foreground app via the Accessibility framework only
+   (the bundled `ocr` module is not wired into capture). It reads element text
+   and geometry boxes only. No screenshots are stored or transmitted. Element
+   text goes to the chat's own model provider, same as any other tool output in
+   the session.
 4. Guide plans, live state, the summon config, and transcripts are small JSON
    files under `plugin-data/butler` (`guides/*.json`, `state.json`,
    `config.json`); nothing else is written outside the plugin's own data
@@ -274,8 +273,8 @@ directories are the whole runtime footprint.
   The guide then stalls and says so rather than guessing.
 - Multi-display placement is implemented but has not been exercised on a
   multi-monitor setup.
-- OCR requires the Screen Recording grant; without it, gated content that AX
-  cannot see stays unverifiable.
+- AX only: the bundled `ocr` module is not wired into capture, so content the
+  Accessibility tree cannot see stays unverifiable.
 
 Screenshots land in `docs/img` before publishing.
 

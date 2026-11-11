@@ -24,6 +24,7 @@ The companion writes one event line on clickable mini-windows:
   {"op":"summon_text","text":"...","id":"a1b2c3d4"}
   {"op":"look_text","text":"...","id":"a1b2c3d4","destination":"recent",
    "target":{"app":"Preview","role":"Button","label":"Export","box":[1,2,3,4]}}
+  {"op":"watch_ack"}   the hat menu's Acknowledge watch hit button
 
 Ambient WATCH lines (passive AX observation; never a click):
   {"op":"watch-started","app":"Slack","until":"Export complete","pid":123}
@@ -526,6 +527,17 @@ class Overlay:
         if not isinstance(message, dict):
             return
         op = message.get("op")
+        if op == "watch_ack":
+            # The hat's Acknowledge watch hit button: one event line, routed to
+            # the same engine door `butler_watch_ack` uses (never the request
+            # inbox, which waits for an AX reply). Journal the hop for support.
+            journal_click("watch-ack:menu")
+            try:
+                from . import engine as bp_engine
+                bp_engine.ack_watch()
+            except Exception:  # noqa: BLE001 - a menu click must not kill the pipe
+                pass
+            return
         if op in ("claim_click", "launcher_click", "summon_text", "look_text"):
             callback = self.on_event
             journal_click("pipe-%s cb=%s" % (

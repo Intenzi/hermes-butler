@@ -323,6 +323,63 @@ def test_watch_ack_endpoint_is_honest_when_no_watch_exists(
                                "acknowledged": False}
 
 
+def test_watch_ack_endpoint_clears_the_outliving_hit_with_no_watch(
+        client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A one-shot hit leaves no watch row; the announcement is the only row."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    engine.init(bp_paths.plugin_data_dir("butler"))
+    engine._watch = None
+    engine._watch_ring.clear()
+    state_path = tmp_path / "plugin-data" / "butler" / "state.json"
+    block = {
+        "app": "Slack", "label": "Export complete",
+        "window": "general — Slack", "at": time.time(),
+        "acknowledged": False, "id": "a1b2c3d4",
+    }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"watch_hit": block}), encoding="utf-8")
+
+    # /state exposes the block the pet speaks.
+    assert client.get("/state").json()["watch_hit"] == block
+
+    response = client.post("/watch/ack")
+
+    assert response.status_code == 200
+    assert response.json()["acknowledged"] is True
+    assert response.json()["status"] == "acknowledged"
+    assert response.json()["app"] == "Slack"
+    assert "watch_hit" not in client.get("/state").json(), "the block is removed"
+
+    # A second ack is a no-op, never an exception.
+    again = client.post("/watch/ack")
+    assert again.status_code == 200
+    assert again.json() == {"ok": True, "status": "idle", "acknowledged": False}
+
+
+def test_the_hat_menu_watch_ack_route_reaches_the_engine(
+        client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """overlay.py routes the hat's {"op":"watch_ack"} to engine.ack_watch()."""
+    from butler_core import overlay as bp_overlay
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    engine.init(bp_paths.plugin_data_dir("butler"))
+    engine._watch = None
+    engine._watch_ring.clear()
+    block = {"app": "Slack", "label": "Export complete", "window": None,
+             "at": time.time(), "acknowledged": False, "id": "a1b2c3d4"}
+    path = tmp_path / "plugin-data" / "butler" / "state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"watch_hit": block}), encoding="utf-8")
+    journaled = []
+    monkeypatch.setattr(bp_overlay, "journal_click", journaled.append)
+
+    controller = bp_overlay.Overlay()
+    controller._handle_message({"op": "watch_ack"})
+
+    assert journaled == ["watch-ack:menu"]
+    assert "watch_hit" not in client.get("/state").json()
+
+
 def test_summon_pet_is_a_noop_without_a_petdex_pet(
         client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     (Path(os.environ["HERMES_HOME"]) / "pets").mkdir()

@@ -1418,7 +1418,13 @@ def test_hat_option_right_click_menu_keeps_the_look_and_watch_doors() -> None:
     assert '"Look at this…"' in menu
     assert '"Watch \\(app)…"' in menu
     assert '"What did the watch see?"' in menu
+    assert '"Acknowledge watch hit"' in menu
     assert '"Stop watching"' in menu
+    # The acknowledgement row sits ABOVE Stop watching: acknowledging a hit is
+    # not stopping the watch (round 21: a one-shot hit already stopped it).
+    assert menu.index('"Acknowledge watch hit"') < menu.index('"Stop watching"')
+    assert "unacknowledgedWatchHit()" in menu, "gated by the top-level hit block"
+    assert "acknowledgeWatchHit()" in menu
     assert "menu.popUp(positioning: nil, at: point, in: view)" in menu
     assert "hatMenuTargets = targets" in menu, "menu action boxes outlive tracking"
     # The watch doors are prefilled, not a new endpoint.
@@ -1427,6 +1433,21 @@ def test_hat_option_right_click_menu_keeps_the_look_and_watch_doors() -> None:
     assert 'openSummonField(prefill: "stop watching")' in menu
     assert "summon_text" not in menu
     assert "look_text" not in menu
+    # Acknowledgement is one stdout line, not an HTTP call or a new window.
+    ack_action = _swift_function_body(source,
+                                      "private func acknowledgeWatchHit()",
+                                      "/// The `watch` row of the shared state")
+    assert 'writeEventLine(["op": "watch_ack"])' in ack_action
+    assert 'chipJournal("watch-ack:emit")' in ack_action
+    assert "URLSession" not in ack_action
+    # Enabled only when state.json carries watch_hit.acknowledged == false.
+    acknowledged_gate = _swift_function_body(source,
+                                             "private func unacknowledgedWatchHit() -> Bool {",
+                                             "/// The shared state snapshot")
+    assert 'object["watch_hit"]' in acknowledged_gate
+    assert 'hit["acknowledged"]' in acknowledged_gate
+    assert "acknowledged is NSNull" in acknowledged_gate
+    assert "return !flag" in acknowledged_gate
     frontmost = _swift_function_body(source,
                                      "private func hatMenuFrontmostAppName()",
                                      "/// Is a watch active?")

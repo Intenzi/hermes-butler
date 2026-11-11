@@ -26,7 +26,8 @@ const INTERNALS = [
   'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey', 'dismissSummonBar',
   'startSummonPendingPolling', 'pollSummonPending',
   'petSpeechBeat', 'speakButlerAnswer', 'petStatusLine', 'watchStatusLine',
-  'watchIsActive', 'watchEndedLine', 'watchPaneText', 'WatchRow', 'stopWatch'
+  'watchIsActive', 'watchEndedLine', 'watchPaneText', 'WatchRow', 'stopWatch',
+  'watchHitLine', 'speechSnapshot'
 ]
 
 function makeDocument({
@@ -2383,6 +2384,128 @@ test('a sticky hit is pane-visible and the keep-alive never re-says it', async (
   assert.equal(said.at(-1).text, '⏲ Watch · Finder · 4 changes')
   assert.equal(env.api.petSpeechBeat({ watch: acked }, 116000), 'status')
   assert.equal(said.length, 3)
+  env.dispose()
+})
+
+test('an unacknowledged watch_hit outlives its watch and is re-said every 25 s', async () => {
+  const said = []
+  const pet = {
+    say(text, options) { said.push({ text, options }) },
+    clear() {}
+  }
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument(), pet
+  })
+  const hit = {
+    app: 'Slack', label: 'Export complete', window: 'general — Slack',
+    at: 1_800_000_010, acknowledged: false, id: 'a1b2c3d4'
+  }
+  const watch = { app: 'Slack', events: 9, stopped: null }
+  const stalled = {
+    status: 'stalled',
+    note: 'step 1 unverified for 600s; expect=expectation_unmet',
+    instruction: 'Click Settings',
+    watch,
+    watchHit: hit
+  }
+
+  assert.equal(env.api.watchHitLine(hit), '⏲ Hit · Slack: Export complete')
+  assert.equal(env.api.petStatusLine(stalled),
+    '⏲ Hit · Slack: Export complete',
+    'the hit outranks the live watch line and a stalled guide note')
+  assert.equal(env.api.petStatusLine({
+    status: 'stopped', note: 'stopped by agent', watchHit: hit
+  }), '⏲ Hit · Slack: Export complete', 'and every terminal guide line')
+  assert.equal(env.api.petStatusLine({
+    status: 'done', watchHit: hit
+  }), '⏲ Hit · Slack: Export complete')
+  // A live guide instruction still wins: the user is being walked through it.
+  assert.equal(env.api.petStatusLine({
+    status: 'running', instruction: 'Click Export', watchHit: hit, watch
+  }), 'Click Export')
+
+  assert.equal(env.api.petSpeechBeat(stalled, 1000), 'status')
+  assert.equal(said[0].text, '⏲ Hit · Slack: Export complete')
+  // The host clamps a ttl to 30 s: the 25 s re-say lands before it expires.
+  assert.equal(said[0].options.ttlMs, 30000)
+  assert.equal(said[0].options.id, 'butler-say')
+  assert.equal(env.api.petSpeechBeat(stalled, 24999), 'repeat')
+  assert.equal(said.length, 1)
+  assert.equal(env.api.petSpeechBeat(stalled, 26000), 'status')
+  assert.equal(said.length, 2)
+  assert.equal(said[1].text, said[0].text)
+
+  // Acknowledging removes it on the next beat: no "thanks", no extra speech.
+  const acked = { ...stalled, watchHit: { ...hit, acknowledged: true } }
+  assert.equal(env.api.petStatusLine(acked), '⏲ Watch · Slack · 9 changes')
+  assert.equal(env.api.petSpeechBeat(acked, 52000), 'status')
+  assert.equal(said.at(-1).text, '⏲ Watch · Slack · 9 changes')
+  // Absent behaves like round 20 too.
+  assert.equal(env.api.petStatusLine({ watch }), '⏲ Watch · Slack · 9 changes')
+  assert.equal(env.api.petStatusLine({}), null)
+  assert.equal(env.api.watchHitLine({ app: 'Slack', label: '', acknowledged: false }), null)
+  assert.equal(env.api.watchHitLine({ app: 'Slack', label: 'X', acknowledged: true }), null)
+  env.dispose()
+})
+
+test('a one-shot hit speaks the persistent hit line, not "Watch ended"', async () => {
+  const said = []
+  const calls = []
+  const pet = {
+    say(text, options) { said.push({ text, options }) },
+    clear() {}
+  }
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async (requestPath, options) => {
+      calls.push({ path: requestPath, method: options && options.method })
+      return requestPath === '/watch/stop'
+        ? { ok: true, status: 'stopped' }
+        : {}
+    },
+    document: makeDocument(),
+    pet
+  })
+  const watch = {
+    app: 'Slack', events: 3, once: true,
+    hit: { label: 'Export complete', at: 2000 },
+    stopped: { reason: 'hit', events: 3, at: 3000 }
+  }
+  const watchHit = {
+    app: 'Slack', label: 'Export complete', at: 2000,
+    acknowledged: false, id: 'a1b2c3d4'
+  }
+  const cur = { watch, watchHit }
+
+  assert.equal(env.api.petSpeechBeat(cur, 1000), 'status')
+  assert.deepEqual(said.map(row => row.text), ['⏲ Hit · Slack: Export complete'],
+    'the ended line yields to the announcement that outlives it')
+  assert.ok(calls.some(call => call.path === '/watch/stop' && call.method === 'POST'),
+    'the ended watch row is still cleared')
+
+  const posted = calls.filter(call => call.path === '/watch/stop').length
+  assert.equal(env.api.petSpeechBeat(cur, 3000), 'repeat')
+  assert.equal(calls.filter(call => call.path === '/watch/stop').length, posted,
+    'the silent clear runs once, not every beat')
+  assert.equal(env.api.petSpeechBeat(cur, 26000), 'status')
+  assert.deepEqual(said.map(row => row.text),
+    ['⏲ Hit · Slack: Export complete', '⏲ Hit · Slack: Export complete'])
+  env.dispose()
+})
+
+test('the speech snapshot carries the top-level watch_hit row', async () => {
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument()
+  })
+  const hit = { app: 'Slack', label: 'Export complete', acknowledged: false }
+
+  const snapshot = env.api.speechSnapshot({ watch_hit: hit })
+
+  assert.deepEqual(snapshot.watch_hit, hit)
+  assert.equal(env.api.speechSnapshot({}).watch_hit, null)
+  // The beat also reads the raw state spelling straight through.
+  assert.equal(env.api.petStatusLine({ watch_hit: hit }),
+    '⏲ Hit · Slack: Export complete')
   env.dispose()
 })
 

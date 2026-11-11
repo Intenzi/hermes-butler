@@ -4,7 +4,7 @@
 ``GET /history`` — finished guide rows, newest first (cap 50).
 ``POST /summon/send`` — inject a framed butler turn into a selected session.
 ``POST /watch/stop`` — stop the live watch and clear its pane row.
-``POST /watch/ack`` — clear a sticky watch hit, keeping the watch running.
+``POST /watch/ack`` — clear the hit announcement (works after the watch ends).
 ``GET /health`` — mount probe.
 """
 from __future__ import annotations
@@ -689,16 +689,16 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
 
 @router.post("/watch/ack")
 def watch_ack() -> dict[str, Any]:
-    """Acknowledge a sticky watch hit without stopping the watch.
+    """Acknowledge the hit announcement, which outlives its watch.
 
-    The "thank you" door beside the pet: ``once: false`` watches record the hit
-    and stay live, so the user (not the keep-alive) decides when it is done.
-    Delegates to the same ``engine.acknowledge_watch_hit()`` the
-    ``butler_watch_ack`` tool calls. ``acknowledged`` is true only when a live
-    hit was actually cleared; false (never a 500) when there is no hit, the
-    watch already ended, or another live plugin process owns the row — the
-    engine's ``status`` says which (``no-hit``, ``stopped``, ``idle``,
-    ``elsewhere``, ``stale``).
+    The user's acknowledgement door: a hit writes a top-level ``watch_hit``
+    block, so this works when no watch is running — the normal case after a
+    one-shot hit (the watch ended, the announcement did not). Delegates to the
+    same ``engine.acknowledge_watch_hit()`` the ``butler_watch_ack`` tool and the
+    hat menu use. In sticky mode it also clears the live row's hit.
+    ``acknowledged`` is true only when an announcement (or sticky hit) was
+    actually cleared; false (never a 500) when there is nothing to clear — the
+    engine's ``status`` says which (``no-hit``, ``stopped``, ``idle``).
     """
     try:
         acked = _engine_module().acknowledge_watch_hit()

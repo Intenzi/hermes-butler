@@ -75,6 +75,9 @@ _stop_flag = False
 _summon_pending = None    # companion chip click waiting for the desktop bar
 _claim_chip_enabled = False
 _watch = None             # the one active watch row (v1 is single-watch)
+#: Id of the top-level ``watch_hit`` THIS process published, kept so a sticky
+#: row's hit can be reconciled away when another process acknowledges it.
+_watch_hit_id = None
 _watch_ring = []          # newest WATCH_RING events, oldest first
 # Re-entrant: the stdout reader mutates the row, a status poll snapshots it,
 # and _write_state takes it again from inside those paths.
@@ -85,10 +88,13 @@ _watch_start_lock = threading.Lock()
 
 
 def init(data_dir):
-    global DATA_DIR
+    global DATA_DIR, _watch_hit_id
     if not data_dir:
         raise ValueError("butler engine: init() requires a data_dir")
     DATA_DIR = data_dir
+    # A fresh engine has published no hit announcement yet; the shared file
+    # remains the source of truth for one that another process wrote.
+    _watch_hit_id = None
     os.makedirs(os.path.join(str(data_dir), "guides"), exist_ok=True)
     # The companion is a long-lived shared transport; route its click events
     # back into the same state snapshot the desktop already polls.
@@ -305,7 +311,8 @@ def guide_block_is_stale(guide, now=None, updated_at=None):
     return (time.time() if now is None else now) - stamp > GUIDE_STALE_SECONDS
 
 
-def _write_state(clear_summon=False, clear_watch=False):
+def _write_state(clear_summon=False, clear_watch=False, watch_hit=None,
+                 clear_watch_hit=False, clear_sticky_hit=False):
     """Publish the shared snapshot. Never raises.
 
     Two processes host this engine: the agent runtime (guides) and the plugin
@@ -316,7 +323,15 @@ def _write_state(clear_summon=False, clear_watch=False):
     block merges the same way (stop_watch clears it explicitly). A terminal
     guide block older than ``GUIDE_STALE_SECONDS`` is not carried forward: the
     guide stays in history, but the live-status row stops talking.
+
+    The top-level ``watch_hit`` announcement OUTLIVES the watch row: a hit is
+    published here beside ``watch``/``say``/``summon_pending`` and is carried
+    forward like the other shared rows until an acknowledgement clears it
+    (``clear_watch_hit``). It is deliberately not held in memory, so an ack in
+    any process removes it for every other writer instead of it being
+    republished by the one that saw the hit.
     """
+    global _watch_hit_id
     if not DATA_DIR:
         return
     path = os.path.join(str(DATA_DIR), "state.json")
@@ -327,6 +342,9 @@ def _write_state(clear_summon=False, clear_watch=False):
         watch_snap = _watch_snapshot()
     if watch_snap is not None:
         snap["watch"] = watch_snap
+    explicit_hit = watch_hit is not None or clear_watch_hit
+    if watch_hit is not None:
+        snap["watch_hit"] = dict(watch_hit)
     if _session is not None:
         snap.update({
             "guide": _session,
@@ -352,7 +370,36 @@ def _write_state(clear_summon=False, clear_watch=False):
             # plugin API process published (and vice versa); only stop_watch
             # clears it, via clear_watch.
             if not clear_watch and watch_snap is None and "watch" in existing:
-                snap["watch"] = existing["watch"]
+                watch_row = existing["watch"]
+                # An ack in a process that does not own the row can still clear
+                # a sticky hit left by a dead owner; a live foreign owner is
+                # left alone (its own write reconciles it).
+                if clear_sticky_hit and isinstance(watch_row, dict) \
+                        and "hit" in watch_row:
+                    watch_row = dict(watch_row)
+                    watch_row["hit"] = None
+                snap["watch"] = watch_row
+            # A sticky hit acknowledged by ANOTHER process leaves the top-level
+            # block gone (or acknowledged) while this process still holds
+            # row.hit in memory. Reconcile on the next write: return the row to
+            # the change count and re-arm the duplicate guard for the next hit.
+            if not explicit_hit and watch_snap is not None \
+                    and _watch_hit_id is not None:
+                existing_hit = existing.get("watch_hit")
+                acked_elsewhere = not isinstance(existing_hit, dict) \
+                    or existing_hit.get("acknowledged") is True
+                with _watch_lock:
+                    if acked_elsewhere and _watch is not None \
+                            and _watch.get("once") is False \
+                            and _watch.get("hit") is not None \
+                            and not _watch.get("stopped"):
+                        _watch["hit"] = None
+                        _watch_hit_id = None
+                        watch_snap = _watch_snapshot()
+                        snap["watch"] = watch_snap
+            # Preserve the outliving hit row unless THIS write sets or clears it.
+            if not explicit_hit and "watch_hit" in existing:
+                snap["watch_hit"] = existing["watch_hit"]
     except Exception:
         pass
     tmp = path + ".tmp"
@@ -380,6 +427,12 @@ def _on_overlay_event(event):
     if not isinstance(event, dict):
         return
     op = event.get("op")
+    if op == "watch_ack":
+        # The hat's acknowledgement button rides the same callback as a click.
+        # overlay.py normally routes it straight to ack_watch(); accepting it
+        # here too keeps an older transport honest.
+        ack_watch()
+        return
     if op in ("watch-event", "watch-hit", "watch-stopped"):
         # Ambient watch lines are not summons: they feed the ring/state and the
         # condition announcement, never the summon row.
@@ -536,17 +589,28 @@ def _pid_alive(pid):
     return True
 
 
-def _read_state_watch_row():
-    """The watch row another process published in state.json, or None."""
+def _read_state_dict():
+    """The shared state snapshot, or {} when it does not exist/is unreadable."""
     if not DATA_DIR:
-        return None
+        return {}
     try:
         with open(os.path.join(str(DATA_DIR), "state.json"),
                   encoding="utf-8") as f:
             state = json.load(f)
     except Exception:
-        return None
-    row = state.get("watch") if isinstance(state, dict) else None
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _read_state_watch_row():
+    """The watch row another process published in state.json, or None."""
+    row = _read_state_dict().get("watch")
+    return row if isinstance(row, dict) else None
+
+
+def _read_state_watch_hit():
+    """The outliving hit announcement in state.json, or None."""
+    row = _read_state_dict().get("watch_hit")
     return row if isinstance(row, dict) else None
 
 
@@ -631,6 +695,7 @@ def _handle_watch_message(event):
 
     Called from the companion's stdout reader thread. Never raises.
     """
+    global _watch_hit_id
     op = event.get("op")
     stop_row = None
     with _watch_lock:
@@ -668,6 +733,7 @@ def _handle_watch_message(event):
                 # One announcement per arm, even if a duplicate line arrives.
                 return
             label = event.get("label") or event.get("until") or ""
+            app = _watch.get("app") or event.get("app") or ""
             # Rows this engine starts always carry the flag. A hand-built or
             # legacy row without it takes the product default: one-shot.
             once = _watch.get("once") is not False
@@ -681,10 +747,25 @@ def _handle_watch_message(event):
                 # stays unacknowledged until the user (or the pane) says so.
                 hit["acknowledged"] = False
             _watch["hit"] = hit
+            # The ANNOUNCEMENT is a top-level row of its own: a one-shot hit
+            # ends the watch row, and the pet must keep saying the hit until
+            # the user acknowledges it (the row is the thing that outlives the
+            # watch). Published in the same write as the terminal row below, so
+            # /state never sees one without the other.
+            watch_hit = {
+                "app": app,
+                "label": label,
+                "window": hit.get("window"),
+                "at": hit.get("at"),
+                "acknowledged": False,
+                "id": uuid.uuid4().hex[:8],
+            }
+            # Remember that THIS process published the top-level block, so a
+            # later write can tell "acked elsewhere" from "never announced".
+            _watch_hit_id = watch_hit["id"]
             # In place, with no model call and without waking the agent: the
             # pet says it now, the agent reads watch_status on its next turn.
-            say("%s: %s appeared" % (_watch.get("app") or event.get("app") or "",
-                                     label))
+            say("%s: %s appeared" % (app, label))
             if once:
                 # A hit ends a one-shot watch: the request was "tell me when X
                 # appears", and X appeared. The terminal row is published below
@@ -698,7 +779,7 @@ def _handle_watch_message(event):
                     "token": _watch.get("token"),
                 }
                 stop_row = _watch
-            _write_state()
+            _write_state(watch_hit=watch_hit)
         elif op == "watch-stopped":
             if _watch.get("stopped") is not None:
                 # A watch ends ONCE. The terminal reason wins: in particular the
@@ -925,50 +1006,82 @@ def _send_watch_stop():
 
 
 def acknowledge_watch_hit():
-    """Clear a sticky watch hit; the watch keeps observing (never raises).
+    """Acknowledge the hit announcement that outlives the watch (never raises).
 
-    A sticky (``once: false``) watch records the hit and stays live so the user
-    decides when it is done. This is that "done": drop the hit and the row goes
-    back to the ordinary change count. A one-shot watch is already stopped, so
-    there is nothing to acknowledge. ``acknowledged`` is False — never an error
-    — when there is no hit, the watch already ended, or another live process
-    owns the row.
+    A hit writes a top-level ``watch_hit`` row, so the announcement survives the
+    watch that produced it — in particular a one-shot watch has already stopped
+    when the user sees it. This is the user's acknowledgement: mark the block
+    ``acknowledged: true`` and then remove it. In sticky mode it also drops the
+    live row's ``hit`` so the row returns to the ordinary change count. Works
+    with no watch running (the normal case after a one-shot hit); a second ack
+    is an honest false, never an error. Only an ack removes the announcement:
+    stopping the watch (``stop_watch``/the pane's Stop) leaves it in place.
     """
     with _watch_lock:
+        global _watch_hit_id
         row = _watch
         external = False
         if row is None:
             row = _read_state_watch_row()
+            external = row is not None
+        top_hit = _read_state_watch_hit()
+        row_hit = row.get("hit") if isinstance(row, dict) else None
+        row_hit = row_hit if isinstance(row_hit, dict) else None
+        stopped = bool(row and row.get("stopped"))
+        sticky = bool(row and row.get("once") is False and not stopped)
+        app = (top_hit or {}).get("app") or (row or {}).get("app")
+        try:
+            events = int((row or {}).get("events") or 0)
+        except (TypeError, ValueError, AttributeError):
+            events = 0
+
+        if top_hit is None and sticky and row_hit is not None and external \
+                and _foreign_owner_alive(row.get("owner_pid")):
+            # Legacy sticky hit with no top-level block, owned by another LIVE
+            # process: this process cannot clear it. Be honest (and a second
+            # ack stays a no-op) instead of reporting an acknowledgement that
+            # did not happen.
+            return {"status": "elsewhere", "acknowledged": False,
+                    "app": app, "owner_pid": row.get("owner_pid"),
+                    "note": "another butler process owns this watch; "
+                            "acknowledge it from that process"}
+
+        if top_hit is None and not (sticky and row_hit is not None):
             if row is None:
                 return {"status": "idle", "acknowledged": False}
-            external = True
-        app = row.get("app")
-        if row.get("stopped"):
-            return {"status": "stopped", "acknowledged": False, "app": app}
-        hit = row.get("hit")
-        if not isinstance(hit, dict):
-            return {"status": "no-hit", "acknowledged": False, "app": app}
-        if external:
-            owner = row.get("owner_pid")
-            if _foreign_owner_alive(owner):
-                return {"status": "elsewhere", "acknowledged": False,
-                        "app": app, "owner_pid": owner,
-                        "note": "another butler process owns this watch; "
-                                "acknowledge it from that process"}
-            return {"status": "stale", "acknowledged": False, "app": app,
-                    "note": ("this process does not hold a live watch row; "
-                             "butler_watch_stop clears it")
-                    if owner == os.getpid() else
-                    ("the process that owned this watch exited; "
-                     "butler_watch_stop clears it")}
-        row["hit"] = None
-        try:
-            events = int(row.get("events") or 0)
-        except (TypeError, ValueError):
-            events = 0
-        _write_state()
+            return {"status": "stopped" if stopped else "no-hit",
+                    "acknowledged": False, "app": app, "events": events}
+
+        # 1. Say it was seen BEFORE removing it: a poll between the two writes
+        #    can only ever see an acknowledged hit, never look unacked.
+        if top_hit is not None:
+            acked = dict(top_hit)
+            acked["acknowledged"] = True
+            _write_state(watch_hit=acked)
+
+        # 2. Sticky only: the live row's own hit goes back to the change count.
+        #    A row owned by another LIVE process is left to that process, whose
+        #    next write reconciles it against the now-gone top-level block; a
+        #    dead owner's row is cleared here.
+        clear_foreign_hit = False
+        if sticky and row_hit is not None:
+            if external:
+                clear_foreign_hit = not _foreign_owner_alive(
+                    row.get("owner_pid"))
+            else:
+                row["hit"] = None
+        _watch_hit_id = None
+
+        # 3. Remove the announcement block (never clobbering the watch row).
+        _write_state(clear_watch_hit=True,
+                     clear_sticky_hit=clear_foreign_hit)
         return {"status": "acknowledged", "acknowledged": True,
                 "app": app, "events": events}
+
+
+def ack_watch():
+    """The hat menu's acknowledgement door: same work as ``butler_watch_ack``."""
+    return acknowledge_watch_hit()
 
 
 def stop_watch():
