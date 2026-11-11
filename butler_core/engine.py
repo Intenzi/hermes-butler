@@ -632,6 +632,7 @@ def _handle_watch_message(event):
     Called from the companion's stdout reader thread. Never raises.
     """
     op = event.get("op")
+    stop_row = None
     with _watch_lock:
         if _watch is None:
             # A stale line from a companion the agent already stopped: drop it
@@ -667,18 +668,44 @@ def _handle_watch_message(event):
                 # One announcement per arm, even if a duplicate line arrives.
                 return
             label = event.get("label") or event.get("until") or ""
-            _watch["hit"] = {
+            # Rows this engine starts always carry the flag. A hand-built or
+            # legacy row without it takes the product default: one-shot.
+            once = _watch.get("once") is not False
+            hit = {
                 "label": label,
                 "window": event.get("window"),
                 "at": event.get("at") or time.time(),
             }
+            if not once:
+                # Sticky mode keeps observing after the announcement; the hit
+                # stays unacknowledged until the user (or the pane) says so.
+                hit["acknowledged"] = False
+            _watch["hit"] = hit
             # In place, with no model call and without waking the agent: the
             # pet says it now, the agent reads watch_status on its next turn.
             say("%s: %s appeared" % (_watch.get("app") or event.get("app") or "",
                                      label))
+            if once:
+                # A hit ends a one-shot watch: the request was "tell me when X
+                # appears", and X appeared. The terminal row is published below
+                # BEFORE the companion is told, so a /state poll can never see
+                # `hit` without its ending; later lines are inert (the stopped
+                # guard above).
+                _watch["stopped"] = {
+                    "reason": "hit",
+                    "events": int(_watch.get("events") or 0),
+                    "at": time.time(),
+                    "token": _watch.get("token"),
+                }
+                stop_row = _watch
             _write_state()
-            return
-        if op == "watch-stopped":
+        elif op == "watch-stopped":
+            if _watch.get("stopped") is not None:
+                # A watch ends ONCE. The terminal reason wins: in particular the
+                # companion's reply to OUR one-shot watch_stop must not rewrite
+                # "hit" as "stopped" (that would make the desktop say a second
+                # ending line).
+                return
             _watch["stopped"] = {
                 "reason": event.get("reason") or "stopped",
                 "events": event.get("events") or _watch.get("events"),
@@ -686,6 +713,16 @@ def _handle_watch_message(event):
                 "token": event.get("token"),
             }
             _write_state()
+    if stop_row is not None:
+        # Detach the observers OUTSIDE ``_watch_lock``: a request-style
+        # transport can block for its whole timeout, and a synchronous test
+        # double would otherwise re-enter this handler while we hold the lock.
+        # Only send while this row is still the one we ended: a stop/start that
+        # landed in between already owns the companion.
+        with _watch_lock:
+            still_ours = _watch is stop_row and stop_row.get("stopped") is not None
+        if still_ours:
+            _send_watch_stop()
 
 
 def _watch_start_failure(app, code):
@@ -700,7 +737,7 @@ def _watch_start_failure(app, code):
     return {"error": code or "watch_start failed", "app": app}
 
 
-def start_watch(app, until=None):
+def start_watch(app, until=None, once=True):
     """Observe one running app's Accessibility tree; never clicks or types.
 
     Wholly passive: the companion attaches AX observers and streams change
@@ -709,12 +746,17 @@ def start_watch(app, until=None):
     starting a second replaces the first. Never raises — a missing app or a
     missing grant comes back as an error string. Every start carries a token
     echoed by the companion, so a late line from a replaced watch is dropped.
+
+    ``once`` (default True) makes a condition hit END the watch: one
+    announcement, a terminal ``stopped.reason == "hit"`` row, and no re-arm
+    until the agent starts a new watch. ``once=False`` keeps observing after the
+    hit until ``acknowledge_watch_hit`` (or a stop) clears it.
     """
     with _watch_start_lock:
-        return _start_watch_locked(app, until)
+        return _start_watch_locked(app, until, once)
 
 
-def _start_watch_locked(app, until):
+def _start_watch_locked(app, until, once=True):
     global _watch
     try:
         name = str(app or "").strip()
@@ -723,6 +765,13 @@ def _start_watch_locked(app, until):
         needle = until.strip() if isinstance(until, str) else None
         if not needle:
             needle = None
+        # Be liberal with the flag a model may spell as a string; the schema
+        # says boolean. One-shot is the default, so only an explicit false
+        # spelling opts into sticky mode (an empty/unknown string must not).
+        if isinstance(once, str):
+            once = once.strip().lower() not in ("false", "no", "off", "0")
+        else:
+            once = True if once is None else bool(once)
         try:
             ok, detail = _OVERLAY.start(show_pet=False)
         except Exception as exc:  # noqa: BLE001 - transport must not raise
@@ -744,6 +793,7 @@ def _start_watch_locked(app, until):
             provisional = {
                 "app": name,
                 "until": needle,
+                "once": once,
                 "token": token,
                 "owner_pid": os.getpid(),
                 "started_at": time.time(),
@@ -798,7 +848,7 @@ def _start_watch_locked(app, until):
                     started_at = _watch["started_at"]
                     _write_state()
                     return {"ok": True, "app": name, "until": needle,
-                            "started_at": started_at,
+                            "once": once, "started_at": started_at,
                             "status": watch_status()}
                 # A stop line written BEFORE this watch was installed (an old
                 # watch quitting, a concurrent stop) must not mark the new row
@@ -807,7 +857,7 @@ def _start_watch_locked(app, until):
                 return {"error": "watch start was superseded by a stop", "app": name}
             started_at = _watch["started_at"]
             _write_state()
-        return {"ok": True, "app": name, "until": needle,
+        return {"ok": True, "app": name, "until": needle, "once": once,
                 "started_at": started_at, "status": watch_status()}
     except Exception as exc:  # noqa: BLE001 - a handler must always answer
         return {"error": str(exc)}
@@ -855,6 +905,72 @@ def watch_status():
     return "\n".join(lines)
 
 
+def _send_watch_stop():
+    """Ask the live companion to detach its observers, fire-and-forget.
+
+    The companion answers a stop with an unsolicited ``watch-stopped`` line
+    (routed to the event callback), so ``request()`` here would always burn its
+    whole timeout. Only ask a live companion: request() would otherwise spawn one
+    just to stop a watch nobody is running. Never raises.
+    """
+    try:
+        if _OVERLAY.is_running():
+            send = getattr(_OVERLAY, "send", None)
+            if callable(send):
+                send({"op": "watch_stop"})
+            else:  # test doubles that only speak the request dialect
+                _OVERLAY.request({"op": "watch_stop"}, timeout=WATCH_REQUEST_TIMEOUT)
+    except Exception:  # noqa: BLE001 - a dead pipe must not keep a stale row
+        pass
+
+
+def acknowledge_watch_hit():
+    """Clear a sticky watch hit; the watch keeps observing (never raises).
+
+    A sticky (``once: false``) watch records the hit and stays live so the user
+    decides when it is done. This is that "done": drop the hit and the row goes
+    back to the ordinary change count. A one-shot watch is already stopped, so
+    there is nothing to acknowledge. ``acknowledged`` is False — never an error
+    — when there is no hit, the watch already ended, or another live process
+    owns the row.
+    """
+    with _watch_lock:
+        row = _watch
+        external = False
+        if row is None:
+            row = _read_state_watch_row()
+            if row is None:
+                return {"status": "idle", "acknowledged": False}
+            external = True
+        app = row.get("app")
+        if row.get("stopped"):
+            return {"status": "stopped", "acknowledged": False, "app": app}
+        hit = row.get("hit")
+        if not isinstance(hit, dict):
+            return {"status": "no-hit", "acknowledged": False, "app": app}
+        if external:
+            owner = row.get("owner_pid")
+            if _foreign_owner_alive(owner):
+                return {"status": "elsewhere", "acknowledged": False,
+                        "app": app, "owner_pid": owner,
+                        "note": "another butler process owns this watch; "
+                                "acknowledge it from that process"}
+            return {"status": "stale", "acknowledged": False, "app": app,
+                    "note": ("this process does not hold a live watch row; "
+                             "butler_watch_stop clears it")
+                    if owner == os.getpid() else
+                    ("the process that owned this watch exited; "
+                     "butler_watch_stop clears it")}
+        row["hit"] = None
+        try:
+            events = int(row.get("events") or 0)
+        except (TypeError, ValueError):
+            events = 0
+        _write_state()
+        return {"status": "acknowledged", "acknowledged": True,
+                "app": app, "events": events}
+
+
 def stop_watch():
     """Stop the companion's watch and clear its state row.
 
@@ -889,15 +1005,7 @@ def stop_watch():
     # `watch-stopped` line (routed to the event callback), so request() here
     # would always burn its whole timeout. Only ask a live companion: request()
     # would otherwise spawn one just to stop a watch nobody is running.
-    try:
-        if _OVERLAY.is_running():
-            send = getattr(_OVERLAY, "send", None)
-            if callable(send):
-                send({"op": "watch_stop"})
-            else:  # test doubles that only speak the request dialect
-                _OVERLAY.request({"op": "watch_stop"}, timeout=WATCH_REQUEST_TIMEOUT)
-    except Exception:  # noqa: BLE001 - a dead pipe must not keep a stale row
-        pass
+    _send_watch_stop()
     with _watch_lock:
         _clear_watch_state()
     return {"status": "stopped", "app": app, "events": events}

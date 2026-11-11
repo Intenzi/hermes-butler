@@ -2042,7 +2042,10 @@ function watchStatusLine(watch) {
   if (!row || stopped) return null
   const hit = row.hit && typeof row.hit === 'object' ? row.hit : null
   const hitLabel = asText(hit && hit.label)
-  if (hitLabel) return `⏲ Watch · hit: ${hitLabel}`
+  // A hit is a live fact only until acknowledged: sticky mode keeps observing
+  // after the announcement, and the ack (the "thank you") returns the line to
+  // the ordinary change count.
+  if (hitLabel && hit.acknowledged !== true) return `⏲ Watch · hit: ${hitLabel}`
   const app = asText(row.app)
   if (!app) return null
   const changes = asNumber(row.events)
@@ -2077,9 +2080,17 @@ function watchElapsedLabel(watch, now = Date.now()) {
   return `${mm}:${ss}`
 }
 
-/** The pane's watch row text: app, change count, elapsed time. */
+/** The pane's watch row text: the hit while unacknowledged, else app/count/time. */
 function watchPaneText(watch, now = Date.now()) {
   const app = asText(watch && watch.app) || '?'
+  const hit = watch && watch.hit && typeof watch.hit === 'object' ? watch.hit : null
+  const hitLabel = asText(hit && hit.label)
+  // A sticky hit stays on screen until the user acknowledges it; Stop remains
+  // beside it, and `/watch/ack` (the hat menu's acknowledge door) returns the
+  // row to the ordinary change count.
+  if (hitLabel && hit.acknowledged !== true) {
+    return `⏲ Watching ${app} · hit: ${hitLabel}`
+  }
   const changes = asNumber(watch && watch.events)
   return `⏲ Watching ${app} · ${changes} changes · ${watchElapsedLabel(watch, now)}`
 }
@@ -2274,15 +2285,24 @@ function petSpeechBeat(cur, now = Date.now()) {
   // carried by the ring and the pane). Compare the WINNING line to the watch
   // line instead of testing the instruction: a dead guide may still carry a
   // stale step while the watch line is the one the pet is speaking.
-  const watchLine = watchIsActive(cur && cur.watch) ? watchStatusLine(cur.watch) : null
-  const watching = watchLine && line === watchLine ? line : null
+  const liveWatch = watchIsActive(cur && cur.watch) ? cur.watch : null
+  const watchLine = liveWatch ? watchStatusLine(liveWatch) : null
+  const hit = liveWatch && liveWatch.hit && typeof liveWatch.hit === 'object'
+    ? liveWatch.hit
+    : null
+  const hitPending = Boolean(asText(hit && hit.label)) && hit.acknowledged !== true
+  // A hit is announced ONCE, not every 25 s: only the live "watching" count is
+  // kept alive. A hit line still dedupes normally, so the beat never repeats it
+  // on its own; the pane row carries the hit label until the user acknowledges.
+  const watching = watchLine && line === watchLine && !hitPending ? line : null
   if (lastSaid === line) {
     const due = watching && line === watching && now - lastSaidAt >= WATCH_KEEPALIVE_MS
     if (!due) return 'repeat'
   }
   // The host clamps a ttl to 30 s: the watch line asks for the clamp so the
-  // 25 s re-say lands before the previous line expires.
-  const ttlMs = watching && line === watching ? WATCH_TTL_MS : 9000
+  // 25 s re-say lands before the previous line expires. A hit has no keep-alive,
+  // but still asks for a readable ttl for its one announcement.
+  const ttlMs = watchLine && line === watchLine ? WATCH_TTL_MS : 9000
   try {
     petCtx && typeof petCtx.say === 'function'
       && petCtx.say(line, { tone: 'info', ttlMs, id: 'butler-say' })

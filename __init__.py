@@ -2,7 +2,7 @@
 
 Tools: butler_guide_start, butler_guide_status, butler_capture, butler_look,
 butler_say, butler_stop, butler_watch_start, butler_watch_status,
-butler_watch_stop.
+butler_watch_stop, butler_watch_ack.
 Slash command: /butler <request> — inject the request into this chat as a real
 agent turn that plans and starts a guide.
 CLI: hermes butler capture|status|doctor.
@@ -128,6 +128,15 @@ WATCH_START_SCHEMA = {
             "type": "string",
             "description": "Optional condition: announce once when a label, title or value contains this text (case-insensitive).",
         },
+        "once": {
+            "type": "boolean",
+            "default": True,
+            "description": (
+                "Default true: the first condition match announces once and "
+                "ends the watch (re-arm to be told again). false keeps watching "
+                "after the announcement until butler_watch_ack or a stop."
+            ),
+        },
     },
     "required": ["app"],
 }
@@ -135,6 +144,8 @@ WATCH_START_SCHEMA = {
 WATCH_STATUS_SCHEMA = {"type": "object", "properties": {}}
 
 WATCH_STOP_SCHEMA = {"type": "object", "properties": {}}
+
+WATCH_ACK_SCHEMA = {"type": "object", "properties": {}}
 
 BUTLER_SLASH_NAME = "butler"
 BUTLER_SLASH_ARGS_HINT = "<request>"
@@ -220,13 +231,16 @@ def tool_watch_start(args, **kwargs):
 
     Reads the app's AX notifications over time and keeps a bounded, human
     readable tail (butler_watch_status) plus an optional one-shot condition
-    (``until``) announced by the pet. Unattended-safe: it never clicks, types,
-    or brings an app forward, and it needs no new TCC grant (the existing
-    companion is the single Accessibility subject). One watch at a time.
+    (``until``) announced by the pet. A hit ends the watch by default (``once``
+    true); pass ``once: false`` to keep observing until ``butler_watch_ack`` or
+    a stop. Unattended-safe: it never clicks, types, or brings an app forward,
+    and it needs no new TCC grant (the existing companion is the single
+    Accessibility subject). One watch at a time.
     """
     try:
         return _out(bp_engine.start_watch(args.get("app") or "",
-                                          args.get("until") or None))
+                                          args.get("until") or None,
+                                          once=args.get("once", True)))
     except Exception as exc:  # noqa: BLE001 - handlers must never raise
         logger.exception("butler_watch_start failed")
         return _out({"error": str(exc)})
@@ -255,6 +269,20 @@ def tool_watch_stop(args, **kwargs):
         return _out(bp_engine.stop_watch())
     except Exception as exc:  # noqa: BLE001
         logger.exception("butler_watch_stop failed")
+        return _out({"error": str(exc)})
+
+
+def tool_watch_ack(args, **kwargs):
+    """Acknowledge a sticky watch hit; the watch keeps observing.
+
+    Clears the hit so the pet/pane line returns to the change count. Returns
+    ``acknowledged: false`` (never an error) when there is no hit or the watch
+    already ended. Unattended-safe: nothing on screen changes.
+    """
+    try:
+        return _out(bp_engine.acknowledge_watch_hit())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("butler_watch_ack failed")
         return _out({"error": str(exc)})
 
 
@@ -374,6 +402,8 @@ def register(ctx):
                       handler=tool_watch_status, description="Read the active watch: how many changes, whether the condition hit, and the last 10 events.", emoji="⏲")
     ctx.register_tool(name="butler_watch_stop", toolset="butler", schema=WATCH_STOP_SCHEMA,
                       handler=tool_watch_stop, description="Stop the active watch and clear its state row.", emoji="⏲")
+    ctx.register_tool(name="butler_watch_ack", toolset="butler", schema=WATCH_ACK_SCHEMA,
+                      handler=tool_watch_ack, description="Acknowledge a sticky watch hit: clear it and keep watching.", emoji="⏲")
     ctx.register_command(
         BUTLER_SLASH_NAME,
         handler=lambda raw, _ctx=ctx: _handle_butler_slash(_ctx, raw),

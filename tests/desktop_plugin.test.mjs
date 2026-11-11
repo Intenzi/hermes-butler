@@ -2341,3 +2341,85 @@ test('a live watch is re-said every 25 s on the existing speech beat', async () 
   assert.equal(said.length, 3)
   env.dispose()
 })
+
+test('a sticky hit is pane-visible and the keep-alive never re-says it', async () => {
+  const said = []
+  const pet = {
+    say(text, options) { said.push({ text, options }) },
+    clear() {}
+  }
+  const env = await loadPlugin({
+    host: defaultHost(), rest: async () => ({}), document: makeDocument(), pet
+  })
+  const listed = 1_800_000_010
+  const watch = {
+    app: 'Finder', events: 4, once: false, started_at: 1_800_000_000,
+    hit: { label: 'Export complete', window: 'Desktop', at: listed, acknowledged: false }
+  }
+  const cur = { watch }
+
+  // The pane row names the hit until the user acknowledges it.
+  assert.equal(env.api.watchPaneText(watch, (1_800_000_000 + 5) * 1000),
+    '⏲ Watching Finder · hit: Export complete')
+  const row = env.api.WatchRow({ watch })
+  assert.match(JSON.stringify(row), /hit: Export complete/)
+  assert.ok(buttonByText(row, 'Stop'), 'Stop stays beside the hit')
+
+  assert.equal(env.api.petSpeechBeat(cur, 1000), 'status')
+  assert.equal(said[0].text, '⏲ Watch · hit: Export complete')
+  // The hit asks for a readable ttl, but it has no keep-alive: the same line
+  // must NOT be re-said 25 s (or 60 s) later.
+  assert.equal(said[0].options.ttlMs, 30000)
+  assert.equal(env.api.petSpeechBeat(cur, 26000), 'repeat')
+  assert.equal(env.api.petSpeechBeat(cur, 60000), 'repeat')
+  assert.equal(said.length, 1, 'a hit is announced once, not every 25 s')
+
+  // Acknowledged: the row returns to the change count, and the live count gets
+  // its normal keep-alive back.
+  const acked = { ...watch, hit: null }
+  assert.equal(env.api.watchPaneText(acked, (1_800_000_000 + 90) * 1000),
+    '⏲ Watching Finder · 4 changes · 01:30')
+  assert.equal(env.api.petSpeechBeat({ watch: acked }, 90000), 'status')
+  assert.equal(said.at(-1).text, '⏲ Watch · Finder · 4 changes')
+  assert.equal(env.api.petSpeechBeat({ watch: acked }, 116000), 'status')
+  assert.equal(said.length, 3)
+  env.dispose()
+})
+
+test('a one-shot hit says "Watch ended" once, then the row clears', async () => {
+  const said = []
+  const calls = []
+  const pet = {
+    say(text, options) { said.push({ text, options }) },
+    clear() {}
+  }
+  const env = await loadPlugin({
+    host: defaultHost(),
+    rest: async (requestPath, options) => {
+      calls.push({ path: requestPath, method: options && options.method })
+      return requestPath === '/watch/stop'
+        ? { ok: true, status: 'stopped' }
+        : {}
+    },
+    document: makeDocument(),
+    pet
+  })
+  const watch = {
+    app: 'Finder', events: 3, once: true,
+    hit: { label: 'Export complete', at: 2000 },
+    stopped: { reason: 'hit', events: 3, at: 3000 }
+  }
+
+  assert.equal(env.api.watchEndedLine(watch), 'Watch ended — hit')
+  assert.equal(env.api.petSpeechBeat({ watch }, 1000), 'watch-ended')
+  assert.deepEqual(said.map(row => row.text), ['Watch ended — hit'])
+  assert.equal(said[0].options.id, 'butler-watch-ended')
+  assert.ok(calls.some(call => call.path === '/watch/stop' && call.method === 'POST'),
+    'the hit row is cleared through the same endpoint the Stop button uses')
+
+  // The terminal row is not re-announced, and it is not a live pane row.
+  assert.equal(env.api.petSpeechBeat({ watch }, 3000), 'idle')
+  assert.equal(said.length, 1)
+  assert.equal(env.api.WatchRow({ watch }), null)
+  env.dispose()
+})
