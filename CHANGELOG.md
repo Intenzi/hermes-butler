@@ -1,3 +1,10 @@
+## 0.4.1
+
+- README rewritten for readers instead of contributors: 315 lines to 125.
+- WATCH: arm-time surface baseline, matched-surface hits and AXValue capture, so
+  a watched value only fires on the appended change rather than any string that
+  happens to contain the text.
+
 ## 0.4.0
 
 - WATCH can scan content: `scan: {author, roles}` waits for a NEW message from a
