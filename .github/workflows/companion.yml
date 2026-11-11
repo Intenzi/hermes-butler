@@ -40,7 +40,7 @@ jobs:
           fi
 
       - name: Build universal companion
-        run: bash scripts/build-companion.sh
+        run: bash scripts/build-companion.sh --universal --force
 
       - name: Package release asset
         run: cp butler_core/services/ButlerOverlay ButlerOverlay-universal

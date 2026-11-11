@@ -511,3 +511,21 @@ def test_the_attested_asset_is_documented_as_universal():
     assert "universal arm64+x86_64" in readme
     assert "attest-build-provenance" in readme
     assert "BUTLER_NO_DOWNLOAD=1" in readme
+
+
+def test_build_script_keeps_the_dev_loop_fast():
+    """The universal build is ~90 s because x86_64 codegen on an arm64 host is
+    slow; a dev loop must not pay it. The script defaults to native, can skip a
+    no-op rebuild, and keeps a per-arch module cache so compiles stay warm."""
+    script = (ROOT / "scripts" / "build-companion.sh").read_text(encoding="utf-8")
+
+    assert 'MODE="native"' in script, "native is the default"
+    assert "--universal" in script and "--native" in script and "--force" in script
+    assert "up to date for" in script, "a matching sidecar must short-circuit"
+    assert "CACHE_ROOT" in script and "module-cache-$arch" in script, \
+        "per-arch persistent module caches (a cold cache is 6x slower)"
+    assert "Library/Caches/butler/companion" in script
+
+    workflow = (ROOT / ".github" / "workflows" / "companion.yml").read_text(encoding="utf-8")
+    assert "build-companion.sh --universal --force" in workflow, \
+        "CI is the only caller that must produce a universal binary"
