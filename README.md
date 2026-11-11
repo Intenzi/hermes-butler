@@ -117,6 +117,7 @@ from the hat menu (**Acknowledge watch hit**). The `/butler` pane shows
 - [skills/](skills) — `butler:follow` (when to offer a guide), `butler:usage`
   (when to suggest one at all), `butler:conventions` (contributor rules).
 - Tests: `pytest` and `npm test`.
+- Screenshots live in `docs/img`.
 
 ## License
 
