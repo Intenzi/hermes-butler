@@ -290,6 +290,6 @@ def test_doctor_forgets_a_cached_download_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(overlay, "_download_failure_stamp_path", lambda: str(stamp))
     monkeypatch.setattr(overlay, "build_if_needed", lambda: (True, "present"))
 
-    doctor.doctor()
+    doctor.report()
 
     assert not stamp.exists(), "doctor must retry instead of trusting the cache"
