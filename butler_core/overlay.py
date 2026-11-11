@@ -77,6 +77,21 @@ def buildinfo_path():
     return os.path.join(os.path.dirname(__file__), "services", ".buildinfo")
 
 
+def plugin_root():
+    """The plugin directory: the parent of ``butler_core``."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def is_working_checkout():
+    """True when the plugin directory is a git working checkout.
+
+    A released install ships no ``.git``; a developer checkout always has one.
+    A linked worktree's ``.git`` is a FILE, so existence is the test, not
+    ``isdir``.
+    """
+    return os.path.exists(os.path.join(plugin_root(), ".git"))
+
+
 def source_sha256(path=None):
     """Content hash of the Swift source, used instead of its mtime."""
     target = path or binary_source_path()
@@ -121,6 +136,7 @@ def _write_buildinfo_best_effort(src, exe):
     """
     try:
         info = {
+            "source": "compiled",
             "source_sha256": source_sha256(src),
             "archs": _current_archs(exe),
             "built_at": int(time.time()),
@@ -309,16 +325,23 @@ def _release_buildinfo(url):
 
 
 def _write_download_buildinfo(url, exe):
-    """Record what the download installed; a cache hint, never a requirement."""
+    """Record that the verified RELEASE asset is what is installed.
+
+    No ``source_sha256`` is claimed: the asset was compiled from the release's
+    source, not necessarily the bundled checkout's, so a hash would make a
+    later resolve mistake it for a locally compiled helper and hide local
+    edits (round 17). ``source: "download"`` is what lets a working checkout
+    treat the row as stale; a released install (no ``.git``) trusts the asset
+    exactly as before.
+    """
     info = _release_buildinfo(url)
     if info is None:
         info = {"archs": _current_archs(exe), "built_at": int(time.time())}
-        try:
-            info["source_sha256"] = source_sha256(binary_source_path())
-        except OSError:
-            # Source is not shipped in an installed plugin; the sidecar then
-            # has no hash and the next run trusts the verified binary.
-            pass
+    else:
+        info = dict(info)
+    info.pop("source_sha256", None)
+    info["source"] = "download"
+    info["version"] = plugin_version()
     try:
         with open(buildinfo_path(), "w", encoding="utf-8") as handle:
             json.dump(info, handle, sort_keys=False)
@@ -394,10 +417,13 @@ def ensure_binary():
     one before it could not produce a usable helper:
 
     1. ``present`` - a binary whose ``.buildinfo`` hash matches the bundled
-       source (or that has no hash to compare) is used as-is.
+       source (or that has no hash to compare) is used as-is. A row recording
+       ``source: "download"`` is NOT trusted in a working checkout (``.git`` in
+       the plugin root): that asset may predate a local edit, so it compiles.
     2. ``downloaded`` - fetch the attested release asset, verify it against the
        release's own SHA-256, and install it atomically. Skipped when
-       ``BUTLER_NO_DOWNLOAD`` is set or no ``.companion_url`` is shipped.
+       ``BUTLER_NO_DOWNLOAD`` is set, no ``.companion_url`` is shipped, or a
+       working checkout is rebuilding stale local source.
     3. ``compiled`` - compile the bundled Swift source with ``swiftc``.
     4. ``(False, ...)`` - ``download_failed`` when a compile was attempted and
        failed too, ``swiftc_not_found`` when the source is there but no
@@ -412,27 +438,45 @@ def ensure_binary():
     exe = binary_path()
     src = binary_source_path()
     exe_ready = os.path.exists(exe) and os.access(exe, os.X_OK)
+    # A downloaded asset must never mask a local edit in a working checkout:
+    # it was built from the RELEASE's source, not this tree's. Once the binary
+    # on disk is stale for ANY reason in a checkout, compile the checkout's
+    # source instead of trying the release download first. A released install
+    # (no .git) keeps download-first exactly as before, and so does a fresh
+    # checkout with no binary to compare (nothing local is being masked).
+    checkout = is_working_checkout() if exe_ready else False
+    compile_in_checkout = False
 
     if exe_ready:
         info = _read_buildinfo()
-        if info is None or not info.get("source_sha256"):
+        if info is not None and info.get("source") == "download" and checkout:
+            _journal("stale (downloaded asset in a working checkout)")
+            compile_in_checkout = True
+        elif info is None or not info.get("source_sha256"):
             _journal("present (no recorded source hash)")
             return True, "present"
-        try:
-            current = source_sha256(src)
-        except OSError:
-            # In an installed plugin the source may not be shipped; its
-            # absence is not evidence that the binary is stale.
-            _journal("present (source unavailable, trusting the binary)")
-            return True, "present"
-        if info.get("source_sha256") == current:
-            _journal("present")
-            return True, "present"
-        _journal("stale (source hash changed)")
+        else:
+            try:
+                current = source_sha256(src)
+            except OSError:
+                # In an installed plugin the source may not be shipped; its
+                # absence is not evidence that the binary is stale.
+                _journal("present (source unavailable, trusting the binary)")
+                return True, "present"
+            if info.get("source_sha256") == current:
+                _journal("present")
+                return True, "present"
+            _journal("stale (source hash changed)")
+            compile_in_checkout = checkout
 
     download_failure = None
     url = download_url()
-    if os.environ.get(NO_DOWNLOAD_ENV):
+    if compile_in_checkout:
+        # Re-downloading the release asset here would run code built from the
+        # release's source (masking this edit) and write a stale row that loops
+        # back here; a working checkout builds its own source.
+        _journal("download skipped (working checkout compiles its source)")
+    elif os.environ.get(NO_DOWNLOAD_ENV):
         _journal("download disabled by %s" % NO_DOWNLOAD_ENV)
     elif url is None:
         _journal("download unavailable (no .companion_url / version)")

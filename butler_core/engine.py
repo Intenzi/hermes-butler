@@ -1214,14 +1214,16 @@ def _watch_matched_line(text, needle):
     """The one line a value hit's status row should quote.
 
     ``new_text`` is the whole delta (maybe several appended lines); the status
-    line reads the first line that carries the needle, never the buffer.
+    line reads the LAST line that carries the needle, never the buffer. A
+    terminal delta starts with the echoed command (`sleep 2; echo BUILD OK`),
+    so it matches the needle before the output line does.
     """
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     if not lines:
         return ""
     if isinstance(needle, str) and needle:
         wanted = needle.lower()
-        for line in lines:
+        for line in reversed(lines):
             if wanted in line.lower():
                 return line
     return lines[0]

@@ -1853,6 +1853,30 @@ def test_a_fallback_hit_quotes_the_matching_line_not_the_buffer_head(
     assert _run_matched_line(value_delta_harness, text, "build ok") == "BUILD OK"
 
 
+def test_a_value_hit_quotes_the_last_matching_delta_line(
+        value_delta_harness) -> None:
+    """Measured round 16: the typed command is echoed BEFORE its output, so a
+    first-match quote names the command. The hit must quote the output line,
+    which is the LAST line of the delta carrying the needle."""
+    delta = ("➜  ~ sleep 2; echo BUILD OK ; echo done\n"
+             "BUILD OK\n"
+             "➜  ~ echo done\n"
+             "done")
+
+    quoted = _run_matched_line(value_delta_harness, delta, "build ok")
+
+    assert quoted == "BUILD OK"
+    assert "sleep 2" not in quoted, "the echoed command is not the output"
+
+
+def test_a_delta_with_one_matching_line_still_quotes_it(
+        value_delta_harness) -> None:
+    """The last-match rule must not change the single-hit case (round 16)."""
+    delta = "step 1 done\nBUILD OK\nall done\n"
+
+    assert _run_matched_line(value_delta_harness, delta, "build ok") == "BUILD OK"
+
+
 def test_the_value_hit_text_cap_uses_the_capture_ellipsis(
         value_delta_harness) -> None:
     text = _run_hit_text(value_delta_harness,

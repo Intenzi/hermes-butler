@@ -1371,6 +1371,27 @@ def test_a_multiline_value_delta_status_reads_the_matched_line(
     assert "\n" not in line
 
 
+def test_a_value_hit_quotes_the_output_after_the_echoed_command(
+        tmp_path: Path, monkeypatch) -> None:
+    """Measured 02:23:58: the delta held the echoed command and then the
+    output. Quoting the first match named the command; the status row must
+    quote the LAST matching line, the output, exactly as Swift does."""
+    _overlay, _result = _terminal(tmp_path, monkeypatch)
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    delta = ("➜  ~ sleep 2; echo BUILD OK ; echo done\n"
+             "BUILD OK\n"
+             "➜  ~ echo done\n"
+             "done\n")
+
+    engine._on_overlay_event(_value_hit(new_text=delta))
+
+    line = engine.watch_status().splitlines()[1]
+
+    assert line.startswith('hit: value — "BUILD OK" (output) at ')
+    assert "sleep 2" not in line, "the echoed command is not the output"
+    assert engine._watch_matched_line(delta, "build ok") == "BUILD OK"
+
+
 def test_an_overlong_value_delta_is_capped_like_a_capture(
         tmp_path: Path, monkeypatch) -> None:
     """The `new_text` cap is the capture cap: 200 chars plus `…`."""

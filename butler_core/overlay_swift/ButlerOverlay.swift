@@ -5298,13 +5298,18 @@ private final class OverlayController {
         return counts
     }
 
-    /// The first line carrying the needle (case-insensitive), else the text.
-    /// Used for a fallback hit, where there is no delta to quote.
+    /// The LAST line carrying the needle (case-insensitive), else the text.
+    /// Used for a fallback hit, where there is no delta to quote, and by the
+    /// status formatter for a delta. A terminal delta starts with the echoed
+    /// command (`sleep 2; echo BUILD OK`), so the FIRST match is the command
+    /// line and the output (`BUILD OK`) comes after it: quote the last match.
     private func watchMatchedLine(_ text: String, needle: String) -> String {
-        for line in watchLines(text) where line.lowercased().contains(needle) {
-            return line
+        let wanted = needle.lowercased()
+        var matched: String?
+        for line in watchLines(text) where line.lowercased().contains(wanted) {
+            matched = line
         }
-        return text
+        return matched ?? text
     }
 
     /// Same rule as capture's value cap: a cut string ends with an ellipsis.

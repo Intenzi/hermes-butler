@@ -213,7 +213,13 @@ def test_download_installs_the_verified_helper_and_its_buildinfo(
     assert exe.read_bytes() == BINARY
     assert exe.stat().st_mode & 0o111, "the helper must be executable"
     assert not Path(str(exe) + ".download").exists(), "no partial file remains"
-    assert json.loads(info.read_text(encoding="utf-8")) == release_info
+    recorded = json.loads(info.read_text(encoding="utf-8"))
+    # Round 17: a release asset may predate a local edit, so its row says where
+    # it came from and never claims the bundled source's hash.
+    assert recorded["source"] == "download"
+    assert recorded["version"] == "9.9.9"
+    assert "source_sha256" not in recorded
+    assert recorded["archs"] == ["arm64", "x86_64"]
     assert "swiftc" not in lookups, "the download path must not need a compiler"
 
 
@@ -241,11 +247,15 @@ def test_download_falls_back_to_a_renamed_buildinfo_sibling(
     assert [url for url, _ in calls] == [
         base + ".sha256", base, release_dir + "/.buildinfo",
         base + ".buildinfo"]
-    assert json.loads(info.read_text(encoding="utf-8")) == release_info
+    recorded = json.loads(info.read_text(encoding="utf-8"))
+    assert recorded["source"] == "download"
+    assert recorded["version"] == "9.9.9"
+    assert "source_sha256" not in recorded
+    assert recorded["archs"] == ["arm64"]
     assert exe.read_bytes() == BINARY
 
 
-def test_download_without_a_buildinfo_asset_records_the_source_hash(
+def test_download_without_a_buildinfo_asset_records_the_download_source(
         tmp_path, monkeypatch):
     exe, _, info = _download_layout(tmp_path, monkeypatch)
     base = URL_TEMPLATE.format(version="9.9.9")
@@ -261,9 +271,108 @@ def test_download_without_a_buildinfo_asset_records_the_source_hash(
     assert overlay.ensure_binary() == (True, "downloaded")
 
     recorded = json.loads(info.read_text(encoding="utf-8"))
-    assert recorded["source_sha256"] == _sha(SOURCE)
+    assert "source_sha256" not in recorded, (
+        "the release asset is not the bundled checkout's compiled helper")
+    assert recorded["source"] == "download"
+    assert recorded["version"] == "9.9.9"
     assert isinstance(recorded["archs"], list) and recorded["archs"]
     assert isinstance(recorded["built_at"], int)
+
+
+# ------------------------- downloaded-vs-local-source rows (round 17)
+#
+# A downloaded asset was built from the RELEASE's source. Recording the bundled
+# checkout's hash for it made every later resolve say "present" and silently
+# ran the released binary after a local Swift edit. `source: "download"` is
+# stale in a working checkout; a released install (no .git) still trusts it.
+
+def _checkout(tmp_path, monkeypatch):
+    """Mark the fake plugin directory as a git working checkout."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(overlay, "plugin_root", lambda: str(tmp_path))
+
+
+def test_a_download_row_compiles_in_a_working_checkout(tmp_path, monkeypatch):
+    row = {"source": "download", "version": "9.9.9",
+           "archs": ["arm64"], "built_at": 1}
+    exe, src, info = _download_layout(tmp_path, monkeypatch, buildinfo=row,
+                                      executable=True)
+    _checkout(tmp_path, monkeypatch)
+    calls = _mock_http(monkeypatch, {})
+    lookups, runs = _stub_compiler(monkeypatch, works=True)
+
+    assert overlay.ensure_binary() == (True, "compiled")
+
+    assert calls == [], "a checkout compiles its source instead of re-downloading"
+    assert "swiftc" in lookups
+    assert runs, "the local source must be rebuilt"
+    refreshed = json.loads(info.read_text(encoding="utf-8"))
+    assert refreshed["source"] == "compiled"
+    assert refreshed["source_sha256"] == _sha(SOURCE)
+
+
+def test_a_stale_compiled_row_also_compiles_in_a_working_checkout(
+        tmp_path, monkeypatch):
+    """A local edit changes the source hash: the checkout must rebuild, not
+    install the release asset for one resolve and only compile on the next."""
+    stale = {"source": "compiled", "source_sha256": "0" * 64,
+             "archs": ["arm64"], "built_at": 1}
+    exe, src, info = _download_layout(tmp_path, monkeypatch, buildinfo=stale,
+                                      executable=True)
+    _checkout(tmp_path, monkeypatch)
+    calls = _mock_http(monkeypatch, {})
+    lookups, runs = _stub_compiler(monkeypatch, works=True)
+
+    assert overlay.ensure_binary() == (True, "compiled")
+
+    assert calls == [], "the release asset must not mask the edited source"
+    assert "swiftc" in lookups and runs
+    assert json.loads(info.read_text(encoding="utf-8"))["source"] == "compiled"
+
+
+def test_a_checkout_compile_failure_reports_compile_failed(
+        tmp_path, monkeypatch):
+    row = {"source": "download", "version": "9.9.9",
+           "archs": ["arm64"], "built_at": 1}
+    exe, _, _ = _download_layout(tmp_path, monkeypatch, buildinfo=row,
+                                 executable=True)
+    _checkout(tmp_path, monkeypatch)
+    calls = _mock_http(monkeypatch, {})
+    _stub_compiler(monkeypatch, works=False)
+
+    ok, detail = overlay.ensure_binary()
+
+    assert ok is False
+    assert detail.startswith("compile_failed:")
+    assert calls == [], "no download is attempted when the checkout compiles"
+
+
+def test_a_download_row_stays_present_without_a_git_checkout(
+        tmp_path, monkeypatch):
+    row = {"source": "download", "version": "9.9.9",
+           "archs": ["arm64"], "built_at": 1}
+    exe, _, _ = _download_layout(tmp_path, monkeypatch, buildinfo=row,
+                                 executable=True)
+    # A released install has no .git: the verified asset stays in use, exactly
+    # as before this round, and no compiler is needed.
+    monkeypatch.setattr(overlay, "plugin_root", lambda: str(tmp_path))
+    calls = _mock_http(monkeypatch, {})
+    monkeypatch.setattr(overlay, "shutil", types.SimpleNamespace(
+        which=lambda name: pytest.fail("a released install must not compile")))
+    monkeypatch.setattr(overlay, "subprocess", types.SimpleNamespace(
+        run=lambda *a, **k: pytest.fail("a released install must not compile")))
+
+    assert overlay.ensure_binary() == (True, "present")
+    assert calls == [], "a present asset must not touch the network"
+
+
+def test_a_locally_compiled_matching_row_stays_present(tmp_path, monkeypatch):
+    buildinfo = {"source": "compiled", "source_sha256": _sha(SOURCE),
+                 "archs": ["arm64"], "built_at": 1}
+    _layout(tmp_path, monkeypatch, buildinfo=buildinfo)
+    _checkout(tmp_path, monkeypatch)
+
+    assert overlay.ensure_binary() == (True, "present")
 
 
 def test_a_sha256_mismatch_removes_the_partial_file_and_falls_through(
