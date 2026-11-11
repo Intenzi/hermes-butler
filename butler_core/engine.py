@@ -95,6 +95,18 @@ WATCH_SCAN_INTERVAL_MAX = 10
 WATCH_SCAN_NODES_DEFAULT = 1500
 WATCH_SCAN_NODES_MAX = 4000
 
+#: The three surfaces a condition hit can name. ``window`` is the frontmost
+#: window title, ``label`` the focused control's AXTitle/AXDescription, and
+#: ``value`` its AXValue (the terminal pane's output). The companion records
+#: which ones already contained the needle at arm and requires a transition
+#: from those; the status lines name the surface the hit actually came from.
+WATCH_SURFACES = ("window", "label", "value")
+#: How a surface reads in the status text: at arm and on a hit.
+WATCH_SURFACE_ARM = {"window": "window title", "label": "label",
+                     "value": "value"}
+WATCH_SURFACE_HIT = {"window": "window title", "label": "control label",
+                     "value": "output"}
+
 # A guide block on the shared snapshot is LIVE status only while the guide is
 # actually being walked (running/capture_failed/stalled). Once terminal, the
 # block is kept just long enough for the pet to say its one ending line; a row
@@ -1332,6 +1344,17 @@ def _handle_watch_message(event):
             kind = event.get("kind")
             if isinstance(kind, str) and kind:
                 hit["kind"] = kind
+            # WHICH surface matched: the companion knows, the agent should not
+            # have to infer it from the event tail (a terminal's window title is
+            # the command line; its value is the output).
+            matched = event.get("matched")
+            if isinstance(matched, str) and matched in WATCH_SURFACES:
+                hit["matched"] = matched
+            surfaces = event.get("baseline_had")
+            if isinstance(surfaces, list):
+                hit["baseline_had"] = [
+                    surface for surface in surfaces
+                    if isinstance(surface, str) and surface in WATCH_SURFACES]
             if not once:
                 # Sticky mode keeps observing after the announcement; the hit
                 # stays unacknowledged until the user (or the pane) says so.
@@ -1355,6 +1378,12 @@ def _handle_watch_message(event):
                 # desktop can say "author" vs a mere text match after the watch
                 # row is gone.
                 watch_hit["kind"] = hit["kind"]
+            if hit.get("matched"):
+                # The surface survives the ended watch row too: the status/desk
+                # text still says which one fired.
+                watch_hit["matched"] = hit["matched"]
+            if hit.get("baseline_had") is not None:
+                watch_hit["baseline_had"] = hit["baseline_had"]
             # Remember that THIS process published the top-level block, so a
             # later write can tell "acked elsewhere" from "never announced".
             _watch_hit_id = watch_hit["id"]
@@ -1629,6 +1658,17 @@ def _start_watch_locked(app, until, once=True, scan=None):
                         and not isinstance(baseline, bool):
                     _watch["scan_baseline"] = max(0, int(baseline))
                 _watch["scan_baseline_at"] = time.time()
+            # Arm-time surface baseline (until watches): the surfaces that
+            # already contained the needle. A surface in this set waits for a
+            # transition, so the status line can say why it is still "no hit"
+            # instead of implying nothing is being watched.
+            surfaces = reply.get("baseline_had")
+            if isinstance(surfaces, list):
+                _watch["baseline_had"] = [
+                    surface for surface in surfaces
+                    if isinstance(surface, str) and surface in WATCH_SURFACES]
+            if reply.get("window_title_disabled") is True:
+                _watch["window_title_disabled"] = True
             stopped = _watch.get("stopped")
             if stopped is not None:
                 if stopped.get("token") == token:
@@ -1641,6 +1681,7 @@ def _start_watch_locked(app, until, once=True, scan=None):
                               "status": watch_status()}
                     if scan_spec is not None:
                         result["scan"] = scan_spec
+                    _add_baseline_result(result, provisional)
                     return result
                 # A stop line written BEFORE this watch was installed (an old
                 # watch quitting, a concurrent stop) must not mark the new row
@@ -1653,9 +1694,51 @@ def _start_watch_locked(app, until, once=True, scan=None):
                   "started_at": started_at, "status": watch_status()}
         if scan_spec is not None:
             result["scan"] = scan_spec
+        _add_baseline_result(result, provisional)
         return result
     except Exception as exc:  # noqa: BLE001 - a handler must always answer
         return {"error": str(exc)}
+
+
+def _add_baseline_result(result, row):
+    """Echo the arm-time surface facts on a successful watch_start result."""
+    surfaces = row.get("baseline_had") if isinstance(row, dict) else None
+    if isinstance(surfaces, list):
+        result["baseline_had"] = list(surfaces)
+    if isinstance(row, dict) and row.get("window_title_disabled"):
+        result["window_title_disabled"] = True
+    return result
+
+
+def _watch_baseline_lines(row, until):
+    """Status lines for the at-arm surfaces that already contained the needle.
+
+    A pre-existing surface is not a hit and is not news: the watch waits for it
+    to change into something new. Saying that plainly is the whole point — the
+    old status ("no hit") left the agent to infer why nothing fired while its
+    terminal title literally read the command it had just typed.
+    """
+    if not isinstance(until, str) or not until:
+        return []
+    surfaces = row.get("baseline_had")
+    if not isinstance(surfaces, list) or not surfaces:
+        return []
+    lines = []
+    for surface in surfaces:
+        if surface not in WATCH_SURFACES:
+            continue
+        reason = ""
+        if surface == "window" and row.get("window_title_disabled"):
+            # Terminal titles are the command line: name the trap explicitly.
+            reason = " (command echo)"
+        # A label waits on the label, not on a value that will never carry the
+        # match. The window case keeps the brief's sentence verbatim.
+        waits_on = "label" if surface == "label" else "value"
+        lines.append(
+            'at arm: %s already contained "%s"%s \u2014 waiting for the '
+            '%s to change' % (WATCH_SURFACE_ARM[surface], until, reason,
+                              waits_on))
+    return lines
 
 
 def watch_status():
@@ -1685,9 +1768,21 @@ def watch_status():
     if scan is not None:
         lines.append(_watch_scan_line(scan, row, bool(hit)))
     if hit:
-        suffix = (" — %s" % hit["window"]) if hit.get("window") else ""
-        lines.append("hit: %s%s at %s" % (hit.get("label") or "", suffix,
-                                          _watch_clock(hit.get("at"))))
+        matched = hit.get("matched")
+        if matched in WATCH_SURFACES:
+            # Name the surface: a terminal hit came from the pane's value (the
+            # output), not from its window title (the command line).
+            lines.append('hit: %s \u2014 "%s" (%s) at %s' % (
+                matched, hit.get("label") or "", WATCH_SURFACE_HIT[matched],
+                _watch_clock(hit.get("at"))))
+        else:
+            suffix = (" \u2014 %s" % hit["window"]) if hit.get("window") else ""
+            lines.append("hit: %s%s at %s" % (hit.get("label") or "", suffix,
+                                              _watch_clock(hit.get("at"))))
+    else:
+        lines.extend(_watch_baseline_lines(row, until))
+    if row.get("window_title_disabled"):
+        lines.append("title matching disabled for terminal app")
     source = ring if not external else (row.get("recent") or [])
     for event in source[-WATCH_STATUS_EVENTS:]:
         lines.append(_watch_event_line(event))

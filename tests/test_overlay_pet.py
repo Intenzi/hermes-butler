@@ -1465,6 +1465,137 @@ def test_watch_matches_on_the_window_title_too() -> None:
     assert "windowText.contains(needle)" in emit
 
 
+def test_watch_arm_baseline_kills_the_terminal_title_false_positive() -> None:
+    """The exact measured regression: a title already containing the needle is
+    NOT news; only a transition into it (the output landing) fires.
+
+    Measured 2026-11-12: ``watch(Terminal, until="BUILD OK")`` while the shell
+    ran ``sleep 70; echo BUILD OK`` fired at 01:03:18 on the window title (which
+    is the command line), one-shot-consumed the watch, while ``pgrep`` still
+    showed the sleep alive; the output appeared at 01:04:19 with nothing
+    watching. The companion now records the three surface baselines at arm and
+    requires an old→new transition from any surface that already matched.
+    """
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    start = _swift_function_body(source, "private func startWatch(",
+                                 "private func resetWatchState()")
+    # One arm-time read per surface, then the set the producer is told about.
+    assert "let armWindowText = watchFocusedWindowTitle()" in start
+    assert "let armLabelText = armFocused.flatMap { watchFocusedLabelText($0) }" in start
+    assert "let armValueText = armFocused.flatMap { axWatchRawValueText($0) }" in start
+    for surface in ("window", "label", "value"):
+        assert 'preexisting.insert("%s")' % surface in start
+    assert "watchPreexistingSurfaces = preexisting" in start
+    assert 'started["baseline_had"] = watchPreexistingSurfaces.sorted()' in start
+    # The baseline is measured BEFORE the ack, like the scan's.
+    assert start.find("watchPreexistingSurfaces = preexisting") \
+        < start.find("writeWatchLine(started)")
+
+    emit = _swift_function_body(source, "private func emitWatchEvent(",
+                                "/// Find the core Hermes pet pop-out")
+    fires = _swift_function_body(source, "private func watchSurfaceFires(",
+                                 "private func watchWindowTransitioned(")
+    # A surface in the arm set only fires when it transitioned into the needle.
+    assert "watchPreexistingSurfaces.contains(surface)" in fires
+    assert "return transitioned" in fires
+    assert "return true" in fires, "a clean surface keeps firing as today"
+    # Transition-only rule (requirement 2): `old` must NOT contain the needle.
+    value = _swift_function_body(source, "private func watchValueTransitioned(",
+                                 "/// Find the core Hermes pet pop-out")
+    assert "!old.lowercased().contains(needle)" in value
+    window = _swift_function_body(source, "private func watchWindowTransitioned(",
+                                  "private func watchLabelTransitioned(")
+    # A window/label TITLE transition is "changed into a containing string"
+    # (the second clause of requirement 1), so a change between two containing
+    # titles still fires; an unchanged title does not.
+    assert "old.lowercased() != text.lowercased()" in window
+    assert "previous ?? watchPreviousWindowText" in window
+    # A window NOTIFICATION passes its own previous title; a CONTROL event must
+    # NOT feed its value old/new into the window transition (a value string is
+    # always "different" from the title, so a pre-existing title would refire on
+    # every control event). The fallback compares the tracked window title.
+    assert "text: window, previous: old, needle: needle" in emit
+    assert "text: window, previous: watchPreviousWindowText" in emit
+    # Exactly one hit per arm: the matched branch disarms the condition.
+    hit_at = emit.find('matched = "value"')
+    assert hit_at != -1
+    assert "watchHitArmed = false" in emit[hit_at:]
+
+
+def test_a_watch_hit_payload_names_the_surface_that_matched() -> None:
+    """`matched` + `baseline_had` are additive: every old key is still there."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+    emit = _swift_function_body(source, "private func emitWatchEvent(",
+                                "/// Find the core Hermes pet pop-out")
+
+    for surface in ("value", "window", "label"):
+        assert 'matched = "%s"' % surface in emit
+    assert '"matched": matched' in emit
+    assert '"baseline_had": watchPreexistingSurfaces.sorted()' in emit
+    # Keep every existing key, so an old reader does not break.
+    for key in ('"op": "watch-hit"', '"app": watchAppName ?? ""',
+                '"until": until', '"label": label ?? ""',
+                '"window": window ?? ""', '"at": now.timeIntervalSince1970'):
+        assert key in emit, key
+    # Surfaces are attributed explicitly: a display label that falls back to
+    # AXValue must never be reported as the label surface.
+    assert "let labelSurfaceText = (surfaceLabel ?? label ?? \"\").lowercased()" in emit
+    assert "let valueSurfaceText = (surfaceValue ?? \"\").lowercased()" in emit
+
+
+def test_a_terminal_text_control_never_matches_its_window_title() -> None:
+    """Role-aware default surface: terminal titles are the command line."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    terminal = _swift_function_body(source, "private func isTerminalApp(",
+                                    "/// AXTitle, else AXDescription, else AXValue")
+    assert 'name.contains("terminal")' in terminal
+    assert '"com.apple.Terminal"' in terminal
+    assert '"com.googlecode.iterm2"' in terminal
+    role = _swift_function_body(source, "private func isWatchTextRole(",
+                                "private func isTerminalApp(")
+    assert 'role == "AXTextArea" || role == "AXTextField"' in role
+
+    start = _swift_function_body(source, "private func startWatch(",
+                                 "private func resetWatchState()")
+    assert ("watchWindowSurfaceDisabled = spec.until != nil && isTerminalApp(app)"
+            in start)
+    assert "isWatchTextRole($0)" in start
+    assert 'started["window_title_disabled"] = true' in start
+
+    emit = _swift_function_body(source, "private func emitWatchEvent(",
+                                "/// Find the core Hermes pet pop-out")
+    # The window branch refuses a terminal title for BOTH window events and
+    # ordinary control events; everyone else keeps window-first behaviour.
+    assert emit.count("!watchWindowSurfaceDisabled") >= 2
+    assert "windowText.contains(needle)" in emit
+
+
+def test_capture_exports_a_text_controls_ax_value() -> None:
+    """`value` is its own field, UTF-8 safe, capped at 200 with a marker."""
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    constants = _swift_function_body(source, "private let axValueLimit = 200",
+                                     "private struct AXCaptureSpec")
+    assert "private let axValueLimit = 200" in constants
+    for role in ("AXTextArea", "AXTextField", "AXComboBox", "AXStaticText"):
+        assert role in constants
+    fields = _swift_function_body(source, "private func readAXFields(",
+                                  "// MARK: - LOOK hit-test")
+    # Character-count cap on whole Characters: a multi-byte value stays valid.
+    assert "trimmed.count > axValueLimit" in fields
+    assert 'String(trimmed.prefix(axValueLimit)) + "\\u{2026}"' in fields
+    assert "valueTruncated = true" in fields
+    # `label` keeps title -> description -> value fallback exactly as before.
+    assert "if label == nil, let valueText = rawValue as? String" in fields
+    walk = _swift_function_body(source, "private func walkAX(",
+                                "private func axWindows(")
+    assert 'row["value"] = value' in walk
+    assert 'row["truncated"] = true' in walk, "the marker rides only a cut value"
+    assert '"label": fields.label ?? NSNull()' in walk
+
+
 def test_hat_option_right_click_menu_keeps_the_look_and_watch_doors() -> None:
     """Option-right-clicking the hat opens the discoverability menu.
 

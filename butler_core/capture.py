@@ -104,17 +104,48 @@ def _capture_op(target, max_elements, depth):
     }
 
 
+def _capture_elements(elements):
+    """Keep the optional per-element ``value``/``truncated`` fields honest.
+
+    ``value`` is the control's AXValue as its own field (the companion caps it
+    at 200 characters, appending ``…`` and setting ``truncated: true`` when
+    cut). It is additive: an element the OS refused the attribute for simply
+    has no key, never a null, so readers of ``label`` see no change. A
+    non-string value from an old/newer companion is dropped rather than
+    forwarded as junk.
+    """
+    kept = []
+    for element in elements:
+        if not isinstance(element, dict):
+            kept.append(element)
+            continue
+        row = dict(element)
+        if not isinstance(row.get("value"), str):
+            row.pop("value", None)
+        if row.get("truncated") is True:
+            row["truncated"] = True
+        else:
+            row.pop("truncated", None)
+        kept.append(row)
+    return kept
+
+
 def capture(target=None, max_elements=DEFAULT_MAX, depth=DEFAULT_DEPTH):
     """Element list of the target/frontmost app. Never raises for OS errors.
 
-    The returned dict is the companion's snapshot, unchanged; on silence or a
-    dead helper it degrades to the untrusted/failed snapshot shape.
+    The returned dict is the companion's snapshot, with the per-element
+    ``value`` passed through unchanged; on silence or a dead helper it degrades
+    to the untrusted/failed snapshot shape.
     """
     if not HAS_MAC:
         return {"platform": "macos_only", "error": "Butler companion capture is macOS-only"}
     op = _capture_op(target, max_elements, depth)
     reply = _request(op)
     if isinstance(reply, dict):
+        elements = reply.get("elements")
+        if isinstance(elements, list):
+            reply = dict(reply)
+            reply["elements"] = _capture_elements(elements)
         return reply
     return _failed_snapshot(
         "Butler companion did not return a capture within %gs" % REQUEST_TIMEOUT)

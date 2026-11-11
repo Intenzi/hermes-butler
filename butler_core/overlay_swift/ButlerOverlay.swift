@@ -297,6 +297,15 @@ private func makeParagraphStyle(lineBreakMode: NSLineBreakMode) -> NSParagraphSt
 
 private let axDefaultMaxElements = 150
 private let axDefaultDepth = 10
+/// The AXValue string is its own capture field, so a text area's content is
+/// visible without changing what `label` means. 200 characters is enough to
+/// recognise a line of output (and keeps one huge document from swamping the
+/// payload); the cut is marked with an ellipsis plus `truncated: true`.
+private let axValueLimit = 200
+/// Roles whose AXValue is the content a human reads. A button's AXValue is
+/// state, not text, so it is not exported.
+private let axValueRoles: Set<String> = ["AXTextArea", "AXTextField",
+                                         "AXComboBox", "AXStaticText"]
 
 private struct AXCaptureSpec {
     let target: String?
@@ -374,6 +383,10 @@ private func axPointOrSize(_ raw: Any?, kind: String) -> [Int]? {
 private struct AXFields {
     let role: String
     let label: String?
+    /// AXValue as its own field (text-like roles only). nil = the OS refused
+    /// the attribute or the control has no text; the wire key stays optional.
+    let value: String?
+    let valueTruncated: Bool
     let box: [Any]
 }
 
@@ -384,6 +397,13 @@ private func readAXFields(_ element: AXUIElement) -> AXFields {
     let rawValue = copyAXAttribute(element, "AXValue")
     let position = copyAXAttribute(element, "AXPosition")
     let size = copyAXAttribute(element, "AXSize")
+
+    let role: String
+    if let roleRaw = roleRaw {
+        role = (roleRaw as? String) ?? String(describing: roleRaw)
+    } else {
+        role = "unknown"
+    }
 
     var label: String?
     for candidate in [title, description] {
@@ -401,6 +421,24 @@ private func readAXFields(_ element: AXUIElement) -> AXFields {
         }
     }
 
+    // The value is NOT the label: a terminal's AXTextArea has no title, so the
+    // label fallback above would otherwise be the only (and lossy) copy of its
+    // content. Count characters, never bytes, so a multi-byte cut stays valid
+    // UTF-8; the loop below only ever slices whole `Character`s.
+    var value: String?
+    var valueTruncated = false
+    if axValueRoles.contains(role), let rawText = rawValue as? String {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            if trimmed.count > axValueLimit {
+                value = String(trimmed.prefix(axValueLimit)) + "\u{2026}"
+                valueTruncated = true
+            } else {
+                value = trimmed
+            }
+        }
+    }
+
     var box: [Any] = [NSNull(), NSNull(), NSNull(), NSNull()]
     if let point = axPointOrSize(position, kind: "point"),
        let dimensions = axPointOrSize(size, kind: "size"),
@@ -408,13 +446,8 @@ private func readAXFields(_ element: AXUIElement) -> AXFields {
         box = [point[0], point[1], dimensions[0], dimensions[1]]
     }
 
-    let role: String
-    if let roleRaw = roleRaw {
-        role = (roleRaw as? String) ?? String(describing: roleRaw)
-    } else {
-        role = "unknown"
-    }
-    return AXFields(role: role, label: label, box: box)
+    return AXFields(role: role, label: label, value: value,
+                    valueTruncated: valueTruncated, box: box)
 }
 
 // MARK: - LOOK hit-test (element under the cursor)
@@ -875,10 +908,19 @@ private func walkAX(_ element: AXUIElement,
     }
     let fields = readAXFields(element)
     // read_fields always returns a box (possibly all-null), so every visited
-    // element is recorded - matching the Python walk exactly.
-    out.append(["role": fields.role,
-                "label": fields.label ?? NSNull(),
-                "box": fields.box])
+    // element is recorded - matching the Python walk exactly. `value` and
+    // `truncated` are additive and OPTIONAL: an attribute the OS refused is
+    // absent from the row, never sent as null, so old readers see no change.
+    var row: [String: Any] = ["role": fields.role,
+                              "label": fields.label ?? NSNull(),
+                              "box": fields.box]
+    if let value = fields.value {
+        row["value"] = value
+        if fields.valueTruncated {
+            row["truncated"] = true
+        }
+    }
+    out.append(row)
 
     guard let rawKids = copyAXAttribute(element, "AXChildren"),
           let kids = rawKids as? [Any] else {
@@ -3434,6 +3476,23 @@ private final class OverlayController {
     private var watchAppName: String?
     /// The condition to announce once ("" is never stored; nil means none).
     private var watchUntil: String?
+    /// Surfaces that ALREADY contained the needle at arm: `window`, `label`,
+    /// `value`. A surface in this set is not news in its baseline state; it may
+    /// only fire on a transition (old without the needle → new with it). The
+    /// measured false positive: Terminal's window title IS the command line, so
+    /// `until: "BUILD OK"` matched the typing of `echo BUILD OK` immediately,
+    /// consumed the one-shot hit, and nothing was watching when the output
+    /// actually landed.
+    private var watchPreexistingSurfaces: Set<String> = []
+    /// A terminal's window title is the command line, not its output. When the
+    /// focused control is a text field/area there, the window surface is
+    /// disabled entirely (recorded in the arm reply + status line).
+    private var watchWindowSurfaceDisabled = false
+    /// Previous readable text of the window/label/value surfaces, so
+    /// "transition" can mean old → new instead of just "contains it now".
+    private var watchPreviousWindowText: String?
+    private var watchPreviousLabelText: String?
+    private var watchPreviousValueText: String?
     /// False after the condition fired, so one hit is announced per arm.
     private var watchHitArmed = false
     private var watchSeq = 0
@@ -4213,6 +4272,37 @@ private final class OverlayController {
         if spec.scan != nil {
             scanBaseline = armWatchScanBaseline()
         }
+        // Arm-time baseline per surface: which of `window` (frontmost window
+        // title), `label` (focused control's AXTitle/AXDescription) and `value`
+        // (its AXValue) ALREADY contain the needle. Those surfaces are not news
+        // in that state; they may only fire on a transition (old without the
+        // needle → new with it). The reply names them, so the status line can
+        // say WHY a watch on an already-visible string is still waiting.
+        let armFocused = axElement(from: copyAXAttribute(root, "AXFocusedUIElement"))
+        let armWindowText = watchFocusedWindowTitle()
+        let armLabelText = armFocused.flatMap { watchFocusedLabelText($0) }
+        let armValueText = armFocused.flatMap { axWatchRawValueText($0) }
+        // Role-aware default surface: a terminal's window title is the command
+        // line. With a text control focused there, a title match is the command
+        // echoing, not the output finishing.
+        watchWindowSurfaceDisabled = spec.until != nil && isTerminalApp(app)
+            && (armFocused.map { isWatchTextRole($0) } ?? false)
+        var preexisting: Set<String> = []
+        if let needle = spec.until?.lowercased(), !needle.isEmpty {
+            if let text = armWindowText, text.lowercased().contains(needle) {
+                preexisting.insert("window")
+            }
+            if let text = armLabelText, text.lowercased().contains(needle) {
+                preexisting.insert("label")
+            }
+            if let text = armValueText, text.lowercased().contains(needle) {
+                preexisting.insert("value")
+            }
+        }
+        watchPreexistingSurfaces = preexisting
+        watchPreviousWindowText = armWindowText
+        watchPreviousLabelText = armLabelText
+        watchPreviousValueText = armValueText
         var started: [String: Any] = [
             "op": "watch-started",
             "app": watchAppName ?? spec.app,
@@ -4222,20 +4312,30 @@ private final class OverlayController {
         if spec.scan != nil {
             started["baseline"] = scanBaseline
         }
+        if spec.until != nil {
+            // Empty when nothing matched at arm; sorted so the line is stable.
+            started["baseline_had"] = watchPreexistingSurfaces.sorted()
+        }
+        if watchWindowSurfaceDisabled {
+            started["window_title_disabled"] = true
+        }
         if let token = spec.token {
             started["token"] = token
         }
         writeWatchLine(started)
-        // Baseline: describe where the app is RIGHT NOW. A watch opened on a
-        // condition that is already true must fire immediately instead of
-        // waiting for the user to move something.
+        // Baseline: describe where the app is RIGHT NOW, so the status text has
+        // a first line to show. A condition already visible at arm is recorded
+        // in `baseline_had` and waits for a transition; the old immediate-fire
+        // turned a terminal's command echo into a match.
         let baseline = axElement(from: copyAXAttribute(root, "AXFocusedUIElement"))
             ?? axElement(from: copyAXAttribute(root, "AXFocusedWindow"))
         if let element = baseline {
             emitWatchEvent(kind: "focus",
                            role: watchRole(element),
                            label: watchLabel(element),
-                           window: watchWindowLine(element))
+                           window: watchWindowLine(element),
+                           surfaceLabel: watchFocusedLabelText(element),
+                           surfaceValue: axWatchRawValueText(element))
         } else {
             emitWatchEvent(kind: "focus", role: "AXApplication",
                            label: watchAppName, window: watchFocusedWindowTitle())
@@ -4254,6 +4354,11 @@ private final class OverlayController {
         watchAppName = nil
         watchUntil = nil
         watchHitArmed = false
+        watchPreexistingSurfaces.removeAll()
+        watchWindowSurfaceDisabled = false
+        watchPreviousWindowText = nil
+        watchPreviousLabelText = nil
+        watchPreviousValueText = nil
         watchSeq = 0
         watchEventCount = 0
         observedWatchWindows.removeAll()
@@ -4701,7 +4806,9 @@ private final class OverlayController {
             if let focused = watchFocusedElement {
                 emitWatchEvent(kind: "focus", role: watchRole(focused),
                                label: watchLabel(focused),
-                               window: watchWindowLine(focused))
+                               window: watchWindowLine(focused),
+                               surfaceLabel: watchFocusedLabelText(focused),
+                               surfaceValue: axWatchRawValueText(focused))
             } else {
                 emitWatchEvent(kind: "focus", role: "AXApplication",
                                label: watchAppName, window: watchFocusedWindowTitle())
@@ -4727,13 +4834,18 @@ private final class OverlayController {
             let key = Int(CFHash(element))
             let role = watchRole(element)
             let title = axNonEmpty(axWindowTitle(element))
+            // Read the title this watch last saw BEFORE replacing it: a title
+            // change into a containing string is a transition even when the old
+            // title also contained the needle ("BUILD OK (1)" → "BUILD OK (2)").
+            let previousTitle = watchWindowTitles[key]
             if let title = title {
                 watchWindowTitles[key] = title
             }
             if role == "AXWindow" {
-                let windowTitle = title ?? watchWindowTitles[key]
+                let windowTitle = title ?? previousTitle
                 emitWatchEvent(kind: "window-title", role: role,
-                               label: windowTitle, window: windowTitle)
+                               label: windowTitle, window: windowTitle,
+                               old: previousTitle, new: windowTitle)
             } else {
                 // A control's title change is content. The contract has no
                 // separate control-title kind, so it rides "value" (with the
@@ -4743,7 +4855,8 @@ private final class OverlayController {
                 watchLastValues["t:" + String(key)] = newValue
                 emitWatchEvent(kind: "value", role: role, label: watchLabel(element),
                                window: watchWindowLine(element),
-                               old: stored, new: newValue)
+                               old: stored, new: newValue,
+                               surfaceLabel: watchFocusedLabelText(element))
             }
         case kAXValueChangedNotification:
             let key = Int(CFHash(element))
@@ -4755,7 +4868,9 @@ private final class OverlayController {
             emitWatchEvent(kind: "value", role: watchRole(element),
                            label: watchLabel(element),
                            window: watchWindowLine(element),
-                           old: oldValue, new: newValue)
+                           old: oldValue, new: newValue,
+                           surfaceLabel: watchFocusedLabelText(element),
+                           surfaceValue: newValue)
         case kAXSelectedChildrenChangedNotification:
             let key = Int(CFHash(element))
             let newValue = watchSelectedText(element)
@@ -4766,7 +4881,9 @@ private final class OverlayController {
             emitWatchEvent(kind: "value", role: watchRole(element),
                            label: watchLabel(element),
                            window: watchWindowLine(element),
-                           old: oldValue, new: newValue)
+                           old: oldValue, new: newValue,
+                           surfaceLabel: watchFocusedLabelText(element),
+                           surfaceValue: newValue)
         case kAXApplicationActivatedNotification:
             emitWatchEvent(kind: "activated", role: "AXApplication",
                            label: watchAppName, window: watchFocusedWindowTitle())
@@ -4780,6 +4897,38 @@ private final class OverlayController {
 
     private func watchRole(_ element: AXUIElement) -> String {
         return axNonEmpty(axString(element, "AXRole")) ?? "unknown"
+    }
+
+    /// AXTitle, else AXDescription — the LABEL surface. Deliberately no AXValue
+    /// fallback: the value is its own surface and is compared separately.
+    private func watchFocusedLabelText(_ element: AXUIElement) -> String? {
+        for name in ["AXTitle", "AXDescription"] {
+            if let text = axNonEmpty(axString(element, name)) {
+                return String(text.prefix(watchLabelLimit))
+            }
+        }
+        return nil
+    }
+
+    /// A control whose AXValue is text the user reads (a terminal's output, an
+    /// editor's body, a field's contents).
+    private func isWatchTextRole(_ element: AXUIElement) -> Bool {
+        let role = axNonEmpty(axString(element, "AXRole")) ?? ""
+        return role == "AXTextArea" || role == "AXTextField"
+    }
+
+    /// Terminal titles are the command line, not the pane content. Matching the
+    /// window surface there reports a hit before any output exists (measured:
+    /// `until: "BUILD OK"` fired on the window title while `sleep 70; echo
+    /// BUILD OK` was still running).
+    private func isTerminalApp(_ app: NSRunningApplication) -> Bool {
+        let name = (app.localizedName ?? "").lowercased()
+        if name.contains("terminal") {
+            return true
+        }
+        let bundle = app.bundleIdentifier ?? ""
+        return bundle == "com.apple.Terminal"
+            || bundle == "com.googlecode.iterm2"
     }
 
     /// AXTitle, else AXDescription, else AXValue — trimmed to 120 chars.
@@ -4875,11 +5024,16 @@ private final class OverlayController {
     /// same second. The hit is emitted once per arm (`watchHitArmed`), then the
     /// watch keeps observing but stops matching until a new watch_start.
     private func emitWatchEvent(kind: String, role: String?, label: String?,
-                                window: String?, old: String? = nil, new: String? = nil) {
+                                window: String?, old: String? = nil,
+                                new: String? = nil, surfaceLabel: String? = nil,
+                                surfaceValue: String? = nil) {
         guard watchObserver != nil, !isShuttingDown else {
             return
         }
         let now = Date()
+        // Window notifications name the window surface; everything else is a
+        // control event where value/label are the meaningful surfaces.
+        let windowEvent = role == "AXWindow" || kind.hasPrefix("window")
 
         if watchHitArmed, let until = watchUntil, !until.isEmpty {
             let needle = until.lowercased()
@@ -4890,8 +5044,50 @@ private final class OverlayController {
             // Measured miss: watch("Finder", until: "Downloads") sat at
             // "no hit" while every event carried window "Downloads".
             let windowText = (window ?? "").lowercased()
-            if labelText.contains(needle) || valueText.contains(needle)
-                || windowText.contains(needle) {
+            let labelHit = labelText.contains(needle) || valueText.contains(needle)
+            // Attribute the match to the surface it came from: `label` is
+            // AXTitle/AXDescription, `value` is AXValue (the terminal pane's
+            // output), `window` is the frontmost window title. A caller that
+            // has the element passes both surfaces explicitly, so a display
+            // label falling back to AXValue never gets named "label".
+            let labelSurfaceText = (surfaceLabel ?? label ?? "").lowercased()
+            let valueSurfaceText = (surfaceValue ?? "").lowercased()
+            var matched: String?
+            if windowEvent {
+                if !watchWindowSurfaceDisabled,
+                   windowText.contains(needle),
+                   watchSurfaceFires(
+                       "window",
+                       transitioned: watchWindowTransitioned(
+                           text: window, previous: old, needle: needle)) {
+                    matched = "window"
+                }
+            } else if valueSurfaceText.contains(needle),
+                      watchSurfaceFires(
+                        "value",
+                        transitioned: watchValueTransitioned(
+                            old: old ?? watchPreviousValueText, needle: needle)) {
+                matched = "value"
+            } else if labelHit, labelSurfaceText.contains(needle),
+                      watchSurfaceFires(
+                        "label",
+                        transitioned: watchLabelTransitioned(
+                            text: labelSurfaceText, needle: needle)) {
+                matched = "label"
+            } else if windowText.contains(needle),
+                      !watchWindowSurfaceDisabled,
+                      watchSurfaceFires(
+                        "window",
+                        // This event is about a CONTROL, so `old` is the
+                        // control's previous value/title, never a window
+                        // title. Compare against the title the watch last saw,
+                        // or a pre-existing title would refire on every event.
+                        transitioned: watchWindowTransitioned(
+                            text: window, previous: watchPreviousWindowText,
+                            needle: needle)) {
+                matched = "window"
+            }
+            if let matched = matched {
                 watchHitArmed = false
                 var hit: [String: Any] = [
                     "op": "watch-hit",
@@ -4900,12 +5096,25 @@ private final class OverlayController {
                     "label": label ?? "",
                     "window": window ?? "",
                     "at": now.timeIntervalSince1970,
+                    "matched": matched,
+                    "baseline_had": watchPreexistingSurfaces.sorted(),
                 ]
                 if let token = watchToken {
                     hit["token"] = token
                 }
                 writeWatchLine(hit)
             }
+        }
+        // Remember what each surface looked like, so the NEXT event can tell a
+        // transition into the needle from a baseline that already had it.
+        if let text = window, !text.isEmpty {
+            watchPreviousWindowText = text
+        }
+        if !windowEvent, let text = surfaceLabel ?? label, !text.isEmpty {
+            watchPreviousLabelText = text
+        }
+        if let text = surfaceValue {
+            watchPreviousValueText = text
         }
 
         watchEmitTimes.removeAll { now.timeIntervalSince($0) > watchRateWindow }
@@ -4949,6 +5158,48 @@ private final class OverlayController {
             payload["new"] = new
         }
         writeWatchLine(payload)
+    }
+
+    /// Does a surface that contains the needle get to fire?
+    ///
+    /// A surface the arm-time baseline already found is suppressed until the
+    /// text CHANGES from a version without the needle into one with it — that
+    /// is exactly the transition rule, and it is what turns a terminal's
+    /// command-echo title into "no news" while the real output still fires.
+    /// A surface that was clean at arm keeps firing as before.
+    private func watchSurfaceFires(_ surface: String, transitioned: Bool) -> Bool {
+        if watchPreexistingSurfaces.contains(surface) {
+            return transitioned
+        }
+        return true
+    }
+
+    /// A TITLE transition: the text CHANGED into a string containing the
+    /// needle. The brief allows "a title change into a string containing the
+    /// needle" even when the previous title also contained it (`BUILD OK (1)`
+    /// → `BUILD OK (2)`); an unchanged title is not a transition.
+    private func watchWindowTransitioned(text: String?, previous: String?,
+                                         needle: String) -> Bool {
+        guard let text = text, text.lowercased().contains(needle),
+              let old = previous ?? watchPreviousWindowText else {
+            return false
+        }
+        return old.lowercased() != text.lowercased()
+    }
+
+    private func watchLabelTransitioned(text: String, needle: String) -> Bool {
+        guard text.lowercased().contains(needle),
+              let previous = watchPreviousLabelText else {
+            return false
+        }
+        return previous.lowercased() != text.lowercased()
+    }
+
+    private func watchValueTransitioned(old: String?, needle: String) -> Bool {
+        guard let old = old else {
+            return false
+        }
+        return !old.lowercased().contains(needle)
     }
 
     /// Find the core Hermes pet pop-out. Identification is owner pid + shape

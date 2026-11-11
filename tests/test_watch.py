@@ -1201,3 +1201,149 @@ def test_status_says_baseline_unknown_until_the_ack_lands(
 
     assert line == ('scan: author "Adolan" · roles AXImage,AXButton,AXLink '
                     '· baseline ? · 0 ticks · no hit')
+
+
+# ------------------------------------- WHICH surface matched (round 15)
+#
+# A hit used to be a bare "something contained the needle". A Terminal's
+# window title IS its command line, so `until: "BUILD OK"` matched the typing
+# of `echo BUILD OK` immediately, consumed the one-shot hit, and nothing was
+# watching when the output actually landed. The companion now records which
+# surfaces already contained the needle at arm (`baseline_had`) and only fires
+# those on a transition; the hit says WHICH surface fired (`matched`).
+
+def _terminal(tmp_path: Path, monkeypatch, until="BUILD OK"):
+    overlay = FakeOverlay([{
+        "op": "watch-started", "app": "Terminal", "until": until,
+        "baseline_had": ["window"], "window_title_disabled": True,
+    }])
+    monkeypatch.setattr(engine, "_OVERLAY", overlay)
+    return overlay, engine.start_watch("Terminal", until=until)
+
+
+def test_the_arm_reply_records_the_preexisting_surfaces(
+        tmp_path: Path, monkeypatch) -> None:
+    """`baseline_had` names the trap, and the status says why it is waiting."""
+    _overlay, result = _terminal(tmp_path, monkeypatch)
+
+    assert result["baseline_had"] == ["window"]
+    assert result["window_title_disabled"] is True
+    row = _state(tmp_path)["watch"]
+    assert row["baseline_had"] == ["window"]
+    assert row["window_title_disabled"] is True
+
+    lines = engine.watch_status().splitlines()
+    assert lines[0] == "watching Terminal for BUILD OK · 0 events · no hit"
+    assert lines[1] == (
+        'at arm: window title already contained "BUILD OK" (command echo) '
+        '— waiting for the value to change')
+    assert lines[2] == "title matching disabled for terminal app"
+
+
+def test_a_value_transition_hit_names_the_value_surface(
+        tmp_path: Path, monkeypatch) -> None:
+    """Exactly one announcement, and it says the OUTPUT matched (not the title)."""
+    _overlay, _result = _terminal(tmp_path, monkeypatch)
+    said = []
+    monkeypatch.setattr(engine, "say",
+                        lambda text: said.append(text) or {"ok": True})
+
+    hit = {"op": "watch-hit", "app": "Terminal", "until": "BUILD OK",
+           "label": "BUILD OK", "window": "sleep 70; echo BUILD OK",
+           "matched": "value", "baseline_had": ["window"],
+           "at": 1_794_330_019.0}
+    engine._on_overlay_event(hit)
+    engine._on_overlay_event(hit)  # a duplicate line must not speak twice
+
+    assert said == ["Terminal: BUILD OK appeared"]
+    state = _state(tmp_path)
+    assert state["watch"]["hit"]["matched"] == "value"
+    assert state["watch"]["hit"]["baseline_had"] == ["window"]
+    assert state["watch_hit"]["matched"] == "value"
+    assert state["watch_hit"]["baseline_had"] == ["window"]
+    assert state["watch"]["stopped"]["reason"] == "hit"
+
+    lines = engine.watch_status().splitlines()
+    assert lines[1].startswith('hit: value — "BUILD OK" (output) at ')
+    assert all("at arm:" not in line for line in lines), (
+        "a hit is not still described as waiting")
+
+
+def test_a_window_surface_hit_says_window(tmp_path: Path, monkeypatch) -> None:
+    """Everyone else keeps window-first behaviour, and the status names it."""
+    _start(tmp_path, monkeypatch, until="Export complete")
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+
+    engine._on_overlay_event({
+        "op": "watch-hit", "app": "Slack", "until": "Export complete",
+        "label": "Export complete", "window": "Export complete — Preview",
+        "matched": "window", "baseline_had": [],
+        "at": 1_794_330_012.0})
+
+    lines = engine.watch_status().splitlines()
+    assert lines[1].startswith(
+        'hit: window — "Export complete" (window title) at ')
+
+
+def test_a_hit_without_a_surface_keeps_the_legacy_line(
+        tmp_path: Path, monkeypatch) -> None:
+    """An older companion's hit payload still renders the old sentence."""
+    _start(tmp_path, monkeypatch, until="Export complete")
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+
+    engine._on_overlay_event({
+        "op": "watch-hit", "app": "Slack", "until": "Export complete",
+        "label": "Export complete", "window": "general — Slack",
+        "at": 1_794_330_012.0})
+
+    assert engine.watch_status().splitlines()[1].startswith(
+        "hit: Export complete — general — Slack at ")
+
+
+# ------------------------------------------------------- capture value field
+
+def _capture_reply(elements):
+    return {"trusted": True, "app": "Terminal", "window": "shell",
+            "count": len(elements), "with_box": 1, "elements": elements}
+
+
+def test_capture_carries_the_ax_value_of_a_text_area(monkeypatch) -> None:
+    """`value` is its own field: a terminal's content reaches the payload."""
+    from butler_core import capture as bp_capture
+
+    reply = _capture_reply([{
+        "role": "AXTextArea", "label": "shell", "value": "BUILD OK\n➜",
+        "box": [10, 20, 30, 40], "id": 0,
+    }])
+    monkeypatch.setattr(bp_capture, "HAS_MAC", True)
+    monkeypatch.setattr(bp_capture, "_request", lambda op, timeout=None: reply)
+
+    snap = bp_capture.capture(target="Terminal")
+
+    element = snap["elements"][0]
+    assert element["value"] == "BUILD OK\n➜"
+    assert element["label"] == "shell", "label keeps its derivation"
+    assert "truncated" not in element
+
+
+def test_capture_keeps_the_optional_value_fields_optional(
+        monkeypatch) -> None:
+    """Absent stays absent (no null keys), and a cut value keeps its marker."""
+    from butler_core import capture as bp_capture
+
+    long_value = "x" * 200 + "…"
+    reply = _capture_reply([
+        {"role": "AXTextArea", "label": "shell", "value": long_value,
+         "truncated": True, "box": [0, 0, 10, 10], "id": 0},
+        {"role": "AXButton", "label": "Export", "box": [0, 0, 10, 10], "id": 1},
+    ])
+    monkeypatch.setattr(bp_capture, "HAS_MAC", True)
+    monkeypatch.setattr(bp_capture, "_request", lambda op, timeout=None: reply)
+
+    elements = bp_capture.capture()["elements"]
+
+    assert elements[0]["value"] == long_value
+    assert elements[0]["truncated"] is True
+    assert elements[0]["label"] == "shell"
+    assert "value" not in elements[1]
+    assert "truncated" not in elements[1]
