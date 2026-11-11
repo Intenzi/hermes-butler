@@ -76,11 +76,11 @@ def _isolated(tmp_path: Path):
     _reset()
 
 
-def _start(tmp_path: Path, monkeypatch, until=None, replies=None):
+def _start(tmp_path: Path, monkeypatch, until=None, replies=None, once=True):
     overlay = FakeOverlay(replies if replies is not None
                           else [{"op": "watch-started", "app": "Slack"}])
     monkeypatch.setattr(engine, "_OVERLAY", overlay)
-    result = engine.start_watch("Slack", until=until)
+    result = engine.start_watch("Slack", until=until, once=once)
     return overlay, result
 
 
@@ -353,6 +353,161 @@ def test_a_hit_without_a_condition_still_records(
     assert engine._watch["hit"]["label"] == ""
 
 
+# ----------------------------------------------------- hit lifecycle (round 20)
+
+def test_a_hit_ends_a_one_shot_watch_by_default(
+        tmp_path: Path, monkeypatch) -> None:
+    """The request was "tell me when X appears"; X appeared, so the watch ends.
+
+    One announcement, a terminal ``stopped.reason == "hit"`` row, one
+    ``watch_stop`` to the companion, and no second announcement — ever.
+    """
+    overlay, result = _start(tmp_path, monkeypatch, until="Export complete")
+    assert result["once"] is True
+    assert engine._watch["once"] is True
+    said = []
+    monkeypatch.setattr(engine, "say", lambda text: said.append(text) or {"ok": True})
+    engine._on_overlay_event(_event(1))
+    hit = {"op": "watch-hit", "app": "Slack", "until": "Export complete",
+           "label": "Export complete", "window": "general — Slack",
+           "at": 1_794_330_012.0}
+
+    engine._on_overlay_event(hit)
+
+    assert said == ["Slack: Export complete appeared"], "announced exactly once"
+    assert engine._watch["hit"]["label"] == "Export complete"
+    assert engine._watch["stopped"]["reason"] == "hit"
+    assert engine._watch["stopped"]["events"] == 1
+    assert overlay.sends == [{"op": "watch_stop"}], (
+        "the engine detaches the observers itself; no Stop hunting")
+    state = _state(tmp_path)
+    assert state["watch"]["stopped"]["reason"] == "hit"
+    assert state["watch"]["once"] is True
+
+    # The companion's answer to OUR watch_stop must not rewrite the reason.
+    engine._on_overlay_event({"op": "watch-stopped",
+                              "token": engine._watch["token"],
+                              "events": 1, "reason": "stopped"})
+    assert engine._watch["stopped"]["reason"] == "hit"
+
+    # A second event and a duplicate hit line cannot re-open or re-say it.
+    engine._on_overlay_event(_event(2))
+    engine._on_overlay_event(hit)
+    assert engine._watch["events"] == 1, "a stopped watch stays inert"
+    assert said == ["Slack: Export complete appeared"]
+    assert overlay.sends == [{"op": "watch_stop"}]
+
+
+def test_the_one_shot_row_is_published_before_the_stop_is_sent(
+        tmp_path: Path, monkeypatch) -> None:
+    """A /state poll must never see `hit` without its terminal `stopped`.
+
+    Also: the companion is told OUTSIDE ``_watch_lock``. A blocking request
+    transport (and a synchronous test double) under the lock would stall or
+    re-enter the row it is mutating.
+    """
+    overlay, _result = _start(tmp_path, monkeypatch, until="Export complete")
+    seen = []
+
+    def send(op):
+        overlay.sends.append(op)
+        seen.append({
+            "locked": engine._watch_lock._is_owned(),
+            "reason": _state(tmp_path)["watch"]["stopped"]["reason"],
+        })
+
+    overlay.send = send
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+
+    engine._on_overlay_event({"op": "watch-hit", "app": "Slack",
+                              "label": "Export complete", "at": 5.0})
+
+    assert overlay.sends == [{"op": "watch_stop"}]
+    assert seen == [{"locked": False, "reason": "hit"}]
+
+
+def test_an_empty_or_unknown_once_spelling_stays_one_shot(
+        tmp_path: Path, monkeypatch) -> None:
+    """Sticky is the opt-in: a blank/unknown flag must not select it silently."""
+    overlay = FakeOverlay([{"op": "watch-started", "app": "Slack"}])
+    monkeypatch.setattr(engine, "_OVERLAY", overlay)
+
+    result = engine.start_watch("Slack", until="Export complete", once="")
+
+    assert result["once"] is True
+    assert engine._watch["once"] is True
+
+    overlay.replies.append({"op": "watch-started", "app": "Slack"})
+    sticky = engine.start_watch("Slack", until="Export complete", once="false")
+
+    assert sticky["once"] is False
+    assert engine._watch["once"] is False
+
+
+def test_a_sticky_hit_keeps_observing_and_never_reannounces(
+        tmp_path: Path, monkeypatch) -> None:
+    overlay, _result = _start(tmp_path, monkeypatch, until="Export complete",
+                              once=False)
+    assert engine._watch["once"] is False
+    said = []
+    monkeypatch.setattr(engine, "say", lambda text: said.append(text) or {"ok": True})
+    hit = {"op": "watch-hit", "app": "Slack", "label": "Export complete",
+           "window": "general — Slack", "at": 1_794_330_012.0}
+
+    engine._on_overlay_event(hit)
+
+    assert said == ["Slack: Export complete appeared"]
+    assert engine._watch["stopped"] is None, "sticky keeps watching"
+    assert engine._watch["hit"]["acknowledged"] is False
+    assert overlay.sends == [], "no stop request in sticky mode"
+    assert _state(tmp_path)["watch"]["hit"]["acknowledged"] is False
+
+    # Further matches and changes still flow, but the hit speaks only once.
+    engine._on_overlay_event(_event(1))
+    engine._on_overlay_event(dict(hit, at=1_794_330_020.0))
+    assert engine._watch["events"] == 1
+    assert engine._watch["stopped"] is None
+    assert said == ["Slack: Export complete appeared"]
+
+
+def test_watch_ack_clears_the_hit_and_keeps_the_watch(
+        tmp_path: Path, monkeypatch) -> None:
+    _start(tmp_path, monkeypatch, until="Export complete", once=False)
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    engine._on_overlay_event({"op": "watch-hit", "app": "Slack",
+                              "label": "Export complete", "at": 5.0})
+
+    result = engine.acknowledge_watch_hit()
+
+    assert result == {"status": "acknowledged", "acknowledged": True,
+                      "app": "Slack", "events": 0}
+    assert engine._watch["hit"] is None, "the hit is cleared, not remembered"
+    assert engine._watch["stopped"] is None, "the watch is still live"
+    assert _state(tmp_path)["watch"]["hit"] is None
+    # The watch still observes after the acknowledgement.
+    engine._on_overlay_event(_event(1))
+    assert engine._watch["events"] == 1
+    # A second ack is an honest false, not an exception.
+    again = engine.acknowledge_watch_hit()
+    assert again["acknowledged"] is False
+    assert again["status"] == "no-hit"
+
+
+def test_watch_ack_is_false_for_a_one_shot_hit_and_when_idle(
+        tmp_path: Path, monkeypatch) -> None:
+    _start(tmp_path, monkeypatch, until="Export complete")
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    engine._on_overlay_event({"op": "watch-hit", "app": "Slack",
+                              "label": "Export complete", "at": 5.0})
+
+    assert engine.acknowledge_watch_hit()["acknowledged"] is False
+    assert engine._watch["stopped"]["reason"] == "hit", "the ending still stands"
+
+    engine.stop_watch()
+    assert engine.acknowledge_watch_hit() == {"status": "idle",
+                                              "acknowledged": False}
+
+
 # ------------------------------------------------------------------ status
 
 def test_watch_status_has_the_header_and_ten_event_lines(
@@ -560,14 +715,18 @@ def _registered(tmp_path: Path) -> dict:
     return {row["name"]: row for row in ctx.tools}
 
 
-def test_register_installs_the_three_watch_tools(tmp_path: Path) -> None:
+def test_register_installs_the_four_watch_tools(tmp_path: Path) -> None:
     tools = _registered(tmp_path)
 
     assert tools["butler_watch_start"]["schema"]["required"] == ["app"]
     assert tools["butler_watch_start"]["schema"]["properties"]["until"]["type"] == "string"
+    assert tools["butler_watch_start"]["schema"]["properties"]["once"]["type"] == "boolean"
+    assert tools["butler_watch_start"]["schema"]["properties"]["once"]["default"] is True
     assert tools["butler_watch_status"]["schema"]["properties"] == {}
     assert tools["butler_watch_stop"]["schema"]["properties"] == {}
-    for name in ("butler_watch_start", "butler_watch_status", "butler_watch_stop"):
+    assert tools["butler_watch_ack"]["schema"]["properties"] == {}
+    for name in ("butler_watch_start", "butler_watch_status",
+                 "butler_watch_stop", "butler_watch_ack"):
         assert tools[name]["toolset"] == "butler"
 
 
@@ -578,6 +737,8 @@ def test_the_watch_tools_answer_even_without_a_companion(tmp_path: Path) -> None
         "status": "no watch active"}
     assert json.loads(tools["butler_watch_stop"]["handler"]({})) == {
         "status": "idle"}
+    assert json.loads(tools["butler_watch_ack"]["handler"]({})) == {
+        "status": "idle", "acknowledged": False}
     assert json.loads(tools["butler_watch_start"]["handler"]({})) == {
         "error": "app is required"}
 

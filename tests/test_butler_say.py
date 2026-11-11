@@ -89,6 +89,7 @@ def test_register_installs_butler_say_with_a_required_text_schema(tmp_path: Path
         "butler_watch_start",
         "butler_watch_status",
         "butler_watch_stop",
+        "butler_watch_ack",
     ]
 
 

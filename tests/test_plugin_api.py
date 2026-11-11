@@ -260,6 +260,69 @@ def test_watch_stop_endpoint_is_honest_when_no_watch_exists(
     assert response.json() == {"ok": True, "status": "idle"}
 
 
+def test_watch_ack_endpoint_clears_the_hit_and_keeps_the_watch(
+        client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sticky watch's "thank you": clear the hit, keep observing."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    engine.init(bp_paths.plugin_data_dir("butler"))
+    engine._watch = None
+    engine._watch_ring.clear()
+
+    class FakeOverlay:
+        sends = []
+
+        def is_running(self):
+            return False
+
+    monkeypatch.setattr(engine, "_OVERLAY", FakeOverlay())
+    engine._watch = {
+        "app": "Slack", "until": "Export complete", "once": False,
+        "token": "tok-1", "owner_pid": os.getpid(), "started_at": time.time(),
+        "events": 5, "hit": {"label": "Export complete", "window": None,
+                             "at": time.time(), "acknowledged": False},
+        "stopped": None, "recent": [],
+    }
+    engine._write_state()
+    assert client.get("/state").json()["watch"]["hit"]["label"] == "Export complete"
+
+    response = client.post("/watch/ack")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True, "status": "acknowledged", "acknowledged": True,
+        "app": "Slack", "events": 5,
+    }
+    state = client.get("/state").json()
+    assert state["watch"]["hit"] is None, "the hit is cleared"
+    assert state["watch"]["stopped"] is None, "the watch still runs"
+    assert state["watch"]["app"] == "Slack"
+
+    # A second ack is an honest false, not an error.
+    again = client.post("/watch/ack")
+    assert again.status_code == 200
+    assert again.json()["acknowledged"] is False
+    assert again.json()["status"] == "no-hit"
+
+    # The pane's Stop still fully stops (and clears) the same row.
+    stopped = client.post("/watch/stop")
+    assert stopped.json()["status"] == "stopped"
+    assert "watch" not in client.get("/state").json()
+
+
+def test_watch_ack_endpoint_is_honest_when_no_watch_exists(
+        client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    engine.init(bp_paths.plugin_data_dir("butler"))
+    engine._watch = None
+    engine._watch_ring.clear()
+
+    response = client.post("/watch/ack")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "status": "idle",
+                               "acknowledged": False}
+
+
 def test_summon_pet_is_a_noop_without_a_petdex_pet(
         client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     (Path(os.environ["HERMES_HOME"]) / "pets").mkdir()
