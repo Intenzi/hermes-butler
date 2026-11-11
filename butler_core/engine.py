@@ -106,6 +106,9 @@ WATCH_SURFACE_ARM = {"window": "window title", "label": "label",
                      "value": "value"}
 WATCH_SURFACE_HIT = {"window": "window title", "label": "control label",
                      "value": "output"}
+#: A value hit carries the appended delta as ``new_text``. It is capped the
+#: same way a capture value is: a cut string ends with an ellipsis.
+WATCH_NEW_TEXT_LIMIT = 200
 
 # A guide block on the shared snapshot is LIVE status only while the guide is
 # actually being walked (running/capture_failed/stalled). Once terminal, the
@@ -1191,6 +1194,39 @@ def _watch_clock(value):
         return "--:--:--"
 
 
+def _watch_new_text(value):
+    """The value-hit delta: non-empty, stripped, capped with ``…`` like capture."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    # The companion already caps (grapheme-aware); re-cutting it here would
+    # change a payload Swift measured as 200 characters.
+    if text.endswith("\u2026"):
+        return text
+    if len(text) > WATCH_NEW_TEXT_LIMIT:
+        return text[:WATCH_NEW_TEXT_LIMIT] + "\u2026"
+    return text
+
+
+def _watch_matched_line(text, needle):
+    """The one line a value hit's status row should quote.
+
+    ``new_text`` is the whole delta (maybe several appended lines); the status
+    line reads the first line that carries the needle, never the buffer.
+    """
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if isinstance(needle, str) and needle:
+        wanted = needle.lower()
+        for line in lines:
+            if wanted in line.lower():
+                return line
+    return lines[0]
+
+
 def _watch_event_line(event):
     line = "%s %s %s" % (_watch_clock(event.get("at")),
                          event.get("kind") or "?",
@@ -1350,6 +1386,11 @@ def _handle_watch_message(event):
             matched = event.get("matched")
             if isinstance(matched, str) and matched in WATCH_SURFACES:
                 hit["matched"] = matched
+            # A value hit names WHAT the buffer gained, not the whole
+            # scrollback: the status line and the agent both read this.
+            new_text = _watch_new_text(event.get("new_text"))
+            if new_text:
+                hit["new_text"] = new_text
             surfaces = event.get("baseline_had")
             if isinstance(surfaces, list):
                 hit["baseline_had"] = [
@@ -1382,6 +1423,9 @@ def _handle_watch_message(event):
                 # The surface survives the ended watch row too: the status/desk
                 # text still says which one fired.
                 watch_hit["matched"] = hit["matched"]
+            if hit.get("new_text"):
+                # The matched line outlives the watch row with the surface.
+                watch_hit["new_text"] = hit["new_text"]
             if hit.get("baseline_had") is not None:
                 watch_hit["baseline_had"] = hit["baseline_had"]
             # Remember that THIS process published the top-level block, so a
@@ -1771,9 +1815,13 @@ def watch_status():
         matched = hit.get("matched")
         if matched in WATCH_SURFACES:
             # Name the surface: a terminal hit came from the pane's value (the
-            # output), not from its window title (the command line).
+            # output), not from its window title (the command line). A value
+            # hit reads the appended delta it fired on, never the whole buffer.
+            detail = hit.get("label") or ""
+            if matched == "value" and hit.get("new_text"):
+                detail = _watch_matched_line(hit["new_text"], until)
             lines.append('hit: %s \u2014 "%s" (%s) at %s' % (
-                matched, hit.get("label") or "", WATCH_SURFACE_HIT[matched],
+                matched, detail, WATCH_SURFACE_HIT[matched],
                 _watch_clock(hit.get("at"))))
         else:
             suffix = (" \u2014 %s" % hit["window"]) if hit.get("window") else ""

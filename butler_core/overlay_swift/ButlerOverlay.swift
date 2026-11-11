@@ -1270,6 +1270,13 @@ private let watchMaxEventsPerSecond = 4
 private let watchDuplicateWindow: TimeInterval = 0.15
 private let watchRateWindow: TimeInterval = 1.0
 private let watchLabelLimit = 120
+/// The value surface is a WHOLE buffer, not a per-line field: a terminal's
+/// AXValue is its scrollback. The display cap stays at `watchLabelLimit`, but
+/// the delta needs enough of the real old/new text to compare them.
+private let watchValueFullLimit = 200_000
+/// A value hit's `new_text` is the appended delta, capped like a capture value
+/// (a cut string ends with an ellipsis).
+private let watchHitTextLimit = 200
 private let watchLivenessInterval: TimeInterval = 2.0
 
 /// Content SCAN defaults: a repeating walk of the app's AX tree compared with
@@ -4282,6 +4289,9 @@ private final class OverlayController {
         let armWindowText = watchFocusedWindowTitle()
         let armLabelText = armFocused.flatMap { watchFocusedLabelText($0) }
         let armValueText = armFocused.flatMap { axWatchRawValueText($0) }
+        // The value delta compares the whole buffer; the display-capped read
+        // above is only the at-arm "already contained it" test.
+        let armValueFullText = armFocused.flatMap { axWatchFullValueText($0) }
         // Role-aware default surface: a terminal's window title is the command
         // line. With a text control focused there, a title match is the command
         // echoing, not the output finishing.
@@ -4303,6 +4313,11 @@ private final class OverlayController {
         watchPreviousWindowText = armWindowText
         watchPreviousLabelText = armLabelText
         watchPreviousValueText = armValueText
+        if let element = armFocused, let fullValue = armValueFullText {
+            // The first AXValueChanged must compare against the REAL buffer,
+            // not the display-capped read used only for `baseline_had`.
+            watchLastValues[String(Int(CFHash(element)))] = fullValue
+        }
         var started: [String: Any] = [
             "op": "watch-started",
             "app": watchAppName ?? spec.app,
@@ -4522,8 +4537,10 @@ private final class OverlayController {
             _ = AXObserverAddNotification(observer, focused, name as CFString, refcon)
         }
         // Seed the value baseline: the first AXValueChanged on this control can
-        // then report a readable old value instead of only the new one.
-        if watchLastValues[String(key)] == nil, let value = axWatchRawValueText(focused) {
+        // then report a readable old value instead of only the new one. The
+        // seed is UNTRUNCATED because the value surface is compared by delta.
+        if watchLastValues[String(key)] == nil,
+           let value = axWatchFullValueText(focused) {
             watchLastValues[String(key)] = value
         }
     }
@@ -4860,7 +4877,10 @@ private final class OverlayController {
             }
         case kAXValueChangedNotification:
             let key = Int(CFHash(element))
-            let newValue = axWatchRawValueText(element)
+            // The full value feeds the delta matcher; the capped value is what
+            // the event line and the hit's display label carry.
+            let newValue = axWatchFullValueText(element)
+            let displayValue = newValue.map { String($0.prefix(watchLabelLimit)) }
             let oldValue = watchLastValues[String(key)]
             if let newValue = newValue {
                 watchLastValues[String(key)] = newValue
@@ -4870,7 +4890,7 @@ private final class OverlayController {
                            window: watchWindowLine(element),
                            old: oldValue, new: newValue,
                            surfaceLabel: watchFocusedLabelText(element),
-                           surfaceValue: newValue)
+                           surfaceValue: displayValue)
         case kAXSelectedChildrenChangedNotification:
             let key = Int(CFHash(element))
             let newValue = watchSelectedText(element)
@@ -4952,6 +4972,18 @@ private final class OverlayController {
         }
         return String(text.trimmingCharacters(in: .whitespacesAndNewlines)
             .prefix(watchLabelLimit))
+    }
+
+    /// The same AXValue WITHOUT the display cap. A terminal's value is its
+    /// whole scrollback, so "what did this buffer gain?" can only be answered
+    /// from the real old/new strings; the capped read is for event payloads.
+    private func axWatchFullValueText(_ element: AXUIElement) -> String? {
+        guard let raw = copyAXAttribute(element, "AXValue"),
+              let text = raw as? String else {
+            return nil
+        }
+        return String(text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .prefix(watchValueFullLimit))
     }
 
     /// The value only counts when it is a readable NON-EMPTY string: a label
@@ -5052,6 +5084,22 @@ private final class OverlayController {
             // label falling back to AXValue never gets named "label".
             let labelSurfaceText = (surfaceLabel ?? label ?? "").lowercased()
             let valueSurfaceText = (surfaceValue ?? "").lowercased()
+            // VALUE is a whole buffer (a terminal's scrollback), so containment
+            // alone is not news: a scrollback that already said "BUILD OK"
+            // will say it again on every re-render. Only what the buffer
+            // GAINED can fire. When no delta is computable (old empty or
+            // unreadable), fall back to the round-15 transition rule — never to
+            // bare containment.
+            let valueDelta = surfaceValue != nil
+                ? watchValueDelta(old: old, new: new)
+                : nil
+            let valueDeltaHit = valueDelta.map {
+                $0.lowercased().contains(needle)
+            } ?? false
+            let valueFallbackHit = !valueSurfaceText.isEmpty && valueDelta == nil
+                && valueText.contains(needle)
+                && watchValueTransitioned(old: old, needle: needle)
+            let valueHit = valueDeltaHit || valueFallbackHit
             var matched: String?
             if windowEvent {
                 if !watchWindowSurfaceDisabled,
@@ -5062,11 +5110,7 @@ private final class OverlayController {
                            text: window, previous: old, needle: needle)) {
                     matched = "window"
                 }
-            } else if valueSurfaceText.contains(needle),
-                      watchSurfaceFires(
-                        "value",
-                        transitioned: watchValueTransitioned(
-                            old: old ?? watchPreviousValueText, needle: needle)) {
+            } else if valueHit {
                 matched = "value"
             } else if labelHit, labelSurfaceText.contains(needle),
                       watchSurfaceFires(
@@ -5101,6 +5145,14 @@ private final class OverlayController {
                 ]
                 if let token = watchToken {
                     hit["token"] = token
+                }
+                if matched == "value" {
+                    // The delta, not the whole scrollback: the status line and
+                    // the agent see the line that actually matched. A fallback
+                    // (old unreadable) has no delta, so name the matching line.
+                    let evidence = valueDelta
+                        ?? watchMatchedLine(new ?? "", needle: needle)
+                    hit["new_text"] = watchHitText(evidence)
                 }
                 writeWatchLine(hit)
             }
@@ -5152,10 +5204,17 @@ private final class OverlayController {
             payload["token"] = token
         }
         // old/new when BOTH sides are readable strings (an empty string counts:
-        // clearing a field is a change worth showing).
+        // clearing a field is a change worth showing). A value event carries
+        // the FULL buffer into the matcher, so only its durable line is capped;
+        // window/label payloads keep exactly what they had before.
         if let old = old, let new = new {
-            payload["old"] = old
-            payload["new"] = new
+            if kind == "value" {
+                payload["old"] = String(old.prefix(watchLabelLimit))
+                payload["new"] = String(new.prefix(watchLabelLimit))
+            } else {
+                payload["old"] = old
+                payload["new"] = new
+            }
         }
         writeWatchLine(payload)
     }
@@ -5195,9 +5254,74 @@ private final class OverlayController {
         return previous.lowercased() != text.lowercased()
     }
 
+    /// What the VALUE buffer gained, or nil when no delta can be computed.
+    /// A terminal's AXValue is its whole scrollback, not a per-line field, so
+    /// containment alone would fire forever on text already there at arm.
+    private func watchValueDelta(old: String?, new: String?) -> String? {
+        guard let new = new, !new.isEmpty,
+              let old = old, !old.isEmpty else {
+            return nil
+        }
+        if new.hasPrefix(old) {
+            return String(new.dropFirst(old.count))
+        }
+        return watchLineDelta(old: old, new: new)
+    }
+
+    /// Count-aware line delta: a line twice in `new` and once in `old`
+    /// contributes one. This covers a terminal re-rendering its prompt row,
+    /// which breaks the pure-prefix assumption.
+    private func watchLineDelta(old: String, new: String) -> String {
+        let oldCounts = watchLineCounts(old)
+        var seen: [String: Int] = [:]
+        var added: [String] = []
+        for line in watchLines(new) {
+            let count = (seen[line] ?? 0) + 1
+            seen[line] = count
+            if count > (oldCounts[line] ?? 0) {
+                added.append(line)
+            }
+        }
+        return added.joined(separator: "\n")
+    }
+
+    private func watchLines(_ text: String) -> [String] {
+        return text.replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: "\n")
+    }
+
+    private func watchLineCounts(_ text: String) -> [String: Int] {
+        var counts: [String: Int] = [:]
+        for line in watchLines(text) {
+            counts[line, default: 0] += 1
+        }
+        return counts
+    }
+
+    /// The first line carrying the needle (case-insensitive), else the text.
+    /// Used for a fallback hit, where there is no delta to quote.
+    private func watchMatchedLine(_ text: String, needle: String) -> String {
+        for line in watchLines(text) where line.lowercased().contains(needle) {
+            return line
+        }
+        return text
+    }
+
+    /// Same rule as capture's value cap: a cut string ends with an ellipsis.
+    private func watchHitText(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > watchHitTextLimit else {
+            return trimmed
+        }
+        return String(trimmed.prefix(watchHitTextLimit)) + "\u{2026}"
+    }
+
+    /// The fallback when no delta can be computed (old empty or unreadable):
+    /// `new` contains the needle and `old` did not. An unreadable old cannot be
+    /// shown to contain it, so the containment test is allowed once.
     private func watchValueTransitioned(old: String?, needle: String) -> Bool {
         guard let old = old else {
-            return false
+            return true
         }
         return !old.lowercased().contains(needle)
     }

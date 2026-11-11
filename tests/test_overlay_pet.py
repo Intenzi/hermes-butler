@@ -1,13 +1,18 @@
 """Tests for overlay pet resolution, rebuild freshness, and pet-op startup."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import types
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -1570,6 +1575,291 @@ def test_a_terminal_text_control_never_matches_its_window_title() -> None:
     # ordinary control events; everyone else keeps window-first behaviour.
     assert emit.count("!watchWindowSurfaceDisabled") >= 2
     assert "windowText.contains(needle)" in emit
+
+
+# --------------------------- the value surface fires on the DELTA (round 16)
+#
+# A terminal's AXValue is the WHOLE scrollback, not a per-line field. Round 15
+# made a pre-existing value wait for "new contains the needle AND old does
+# not", which can never fire again: the next run appends another `BUILD OK`, so
+# every later `old` still contains it. The companion now matches what the
+# buffer GAINED. These tests pin the wiring AND run the pure delta helpers when
+# swiftc is available (source-only assertions are the suite's convention).
+
+
+def test_value_matching_is_delta_based_not_containment() -> None:
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    delta = _swift_function_body(source, "private func watchValueDelta(",
+                                 "private func watchLineDelta(")
+    # Prefix path: the appended tail is the delta.
+    assert "new.hasPrefix(old)" in delta
+    assert "String(new.dropFirst(old.count))" in delta
+    # Line-multiset fallback covers a terminal re-rendering a prompt row,
+    # which breaks the pure-prefix assumption.
+    assert "watchLineDelta(old: old, new: new)" in delta
+
+    line_delta = _swift_function_body(source, "private func watchLineDelta(",
+                                      "private func watchLines(")
+    assert "watchLineCounts(old)" in line_delta
+    assert "count > (oldCounts[line] ?? 0)" in line_delta, "count-aware"
+    assert "added.append(line)" in line_delta
+
+    emit = _swift_function_body(source, "private func emitWatchEvent(",
+                                "/// Find the core Hermes pet pop-out")
+    # VALUE fires on the delta, never on the buffer's containment.
+    assert "watchValueDelta(old: old, new: new)" in emit
+    assert "valueDelta.map {" in emit
+    assert "$0.lowercased().contains(needle)" in emit
+    assert "valueSurfaceText.contains(needle)" not in emit, (
+        "a whole-buffer containment test is the round-15 false positive")
+    # The hit keeps the delta for the status line and the agent.
+    assert "let evidence = valueDelta" in emit
+    assert "watchMatchedLine(new ?? \"\", needle: needle)" in emit
+    assert 'hit["new_text"] = watchHitText(evidence)' in emit
+    # No delta computable (old empty/unreadable) -> the round-15 fallback.
+    assert "valueDelta == nil" in emit
+    assert "valueText.contains(needle)" in emit
+    assert "watchValueTransitioned(old: old, needle: needle)" in emit
+    # One hit per arm still comes from the shared disarm.
+    assert "watchHitArmed = false" in emit
+
+
+def test_the_value_hit_text_is_capped_like_a_capture_value() -> None:
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    assert "private let watchHitTextLimit = 200" in source
+    cap = _swift_function_body(source, "private func watchHitText(",
+                               "private func watchValueTransitioned(")
+    assert "trimmed.count > watchHitTextLimit" in cap
+    assert 'String(trimmed.prefix(watchHitTextLimit)) + "\\u{2026}"' in cap
+
+
+def test_the_value_delta_reads_the_full_buffer_not_the_display_cap() -> None:
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+
+    full = _swift_function_body(source, "private func axWatchFullValueText(",
+                                "/// The value only counts when it is a readable")
+    assert "watchValueFullLimit" in full
+    assert "prefix(watchLabelLimit)" not in full, (
+        "a 120-char read can never see an appended line in a long scrollback")
+    value_event = _swift_function_body(
+        source, "case kAXValueChangedNotification:",
+        "case kAXSelectedChildrenChangedNotification:")
+    assert "axWatchFullValueText(element)" in value_event
+    assert "surfaceValue: displayValue" in value_event
+    # The arm baseline keeps its display read (the at-arm "already contained"
+    # test) and seeds the full buffer the first delta must compare against.
+    start = _swift_function_body(source, "private func startWatch(",
+                                 "private func resetWatchState()")
+    assert "axWatchFullValueText($0)" in start
+    assert "watchLastValues[String(Int(CFHash(element)))] = fullValue" in start
+
+
+_VALUE_DELTA_DRIVER = r'''
+func emitBase64(_ marker: String, _ text: String) {
+    let data = Data(text.utf8).base64EncodedString()
+    print(marker + data)
+}
+
+let arguments = CommandLine.arguments
+if arguments.count >= 2 {
+    switch arguments[1] {
+    case "delta":
+        var old: String? = nil
+        if arguments.count >= 3 && arguments[2] != "<nil>" {
+            old = arguments[2]
+        }
+        var new: String? = nil
+        if arguments.count >= 4 && arguments[3] != "<nil>" {
+            new = arguments[3]
+        }
+        if let delta = watchValueDelta(old: old, new: new) {
+            emitBase64("D:", delta)
+        } else {
+            print("NIL")
+        }
+    case "text":
+        let text = arguments.count >= 3 ? arguments[2] : ""
+        emitBase64("T:", watchHitText(text))
+    case "transition":
+        var old: String? = nil
+        if arguments.count >= 3 && arguments[2] != "<nil>" {
+            old = arguments[2]
+        }
+        let needle = arguments.count >= 4 ? arguments[3].lowercased() : ""
+        print(watchValueTransitioned(old: old, needle: needle) ? "YES" : "NO")
+    case "matched":
+        let text = arguments.count >= 3 ? arguments[2] : ""
+        let needle = arguments.count >= 4 ? arguments[3].lowercased() : ""
+        emitBase64("M:", watchMatchedLine(text, needle: needle))
+    default:
+        print("?")
+    }
+}
+'''
+
+
+@pytest.fixture(scope="module")
+def value_delta_harness(tmp_path_factory):
+    """Compile the real pure helpers from ButlerOverlay.swift once."""
+    swiftc = shutil.which("swiftc")
+    if not swiftc:
+        pytest.skip("swiftc is required to run the value-delta helpers")
+    source = Path(overlay.binary_source_path()).read_text(encoding="utf-8")
+    helpers = _swift_function_body(
+        source, "private func watchValueDelta(",
+        "/// Find the core Hermes pet pop-out")
+    # A rename must fail loudly, not compile an empty harness and go green.
+    for signature in ("private func watchValueDelta(",
+                      "private func watchLineDelta(",
+                      "private func watchLines(",
+                      "private func watchLineCounts(",
+                      "private func watchMatchedLine(",
+                      "private func watchHitText(",
+                      "private func watchValueTransitioned("):
+        assert signature in helpers, signature
+    harness = tmp_path_factory.mktemp("value-delta") / "main.swift"
+    binary = harness.parent / "value-delta-harness"
+    harness.write_text(
+        "import Foundation\n\n"
+        "private let watchHitTextLimit = 200\n\n"
+        + helpers + "\n" + _VALUE_DELTA_DRIVER,
+        encoding="utf-8")
+    proc = subprocess.run([swiftc, "-o", str(binary), str(harness)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    return binary
+
+
+def _run_value_delta(binary: Path, old, new):
+    args = [str(binary), "delta",
+            "<nil>" if old is None else old,
+            "<nil>" if new is None else new]
+    out = subprocess.run(args, capture_output=True, text=True,
+                         check=True).stdout.strip()
+    if out == "NIL":
+        return None
+    assert out.startswith("D:"), out
+    return base64.b64decode(out[2:]).decode("utf-8")
+
+
+def _run_hit_text(binary: Path, text: str) -> str:
+    out = subprocess.run([str(binary), "text", text], capture_output=True,
+                         text=True, check=True).stdout.strip()
+    assert out.startswith("T:"), out
+    return base64.b64decode(out[2:]).decode("utf-8")
+
+
+def _run_matched_line(binary: Path, text: str, needle: str) -> str:
+    out = subprocess.run([str(binary), "matched", text, needle],
+                         capture_output=True, text=True,
+                         check=True).stdout.strip()
+    assert out.startswith("M:"), out
+    return base64.b64decode(out[2:]).decode("utf-8")
+
+
+def _run_value_transition(binary: Path, old, needle: str) -> bool:
+    args = [str(binary), "transition",
+            "<nil>" if old is None else old, needle]
+    out = subprocess.run(args, capture_output=True, text=True,
+                         check=True).stdout.strip()
+    return out == "YES"
+
+
+def test_measured_regression_a_repeated_scrollback_line_is_news(
+        value_delta_harness) -> None:
+    """The measured 01:44 defect: `old` already had BUILD OK, and the next run
+    appends another one. Only the appended line may fire, exactly once."""
+    old = "➜  ~ sleep 70; echo BUILD OK\nBUILD OK\n➜  ~ "
+    new = old + "BUILD OK\n"
+
+    delta = _run_value_delta(value_delta_harness, old, new)
+
+    assert delta == "BUILD OK\n", "the delta is the appended line only"
+    assert delta.lower().count("build ok") == 1, (
+        "the pre-existing occurrence is not news a second time")
+    assert _run_hit_text(value_delta_harness, delta) == "BUILD OK"
+
+
+def test_prefix_path_appends_the_hit(value_delta_harness) -> None:
+    old = "first run\n"
+    new = old + "…BUILD OK\n"
+
+    delta = _run_value_delta(value_delta_harness, old, new)
+
+    assert delta == "…BUILD OK\n"
+    assert "BUILD OK" in delta
+
+
+def test_line_multiset_path_covers_a_rerendered_prompt(
+        value_delta_harness) -> None:
+    """Terminal re-renders the prompt row on the same line: not a prefix, but
+    the one added BUILD OK line is still the delta."""
+    old = "shell$ run\nworking\nBUILD OK\n"
+    new = "shell$ run (re-rendered)\nworking\nBUILD OK\nBUILD OK\n"
+
+    assert not new.startswith(old), "the prefix assumption must not hold here"
+    delta = _run_value_delta(value_delta_harness, old, new)
+
+    assert delta is not None
+    lines = delta.splitlines()
+    assert "shell$ run (re-rendered)" in lines
+    assert sum("BUILD OK" in line for line in lines) == 1, (
+        "count-aware: the old BUILD OK is consumed, the new one contributes")
+
+
+def test_an_unrelated_appended_line_does_not_fire(value_delta_harness) -> None:
+    old = "➜  ~ sleep 70; echo BUILD OK\nBUILD OK\n"
+    new = old + "all done\n"
+
+    delta = _run_value_delta(value_delta_harness, old, new)
+
+    assert delta == "all done\n"
+    assert "BUILD OK" not in delta, "no duplicate fire on unrelated output"
+
+
+def test_a_needle_that_was_in_old_and_is_gone_adds_nothing(
+        value_delta_harness) -> None:
+    old = "BUILD OK\n"
+    new = "cleared\n"
+
+    delta = _run_value_delta(value_delta_harness, old, new)
+
+    assert delta == "cleared"
+    assert "BUILD OK" not in delta, "nothing new was said"
+
+
+def test_unreadable_old_falls_back_to_the_transition_rule(
+        value_delta_harness) -> None:
+    """No delta computable -> `new` contains and `old` does not (old unreadable
+    counts as "does not"), which fires once. A readable old that already had the
+    needle must still NOT fire, or round 15's false positive returns."""
+    assert _run_value_delta(value_delta_harness, None, "BUILD OK") is None
+    assert _run_value_delta(value_delta_harness, "", "BUILD OK") is None
+
+    assert _run_value_transition(value_delta_harness, None, "build ok") is True
+    assert _run_value_transition(value_delta_harness, "", "build ok") is True
+    assert _run_value_transition(value_delta_harness, "clean", "build ok") is True
+    assert _run_value_transition(value_delta_harness, "BUILD OK",
+                                 "build ok") is False
+
+
+def test_a_fallback_hit_quotes_the_matching_line_not_the_buffer_head(
+        value_delta_harness) -> None:
+    """With no delta, new_text is the line carrying the needle, not the head."""
+    text = "Last login: months ago\nstarting…\nBUILD OK\nall done\n"
+
+    assert _run_matched_line(value_delta_harness, text, "build ok") == "BUILD OK"
+
+
+def test_the_value_hit_text_cap_uses_the_capture_ellipsis(
+        value_delta_harness) -> None:
+    text = _run_hit_text(value_delta_harness,
+                         "x" * 230 + "BUILD OK")
+
+    assert text == "x" * 200 + "…"
+    assert len(text) == 201
 
 
 def test_capture_exports_a_text_controls_ax_value() -> None:

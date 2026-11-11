@@ -1300,6 +1300,105 @@ def test_a_hit_without_a_surface_keeps_the_legacy_line(
         "hit: Export complete — general — Slack at ")
 
 
+# ------------------------------------- the value surface fires on the DELTA
+#
+# A terminal's AXValue is the WHOLE scrollback, not a per-line field. Round 15
+# made a pre-existing value wait for "new contains the needle AND old does
+# not", which can never fire again: the next run appends another `BUILD OK`,
+# so every later `old` still contains it and the watch stays silent forever.
+# The companion now matches what the buffer GAINED and sends that delta as
+# `new_text`; the status line reads the matched line, not the whole buffer.
+
+def _value_hit(**extra) -> dict:
+    row = {"op": "watch-hit", "app": "Terminal", "until": "BUILD OK",
+           "label": "BUILD OK", "window": "sleep 70; echo BUILD OK",
+           "matched": "value", "baseline_had": ["window"],
+           "at": 1_794_330_019.0}
+    row.update(extra)
+    return row
+
+
+def test_a_value_hit_keeps_the_delta_and_the_status_reads_it(
+        tmp_path: Path, monkeypatch) -> None:
+    """The hit carries `new_text`, and one hit line names the matched line."""
+    _overlay, _result = _terminal(tmp_path, monkeypatch)
+    said = []
+    monkeypatch.setattr(engine, "say",
+                        lambda text: said.append(text) or {"ok": True})
+
+    hit = _value_hit(new_text="BUILD OK")
+    engine._on_overlay_event(hit)
+    engine._on_overlay_event(hit)  # a duplicate line must not speak twice
+
+    assert said == ["Terminal: BUILD OK appeared"]
+    state = _state(tmp_path)
+    assert state["watch"]["hit"]["new_text"] == "BUILD OK"
+    assert state["watch"]["hit"]["matched"] == "value"
+    assert state["watch_hit"]["new_text"] == "BUILD OK", (
+        "the matched line outlives the ended watch row")
+    assert state["watch_hit"]["matched"] == "value"
+
+    lines = engine.watch_status().splitlines()
+    assert lines[1].startswith('hit: value — "BUILD OK" (output) at ')
+
+
+def test_a_value_hit_reads_the_delta_not_the_scrollback_label(
+        tmp_path: Path, monkeypatch) -> None:
+    """The label may be the whole buffer; the hit line must not repeat it."""
+    _overlay, _result = _terminal(tmp_path, monkeypatch)
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    scrollback = "➜  ~ sleep 70; echo BUILD OK\nBUILD OK\n➜  ~ "
+    engine._on_overlay_event(_value_hit(label=scrollback,
+                                        new_text="BUILD OK\n"))
+
+    line = engine.watch_status().splitlines()[1]
+
+    assert line.startswith('hit: value — "BUILD OK" (output) at ')
+    assert "sleep 70" not in line, "the status line is not the whole buffer"
+
+
+def test_a_multiline_value_delta_status_reads_the_matched_line(
+        tmp_path: Path, monkeypatch) -> None:
+    """`new_text` is the whole delta; the hit line is the line that matched."""
+    _overlay, _result = _terminal(tmp_path, monkeypatch)
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    engine._on_overlay_event(_value_hit(new_text="step 1 done\nBUILD OK\n"))
+
+    line = engine.watch_status().splitlines()[1]
+
+    assert line.startswith('hit: value — "BUILD OK" (output) at ')
+    assert "step 1" not in line
+    assert "\n" not in line
+
+
+def test_an_overlong_value_delta_is_capped_like_a_capture(
+        tmp_path: Path, monkeypatch) -> None:
+    """The `new_text` cap is the capture cap: 200 chars plus `…`."""
+    _overlay, _result = _terminal(tmp_path, monkeypatch)
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+    long_delta = "x" * 230
+
+    engine._on_overlay_event(_value_hit(new_text=long_delta))
+
+    kept = _state(tmp_path)["watch"]["hit"]["new_text"]
+    assert kept == "x" * engine.WATCH_NEW_TEXT_LIMIT + "…"
+    assert len(kept) == engine.WATCH_NEW_TEXT_LIMIT + 1
+
+
+def test_a_non_string_value_delta_is_ignored(
+        tmp_path: Path, monkeypatch) -> None:
+    """`new_text` is a value-surface string; a malformed row cannot invent one."""
+    _start(tmp_path, monkeypatch, until="Export complete")
+    monkeypatch.setattr(engine, "say", lambda text: {"ok": True})
+
+    engine._on_overlay_event({
+        "op": "watch-hit", "app": "Slack", "until": "Export complete",
+        "label": "Export complete", "new_text": 42,
+        "at": 1_794_330_012.0})
+
+    assert "new_text" not in _state(tmp_path)["watch"]["hit"]
+
+
 # ------------------------------------------------------- capture value field
 
 def _capture_reply(elements):
