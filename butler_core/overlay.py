@@ -862,7 +862,9 @@ class Overlay:
         # the request inbox: `watch_start` waits for its own ack, and a stream
         # of focus/value events would starve it. They go straight to the
         # engine's ring instead (no journal: an event is not a click).
-        if op in ("watch-event", "watch-hit", "watch-stopped"):
+        # `watch-scan` is the content-scan tick line: same unsolicited route, or
+        # it would sit in the request inbox and starve `watch_start`'s ack.
+        if op in ("watch-event", "watch-hit", "watch-stopped", "watch-scan"):
             callback = self.on_event
             if callable(callback):
                 try:

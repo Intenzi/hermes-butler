@@ -1,3 +1,13 @@
+## 0.4.0
+
+- WATCH can scan content: `scan: {author, roles}` waits for a NEW message from a
+  named author, matched against author-role nodes only (never message bodies),
+  with "new since arming" decided from a baseline of match signatures.
+- `scan.text` is the weaker explicit-content mode; `until` and `scan` are
+  mutually exclusive.
+- The build script is native by default with per-arch warm module caches: a
+  Swift change takes ~7 s instead of ~90 s, and a no-op rebuild is free.
+
 ## 0.3.0
 
 - LOOK: pointer-driven read of one control — right-click the hat for the menu,
