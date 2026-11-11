@@ -1,3 +1,16 @@
+## 0.3.0
+
+- LOOK: pointer-driven read of one control — right-click the hat for the menu,
+  drag it to look, `Esc`/right-click to cancel. Drag and click share one inspect
+  mode; clicks land on the overlay, never on the app underneath.
+- WATCH: Accessibility-tree monitoring with a content condition, a persistent
+  `⏲ Hit · …` line that survives the watch ending, acknowledgement from the hat,
+  and a one-shot default.
+- The hat exists without a popped-out pet (free anchor, remembered position).
+- The companion is fetched from this repository's attested release, verified by
+  SHA-256, and compiled only as a fallback.
+- Doctor names the real remedy, never the wrong permission, and never "Xcode".
+
 # Changelog
 
 All notable changes to this plugin are documented here. The format follows
