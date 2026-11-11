@@ -2,8 +2,11 @@
 
 Owns the click-through companion window that rings controls over ANY app and
 hosts the walking pet double. The renderer is a separate bundled Swift
-process, compiled on first use (disclosed). If it is missing or refuses to run,
-the guide falls back to in-app speech bubbles only - never hard-fails.
+process. On first use the plugin downloads the helper this repository's GitHub
+Actions workflow built and attested, verifies it against the release's own
+SHA-256, and only compiles the bundled Swift source when that download is not
+available (disclosed in the README). If no route produces a helper, the guide
+falls back to in-app speech bubbles only - never hard-fails.
 
 Protocol: one JSON line per op on stdin -
   {"op":"ring","box":[x,y,w,h],"label":"...","say":"...","step":3,"total":7}
@@ -38,11 +41,14 @@ import json
 import os
 import platform
 import queue
+import re
 import select
 import shutil
 import subprocess
+import sys
 import threading
 import time
+import urllib.request
 
 DEFAULT_PET_SCALE = 0.33
 MIN_PET_SCALE = 0.2
@@ -125,17 +131,233 @@ def _write_buildinfo_best_effort(src, exe):
         pass
 
 
-def build_if_needed():
-    """Compile the bundled Swift overlay only when its source really changed.
+#: Every request the helper download makes gets its own deadline, in seconds.
+DOWNLOAD_TIMEOUT = 20
+#: Set BUTLER_NO_DOWNLOAD=1 to refuse the release download and compile instead.
+NO_DOWNLOAD_ENV = "BUTLER_NO_DOWNLOAD"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_LAST_JOURNAL = None
 
-    Returns (ok, detail); detail stays "present" or "compiled" for the doctor.
 
-    Staleness is decided by the source SHA-256 in the shipped ``.buildinfo``,
-    never by mtime: after ``git clone`` every file gets a fresh mtime, so a
-    shipped binary would always look stale and force a compile on a machine
-    that has no compiler. A missing/unreadable sidecar is treated as "trust the
-    shipped binary" for the same reason - doctor's capture probe will report a
-    genuinely broken companion.
+def companion_url_path():
+    """One-line release-asset URL template shipped beside the binary."""
+    return os.path.join(os.path.dirname(binary_path()), ".companion_url")
+
+
+def plugin_yaml_path():
+    """The plugin manifest that names the release tag (``version:``)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "plugin.yaml")
+
+
+def plugin_version():
+    """``version:`` from plugin.yaml, without a YAML dependency."""
+    try:
+        with open(plugin_yaml_path(), "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("version:"):
+                    value = _unquote(line.split(":", 1)[1])
+                    return value or None
+    except OSError:
+        return None
+    return None
+
+
+def download_url():
+    """Resolve the release asset URL for the installed version, or None.
+
+    The template lives in the repo (``services/.companion_url``) so the remote
+    host is auditable from the source tree; ``{version}`` comes from
+    ``plugin.yaml`` so the download matches the installed plugin exactly.
+    """
+    try:
+        with open(companion_url_path(), "r", encoding="utf-8") as handle:
+            template = handle.readline().strip()
+    except OSError:
+        return None
+    if not template:
+        return None
+    if "{version}" in template:
+        version = plugin_version()
+        if not version:
+            return None
+        template = template.replace("{version}", version)
+    return template
+
+
+def _journal(message):
+    """One stderr line per resolution step: never spammy, never raising."""
+    global _LAST_JOURNAL
+    text = "butler companion: %s" % message
+    if text == _LAST_JOURNAL:
+        return
+    _LAST_JOURNAL = text
+    try:
+        sys.stderr.write(text + "\n")
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 - a closed stderr must not break the guide
+        pass
+
+
+def _remove_quietly(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _http_get(url):
+    """Read one URL with the fixed download deadline; raises on any failure."""
+    response = urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT)
+    try:
+        return response.read()
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - a failed close cannot unsave us
+                pass
+
+
+def _parse_sha256(raw):
+    """The first token of a ``shasum`` file, or None when it is not a digest."""
+    try:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    tokens = text.split()
+    if not tokens:
+        return None
+    candidate = tokens[0].lower()
+    return candidate if _SHA256_RE.match(candidate) else None
+
+
+def _release_buildinfo(url):
+    """The release's own ``.buildinfo`` payload, or None when not published."""
+    base = url.rpartition("/")[0]
+    candidates = []
+    if base:
+        # The workflow uploads ``butler_core/services/.buildinfo``, whose asset
+        # name is the bare basename in the release directory.
+        candidates.append(base + "/.buildinfo")
+    # A renamed sibling is accepted too, so the asset can be made discoverable
+    # without changing this resolver.
+    candidates.append(url + ".buildinfo")
+    for candidate in candidates:
+        try:
+            raw = _http_get(candidate)
+        except Exception:  # noqa: BLE001 - an optional asset may 404
+            continue
+        try:
+            info = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(info, dict):
+            return info
+    return None
+
+
+def _write_download_buildinfo(url, exe):
+    """Record what the download installed; a cache hint, never a requirement."""
+    info = _release_buildinfo(url)
+    if info is None:
+        info = {"archs": _current_archs(exe), "built_at": int(time.time())}
+        try:
+            info["source_sha256"] = source_sha256(binary_source_path())
+        except OSError:
+            # Source is not shipped in an installed plugin; the sidecar then
+            # has no hash and the next run trusts the verified binary.
+            pass
+    try:
+        with open(buildinfo_path(), "w", encoding="utf-8") as handle:
+            json.dump(info, handle, sort_keys=False)
+            handle.write("\n")
+    except OSError:
+        pass
+
+
+def fetch_binary():
+    """Download, verify, and install the attested universal helper.
+
+    Returns ``(True, "downloaded")`` or ``(False, "download_failed: <reason>")``.
+    The release's own ``.sha256`` asset supplies the digest, so the binary and
+    the checksum travel together and a mismatch never reaches the executable.
+    """
+    url = download_url()
+    if not url:
+        return False, "download_failed: no release url configured"
+
+    # Refuse to install what cannot be verified: no checksum, no download.
+    try:
+        expected = _parse_sha256(_http_get(url + ".sha256"))
+    except Exception as exc:  # noqa: BLE001
+        return False, "download_failed: sha256 asset unavailable: %s" % exc
+    if not expected:
+        return False, "download_failed: sha256 asset malformed"
+
+    partial = binary_path() + ".download"
+    try:
+        payload = _http_get(url)
+    except Exception as exc:  # noqa: BLE001
+        _remove_quietly(partial)
+        return False, "download_failed: %s" % exc
+
+    # Stage first, verify the staged bytes, and only then touch the real file.
+    try:
+        parent = os.path.dirname(partial)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(partial, "wb") as handle:
+            handle.write(payload)
+    except OSError as exc:
+        _remove_quietly(partial)
+        return False, "download_failed: %s" % exc
+
+    try:
+        digest = hashlib.sha256()
+        with open(partial, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+    except OSError as exc:
+        _remove_quietly(partial)
+        return False, "download_failed: %s" % exc
+    if actual != expected:
+        _remove_quietly(partial)
+        return False, "download_failed: sha256 mismatch"
+
+    try:
+        os.chmod(partial, 0o755)
+        os.replace(partial, binary_path())
+    except OSError as exc:
+        _remove_quietly(partial)
+        return False, "download_failed: %s" % exc
+    _write_download_buildinfo(url, binary_path())
+    return True, "downloaded"
+
+
+def ensure_binary():
+    """Get the screen helper by the cheapest safe route.
+
+    Returns ``(ok, detail)``. Resolution order, each step tried only when the
+    one before it could not produce a usable helper:
+
+    1. ``present`` - a binary whose ``.buildinfo`` hash matches the bundled
+       source (or that has no hash to compare) is used as-is.
+    2. ``downloaded`` - fetch the attested release asset, verify it against the
+       release's own SHA-256, and install it atomically. Skipped when
+       ``BUTLER_NO_DOWNLOAD`` is set or no ``.companion_url`` is shipped.
+    3. ``compiled`` - compile the bundled Swift source with ``swiftc``.
+    4. ``(False, ...)`` - ``download_failed`` when a compile was attempted and
+       failed too, ``swiftc_not_found`` when the source is there but no
+       compiler is, ``helper-unavailable`` when nothing could be tried. The
+       doctor turns any of these into one remedy.
+
+    Staleness is decided by the source SHA-256 in ``.buildinfo``, never by
+    mtime: after ``git clone`` every file gets a fresh mtime. A missing sidecar
+    still means "trust the binary" - doctor's capture probe reports a genuinely
+    broken companion. Nothing here raises: no helper is a report, not a crash.
     """
     exe = binary_path()
     src = binary_source_path()
@@ -144,23 +366,46 @@ def build_if_needed():
     if exe_ready:
         info = _read_buildinfo()
         if info is None or not info.get("source_sha256"):
-            # Never make a missing sidecar cost a user a compiler. The shipped
-            # binary is expected to be good; let the capture probe decide.
+            _journal("present (no recorded source hash)")
             return True, "present"
         try:
             current = source_sha256(src)
         except OSError:
-            # The binary outlives a missing source in an installed plugin; the
-            # source's absence is not evidence that the binary is stale.
+            # In an installed plugin the source may not be shipped; its
+            # absence is not evidence that the binary is stale.
+            _journal("present (source unavailable, trusting the binary)")
             return True, "present"
         if info.get("source_sha256") == current:
+            _journal("present")
             return True, "present"
-        # Hash mismatch: the source changed after this binary was built.
+        _journal("stale (source hash changed)")
+
+    download_failure = None
+    url = download_url()
+    if os.environ.get(NO_DOWNLOAD_ENV):
+        _journal("download disabled by %s" % NO_DOWNLOAD_ENV)
+    elif url is None:
+        _journal("download unavailable (no .companion_url / version)")
+    else:
+        ok, detail = fetch_binary()
+        if ok:
+            _journal("downloaded %s" % url)
+            return True, "downloaded"
+        download_failure = (
+            detail if str(detail).startswith("download_failed")
+            else "download_failed: %s" % detail)
+        _journal(download_failure)
 
     if not os.path.exists(src):
-        return False, "source_missing"
+        # The download failure, if any, is already journaled above; the report
+        # only needs the state the user can act on.
+        _journal("helper-unavailable (no source to compile)")
+        return False, "helper-unavailable"
     if shutil.which("swiftc") is None:
+        _journal("swiftc_not_found")
         return False, "swiftc_not_found"
+
+    _journal("compiling the bundled Swift source")
     # Compile beside the target and swap only on success. An in-place swiftc
     # run can truncate the shipped binary before failing, which would turn a
     # working companion into "needs a compiler" on a machine that has none.
@@ -170,13 +415,22 @@ def build_if_needed():
                        check=True, capture_output=True)
         os.replace(staged, exe)
     except Exception as exc:  # noqa: BLE001
-        try:
-            os.unlink(staged)
-        except OSError:
-            pass
+        _remove_quietly(staged)
+        if download_failure:
+            # Neither route produced a helper; report the one a reinstalled
+            # plugin would fix first (the release download).
+            _journal(download_failure)
+            return False, download_failure
+        _journal("compile_failed: %s" % exc)
         return False, "compile_failed: %s" % exc
     _write_buildinfo_best_effort(src, exe)
+    _journal("compiled")
     return True, "compiled"
+
+
+#: Back-compat name: the controller and doctor call build_if_needed().
+build_if_needed = ensure_binary
+
 
 
 def hermes_home():

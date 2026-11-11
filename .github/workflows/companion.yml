@@ -1,20 +1,20 @@
 name: companion
 
-# Rule 17 of the plugin catalog: a native helper must be built by this repo's own
-# public workflow, from source, and carry a build attestation. The catalog build
-# ships source only; this workflow exists so an attested universal binary can be
-# offered from a release if a user wants one without Command Line Tools.
+# Catalog rule 17: a native helper must be built by this repo's own public
+# workflow, from the source in this repo, and carry a build attestation. The
+# catalog build ships source only; this workflow publishes the attested
+# universal binary as a release asset, and the plugin downloads exactly that one
+# file and verifies it against the published SHA-256. Building from Swift source
+# locally stays available as a fallback, never as a requirement.
 
 on:
   push:
-    paths:
-      - 'butler_core/overlay_swift/**'
-      - 'scripts/build-companion.sh'
-      - '.github/workflows/companion.yml'
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
   attestations: write
 
@@ -24,21 +24,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check the tag matches plugin.yaml
+        # The plugin builds its download URL from plugin.yaml's version, so a
+        # tag that disagrees would publish assets no installed plugin can find.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(sed -n 's/^version:[[:space:]]*//p' plugin.yaml | head -n1 | sed 's/[[:space:]]*#.*//' | tr -d "\"'" | tr -d '[:space:]')"
+          if [ -z "$version" ]; then
+            echo "plugin.yaml has no readable version" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match plugin.yaml version $version" >&2
+            exit 1
+          fi
+
       - name: Build universal companion
         run: bash scripts/build-companion.sh
 
-      - name: Verify architectures
-        run: lipo -archs butler_core/services/ButlerOverlay
+      - name: Package release asset
+        run: cp butler_core/services/ButlerOverlay ButlerOverlay-universal
 
-      - name: Attest provenance
+      - name: Assert both architectures
+        run: |
+          archs="$(lipo -archs ButlerOverlay-universal)"
+          echo "lipo -archs: $archs"
+          case "$archs" in
+            *arm64*) ;;
+            *) echo "companion is missing the arm64 slice" >&2; exit 1 ;;
+          esac
+          case "$archs" in
+            *x86_64*) ;;
+            *) echo "companion is missing the x86_64 slice" >&2; exit 1 ;;
+          esac
+
+      - name: Publish the checksum the plugin verifies
+        run: shasum -a 256 butler_core/services/ButlerOverlay > ButlerOverlay-universal.sha256
+
+      - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: butler_core/services/ButlerOverlay
+          subject-path: ButlerOverlay-universal
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: ButlerOverlay-universal
-          path: |
-            butler_core/services/ButlerOverlay
+      - name: Create the release with the three assets
+        # Manual dispatch on a tag works too; a branch dispatch only builds and
+        # attests, because a release is named by its tag.
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes \
+            ButlerOverlay-universal \
+            ButlerOverlay-universal.sha256 \
             butler_core/services/.buildinfo

@@ -1,4 +1,4 @@
-"""Butler doctor: grants, capabilities, companion build, configuration report.
+"""Butler doctor: grants, capabilities, companion helper, configuration report.
 
 `ask=True` pops macOS's own Accessibility dialog
 (AXIsProcessTrustedWithOptions(prompt=True)) and deep-links the pane, so the
@@ -10,17 +10,12 @@ permission problem: reporting "grant Accessibility" would send the user to a
 toggle that cannot help when the real cause is a missing helper. In that case
 the accessibility answer is ``None`` (unknown), never ``False``.
 
-Two different companion failures get two different remedies, and neither is a
-compiler for a user who never had one:
-
-* the binary is missing or not executable -> the plugin install is incomplete
-  or macOS blocked it; reinstall the plugin.
-* the binary runs but the local source hash no longer matches ``.buildinfo``
-  (a developer edited the Swift) -> rebuild with Command Line Tools, or
-  reinstall.
-
-The word "Xcode" is banned from doctor output: the toolchain the user needs is
-Command Line Tools.
+The overlay is reported as one of six statuses: ``present``, ``downloaded``,
+``compiled`` (usable), or ``download_failed``, ``swiftc_not_found``,
+``helper-unavailable`` (not usable). There is ONE remedy for the unusable
+three: reinstall the plugin, because the plugin can download the attested
+helper and nobody has to own a compiler. Command Line Tools remain an option
+only for someone who chooses to build the Swift source locally.
 """
 import os
 import shutil
@@ -39,20 +34,27 @@ GRANT_FIX = (
     "Grant Accessibility to \"%s\" in System Settings -> Privacy & Security -> "
     "Accessibility, then try the guide again. %s" % (GRANT_SUBJECT, GRANT_WHY)
 )
-# The helper itself is gone (uninstalled, quarantined, or not executable). No
-# compiler and no grant can fix an install that is missing its binary.
-OVERLAY_REINSTALL_FIX = (
-    "The butler helper is missing or blocked — reinstall the plugin: "
-    "hermes plugins install butler"
+#: Every unusable-overlay state has the same remedy: an incomplete install gets
+#: reinstalled. The plugin downloads the attested helper, so a missing binary or
+#: a failed download never means "install a compiler".
+OVERLAY_FIX = (
+    "Butler could not get its screen helper: reinstall the plugin "
+    "(hermes plugins install butler). Command Line Tools are only needed if you "
+    "build from source."
 )
-# The developer case: a working helper whose local Swift source changed. Build
-# tooling is the remedy, and only here does the compiler belong in the answer.
-OVERLAY_REBUILD_FIX = (
-    "Local source changed: rebuild the helper with Command Line Tools "
-    "(xcode-select --install), or reinstall the plugin"
+#: Back-compat spelling used by older callers.
+OVERLAY_REINSTALL_FIX = OVERLAY_FIX
+#: The statuses doctor reports for the overlay; anything else is normalized.
+OVERLAY_STATUSES = (
+    "present",
+    "downloaded",
+    "compiled",
+    "download_failed",
+    "swiftc_not_found",
+    "helper-unavailable",
 )
-#: Back-compat spelling: the unusable-overlay remedy is a reinstall.
-OVERLAY_FIX = OVERLAY_REINSTALL_FIX
+#: Statuses that mean the companion cannot answer anything.
+OVERLAY_UNUSABLE = ("download_failed", "swiftc_not_found", "helper-unavailable")
 #: The plugin has no OCR fallback wired in; the grant is reported for
 #: transparency only and never becomes a fix.
 OCR_STATUS = "optional, not used"
@@ -67,23 +69,29 @@ def _open_panel(pane_url):
         return False
 
 
-def _doctor_detail(detail):
-    """Doctor's own wording: never "Xcode", always Command Line Tools."""
-    return str(detail).replace("Xcode", "Command Line Tools")
+def _overlay_status(detail):
+    """Normalize whatever the resolver logged into one of ``OVERLAY_STATUSES``.
+
+    The resolver's detail strings carry a human reason (a URL, a swiftc error);
+    the report keeps the closed status set so a user-facing answer can be
+    chosen without pattern-matching English prose.
+    """
+    text = str(detail or "").strip()
+    if text in OVERLAY_STATUSES:
+        return text
+    if text.startswith("download_failed"):
+        return "download_failed"
+    return "helper-unavailable"
 
 
 def _overlay_remedy():
-    """Name the RIGHT overlay fix: a reinstall when the helper itself is gone.
+    """The one fix for an unusable helper: reinstall the plugin.
 
-    A missing or non-executable binary cannot be compiled into existence for a
-    user who never installed a toolchain; the plugin install is the remedy.
-    Only an installed, runnable helper whose source hash differs (a developer's
-    edit that failed to compile) earns the Command Line Tools sentence.
+    Downloading the attested release asset is the normal path, so a missing
+    binary, a failed download, or no compiler all mean the same thing to the
+    user: the install is incomplete, not that they need a toolchain.
     """
-    exe = bp_overlay.binary_path()
-    if not os.path.exists(exe) or not os.access(exe, os.X_OK):
-        return OVERLAY_REINSTALL_FIX
-    return OVERLAY_REBUILD_FIX
+    return OVERLAY_FIX
 
 
 def _overlay_archs(exe):
@@ -119,9 +127,9 @@ def report(ask=False):
     # unusable, a failed grant probe would just mirror that and send the user
     # to Accessibility - a toggle that cannot make a missing helper appear.
     overlay_ok, overlay_detail = bp_overlay.build_if_needed()
-    detail = _doctor_detail(overlay_detail)
+    status = _overlay_status(overlay_detail)
     exe = bp_overlay.binary_path()
-    out["overlay"] = detail
+    out["overlay"] = status
     out["overlay_binary"] = exe if os.path.exists(exe) else None
     out["overlay_archs"] = _overlay_archs(exe)
 
@@ -131,11 +139,11 @@ def report(ask=False):
     out["screen_recording_granted"] = screen_recording_granted
     out["prompted"] = {}
 
-    if not overlay_ok:
+    if not overlay_ok or status in OVERLAY_UNUSABLE:
         # Unknown is not false: the companion never got to answer the grant
         # question, so neither grant claim nor grant instruction is honest.
         out["accessibility_granted"] = None
-        out["capture"] = "unavailable: %s" % detail
+        out["capture"] = "unavailable: %s" % status
         fix = _overlay_remedy()
         out["fix"] = fix
         out["fixes"] = [fix]

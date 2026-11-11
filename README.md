@@ -208,14 +208,15 @@ text only when the work calls for it.
 
 Plain statements about what this plugin does when it runs.
 
-1. **No binary is committed.** The companion ships as Swift source
-   (`butler_core/overlay_swift/ButlerOverlay.swift`, readable in the repo) and is
-   compiled locally by `scripts/build-companion.sh` — or automatically on first
-   use when the compiled helper is absent. Compiling needs Apple's Command Line
-   Tools (`xcode-select --install`); a machine without them cannot run the
-   companion, and `hermes butler doctor` says so instead of blaming a permission.
-   Nothing is downloaded: no fetched binary, no remote artifact, no checksum to
-   trust.
+1. The helper is built by this repository's GitHub Actions workflow from the
+   Swift source in this repo, published as a release asset and attested with
+   `actions/attest-build-provenance`. On first use Butler downloads that one
+   file (~1.1 MB, universal arm64+x86_64) from this repository's release for
+   the installed version, verifies it against the release's published SHA-256,
+   and runs it. Nothing else is fetched; there is no update check and no other
+   remote call. If the download fails and Command Line Tools are installed, the
+   plugin compiles the same source locally instead. Set
+   `BUTLER_NO_DOWNLOAD=1` to refuse the download.
 2. Overlay rendering runs in a spawned local companion process, driven by a
    JSON-over-stdin protocol. The same shared process serves guides, captures,
    the summon double, and the pop-out hat badge; it exits when idle (a roughly
@@ -233,8 +234,9 @@ Plain statements about what this plugin does when it runs.
    screen position, in this companion's own `UserDefaults` domain
    (`~/Library/Preferences/ButlerOverlay.plist`). There is no second runtime
    config path in the plugin install dir.
-5. No network destination other than the model provider. No telemetry, no
-   auto-updater, no phoning home.
+5. The only network destinations are the chat's model provider and the
+   one-time helper download from this repository's release (above). No
+   telemetry, no auto-updater, no other phoning home.
 6. Guides fail closed under unattended runs. From cron or a headless context,
    a guide refuses rather than prompt, so a follow-mode companion can never
    become a background screenreader.
