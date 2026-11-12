@@ -903,12 +903,10 @@ function pollSummonPending() {
         ? 'new' : 'recent'
       // A LOOK row is a text row with an element attached, and the injected
       // turn leads with the control the user pointed at.
-      jsJournal(`poll row id=${asText(pending && pending.id)} text=${asText(text).length}`)
       const isLook = asText(pending && pending.origin) === 'look'
       const outgoing = isLook ? lookPendingText(pending) : text
       // Send in place. A failed send still acks: the text was typed once, and
       // retrying silently is worse than telling the user exactly why it failed.
-      jsJournal(`poll send ${destination} look=${isLook} len=${outgoing.length}`)
       // Two doors, in the order that matches how the pet is used: you are
       // outside Hermes, so a chat's composer is not mounted and driving it is
       // not an option. Injection continues an existing chat; RPC creates one
@@ -933,7 +931,6 @@ function pollSummonPending() {
           if (injectionAllowed !== false) {
             injected = await sendSummonInjection(
               targetId, outgoing, isLook ? { origin: 'look' } : {})
-            jsJournal(`inject ok=${!!(injected && injected.ok)} reason=${asText(injected && injected.reason) || '-'}`)
             if (injected && injected.ok) {
               injectionAllowed = true
             } else if (asText(injected && injected.reason) === 'injection_denied') {
@@ -950,8 +947,8 @@ function pollSummonPending() {
             return injected
           }
           const rpc = await sendSummonRpc(targetId, outgoing)
-          jsJournal(`rpc ok=${!!(rpc && rpc.ok)} reason=${asText(rpc && rpc.reason) || '-'}`)
           if (rpc && rpc.ok) return rpc
+          jsJournal(`send failed: inject=${asText(injected && injected.reason) || '-'} rpc=${asText(rpc && rpc.reason) || '-'}`)
           // Neither door took the turn: report the last door's reason, but keep
           // the injection transport error so the toast names the real cause.
           return {
@@ -984,10 +981,10 @@ function pollSummonPending() {
 
 /** Watch the companion summon row from module scope on every host. */
 /**
- * One line into the shared log (same file the companion writes). A press that
- * does nothing has to be traceable to the hop that dropped it: Swift writes
- * `ask-submit`, Python writes `engine-summon_text-received`, this side writes
- * `js:*` for the poll, the send attempt and the outcome.
+ * One line into the shared log (same file the companion writes), for FAILURES
+ * only. A successful press writes nothing here: a user who never has a problem
+ * pays nothing for this, while a broken install still leaves the hop that
+ * dropped the press. Only the error paths call it.
  */
 function jsJournal(line) {
   try {
@@ -1081,7 +1078,6 @@ async function sendSummonRpc(target, text) {
     }
   }
 
-  jsJournal(`rpc choose=${chosen || 'none'} tracked=${candidates.length} rows=${Array.isArray(rows) ? rows.length : 'err'}`)
   if (!chosen) {
     if (Array.isArray(rows)) {
       // The list is authoritative: no tracked id survived it, so mint one.
@@ -1137,7 +1133,6 @@ async function sendSummonRpc(target, text) {
   }
 
   rememberChatIds(chosen)
-  jsJournal(`rpc sent session=${chosen}`)
   return { ok: true, send: 'rpc', session: chosen, attempts: 1 }
 }
 
