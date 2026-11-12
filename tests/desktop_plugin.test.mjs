@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PLUGIN_JS = path.join(HERE, '..', 'desktop', 'plugin.js')
 const INTERNALS = [
-  'summonButler', 'sendSummonText', 'sendSummonInjection', 'summonFromBar',
+  'summonButler', 'sendSummonText', 'sendSummonInjection', 'sendSummonRpc', 'summonFromBar',
   'summonFailureMessage',
   'spawnSummonDouble', 'configPetClickClaim',
   'syncCompanionClaim', 'petStatusRowText',
@@ -2379,4 +2379,75 @@ test('a one-shot hit says "Watch ended" once, then the row clears', async () => 
   assert.equal(said.length, 1)
   assert.equal(env.api.WatchRow({ watch }), null)
   env.dispose()
+})
+
+test('rpc send reuses the most recent tracked chat that still exists', async () => {
+  const calls = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      calls.push({ method, params })
+      if (method === 'session.list') return [{ id: 'live-1', title: 'Butler', created_at: 2 }]
+      if (method === 'session.resume') return { session_id: params.session_id }
+      if (method === 'prompt.submit') return { status: 'streaming' }
+      throw new Error(`unexpected ${method}`)
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const result = await env.api.sendSummonRpc('live-1', 'hello there')
+
+  assert.equal(result.ok, true)
+  assert.equal(result.session, 'live-1')
+  assert.equal(result.send, 'rpc')
+  assert.equal(calls.some(call => call.method === 'session.create'), false,
+    'an existing chat is reused, never re-created')
+  const submit = calls.find(call => call.method === 'prompt.submit')
+  assert.equal(submit.params.text, 'hello there')
+  assert.equal(submit.params.session_id, 'live-1')
+})
+
+test('rpc send creates a chat only when no tracked id exists', async () => {
+  const calls = []
+  const remembered = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      calls.push({ method, params })
+      if (method === 'session.list') return []
+      if (method === 'session.create') return { session_id: 'runtime-9', stored_session_id: 'stored-9' }
+      if (method === 'session.resume') return { session_id: params.session_id }
+      if (method === 'prompt.submit') return { status: 'streaming' }
+      throw new Error(`unexpected ${method}`)
+    }
+  })
+  const env = await loadPlugin({
+    host,
+    rest: async () => ({}),
+    document: makeDocument(),
+    storage: { getItem: () => null, setItem: (key, value) => remembered.push({ key, value }) }
+  })
+
+  const result = await env.api.sendSummonRpc('draft-1', 'first words')
+
+  assert.equal(result.ok, true)
+  assert.equal(result.session, 'stored-9', 'the real chat id is the stored one')
+  assert.equal(calls.filter(call => call.method === 'session.create').length, 1)
+  assert.ok(remembered.some(entry => String(entry.value).includes('stored-9')),
+    'the created chat is remembered for the next send')
+})
+
+test('rpc send refuses to claim a send without an admission receipt', async () => {
+  const host = defaultHost({
+    request: async (method, params) => {
+      if (method === 'session.list') return [{ id: 'live-1', created_at: 1 }]
+      if (method === 'session.resume') return { session_id: params.session_id }
+      if (method === 'prompt.submit') return {}
+      throw new Error(`unexpected ${method}`)
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const result = await env.api.sendSummonRpc('live-1', 'lost words')
+
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'prompt_submit_empty')
 })

@@ -1313,6 +1313,92 @@ function summonFailureMessage(result) {
  * `{ok: false, reason: 'injection_denied'}`; any transport failure reads as
  * `injection_unavailable` so the caller can fall back honestly.
  */
+/**
+ * Send through the gateway JSON-RPC door, which works whether or not the chat is
+ * on screen: `session.resume` subscribes this socket, `prompt.submit` starts the
+ * turn, `session.create` mints a real chat when every tracked id turns out to be
+ * a client-side draft the gateway never made.
+ *
+ * Order of preference, per the owner's rule: reuse the most recent tracked chat
+ * that still exists; only create when none of them do.
+ */
+async function sendSummonRpc(target, text) {
+  const targetId = asText(target)
+  if (!targetId || !host || typeof host.request !== 'function') {
+    return { ok: false, reason: 'no_rpc', session: targetId || null }
+  }
+
+  const candidates = uniqueIds(targetId, readTrackedChatIds())
+  let chosen = ''
+
+  // A chat that exists is the one the gateway lists; a draft is not.
+  let rows = null
+  try {
+    rows = await listSessions()
+  } catch (err) {
+    rows = null
+  }
+  if (Array.isArray(rows) && rows.length) {
+    for (const id of candidates) {
+      if (rows.some(row => rowTargetIds(row).includes(id))) {
+        chosen = id
+        break
+      }
+    }
+  }
+
+  if (!chosen) {
+    if (Array.isArray(rows)) {
+      // The list is authoritative: no tracked id survived it, so mint one.
+      try {
+        const created = await host.request('session.create', {
+          source: 'gui',
+          title: BUTLER_TITLE
+        })
+        chosen = asText(created && (created.stored_session_id || created.session_id))
+      } catch (err) {
+        return { ok: false, reason: 'session_create_failed', error: err, session: targetId }
+      }
+      if (!chosen) {
+        return { ok: false, reason: 'session_create_failed', session: targetId }
+      }
+      rememberChatIds(chosen)
+    } else {
+      // The list itself failed; try the newest id we were handed rather than
+      // creating a chat the user did not ask for.
+      chosen = targetId
+    }
+  }
+
+  // Subscribe this socket to the chat, otherwise prompt.submit is refused with
+  // permission_denied for a session nothing has open.
+  try {
+    await host.request('session.resume', { session_id: chosen })
+  } catch (err) {
+    return { ok: false, reason: 'session_resume_failed', error: err, session: chosen }
+  }
+
+  let receipt = null
+  try {
+    receipt = await host.request('prompt.submit', {
+      session_id: chosen,
+      text,
+      submission_id: `butler-${Date.now().toString(36)}`
+    })
+  } catch (err) {
+    return { ok: false, reason: 'prompt_submit_failed', error: err, session: chosen }
+  }
+  // An admission receipt is an object; anything empty means the turn was not
+  // taken, and calling that a success would hide a lost message.
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)
+      || Object.keys(receipt).length === 0) {
+    return { ok: false, reason: 'prompt_submit_empty', session: chosen }
+  }
+
+  rememberChatIds(chosen)
+  return { ok: true, send: 'rpc', session: chosen, attempts: 1 }
+}
+
 async function sendSummonInjection(target, text) {
   const targetId = asText(target)
   if (!targetId) {
@@ -1420,7 +1506,7 @@ async function summonButler(text, options = {}) {
     return { ...injection, destination }
   }
 
-  // The gateway could not host the turn. Preserve the grounded chip ladder:
+  // Preserve the grounded chip ladder:
   // composer.submit('/butler <text>') reaches the slash handler, which reports
   // honestly instead of opening a full conversation. A fresh send must never
   // re-derive the most recent Butler chat during this fallback.
@@ -1428,6 +1514,28 @@ async function summonButler(text, options = {}) {
     ...options,
     refresh: options.refresh !== undefined ? options.refresh : destination !== SUMMON_NEW
   })
+  if (fallback.ok) {
+    return {
+      ...fallback,
+      session: fallback.session || target,
+      destination,
+      fallback: true,
+      injection_reason: injection.reason,
+      injection_error: injection.error,
+      injection_detail: injection.detail
+    }
+  }
+
+  // Last door, and the only one that works when the tracked chat is a draft the
+  // gateway never created: reach it over JSON-RPC, minting a real chat if none
+  // of the tracked ids exist any more.
+  const rpc = await sendSummonRpc(target, message)
+  if (rpc.ok) {
+    return { ...rpc, destination, injection_reason: injection.reason }
+  }
+  // Nothing took the turn. Report the composer ladder's outcome (it seats the
+  // text for a retry) and keep the RPC's reason beside it for the journal.
+
   return {
     ...fallback,
     session: fallback.session || target,
@@ -1435,7 +1543,9 @@ async function summonButler(text, options = {}) {
     fallback: true,
     injection_reason: injection.reason,
     injection_error: injection.error,
-    injection_detail: injection.detail
+    injection_detail: injection.detail,
+    rpc_reason: rpc.reason,
+    rpc_error: rpc.error
   }
 }
 
