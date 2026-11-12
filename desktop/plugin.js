@@ -1431,11 +1431,17 @@ async function sendSummonRpc(target, text) {
     return { ok: false, reason: 'session_resume_failed', error: err, session: chosen }
   }
 
+  // The frame is what tells the model this came from the pet. Injection applies
+  // it server-side (butler_core/summon.py) and the composer fallback applies it
+  // with `/butler <text>`; a raw prompt.submit would lose it entirely, so route
+  // through the same slash door. An already-framed LOOK row ("[butler look] …")
+  // is passed through untouched.
+  const framed = /^\s*\[butler /.test(text) ? text : butlerCommandText(text)
   let receipt = null
   try {
     receipt = await host.request('prompt.submit', {
       session_id: chosen,
-      text,
+      text: framed,
       submission_id: `butler-${Date.now().toString(36)}`
     })
   } catch (err) {

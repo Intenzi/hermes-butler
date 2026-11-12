@@ -2402,7 +2402,8 @@ test('rpc send reuses the most recent tracked chat that still exists', async () 
   assert.equal(calls.some(call => call.method === 'session.create'), false,
     'an existing chat is reused, never re-created')
   const submit = calls.find(call => call.method === 'prompt.submit')
-  assert.equal(submit.params.text, 'hello there')
+  assert.equal(submit.params.text, '/butler hello there',
+    'the frame rides the same slash door the composer uses')
   assert.equal(submit.params.session_id, 'live-1')
 })
 
@@ -2485,9 +2486,29 @@ test('the pet field reaches a background chat over RPC when no composer is mount
 
   const submit = calls.find(call => call.path === 'rpc:prompt.submit')
   assert.ok(submit, 'the RPC door carried the text')
-  assert.equal(submit.opts.params.text, 'turn off wifi')
+  assert.equal(submit.opts.params.text, '/butler turn off wifi',
+    'the pet frame is never dropped on the RPC door')
   assert.equal(submit.opts.params.session_id, 'live-1')
   assert.deepEqual(acks, ['pending-rpc'], 'the row is acked once the send landed')
 
   env.dispose()
+})
+
+test('a look row keeps its own frame on the RPC door', async () => {
+  const seen = []
+  const host = defaultHost({
+    request: async (method, params) => {
+      if (method === 'session.list') return [{ id: 'live-1', created_at: 1 }]
+      if (method === 'session.resume') return { session_id: params.session_id }
+      if (method === 'prompt.submit') { seen.push(params.text); return { status: 'streaming' } }
+      throw new Error(`unexpected ${method}`)
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const looked = '[butler look] App: Preview · Window: a.pdf\nQuestion: why is this disabled?'
+  const result = await env.api.sendSummonRpc('live-1', looked)
+
+  assert.equal(result.ok, true)
+  assert.equal(seen[0], looked, 'an already-framed row is never wrapped twice')
 })
