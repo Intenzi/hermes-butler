@@ -6,7 +6,7 @@ butler_watch_stop, butler_watch_ack.
 Slash command: /butler <request> — inject the request into this chat as a real
 agent turn that plans and starts a guide.
 CLI: hermes butler capture|status|doctor.
-Skills: butler:follow (guide authoring), butler:conventions (dev conventions).
+Skills: butler:follow (guide authoring), butler:usage (when to offer one).
 """
 import json
 import logging
@@ -481,17 +481,10 @@ def register(ctx):
     except Exception:
         logger.exception("butler:follow skill registration failed")
     try:
-        conventions_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                        "skills", "butler-conventions", "SKILL.md")
-        ctx.register_skill(name="conventions", path=conventions_path,
-                           description="Butler plugin dev conventions: flat step keys, restart batching, verify-dsh-rule, checklist shape, TCC scope, card etiquette. Load for any butler board or code work.")
-    except Exception:
-        logger.exception("butler:conventions skill registration failed")
-    try:
         usage_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "skills", "butler-usage", "SKILL.md")
         ctx.register_skill(name="usage", path=usage_path,
                            description="When to offer a butler guide instead of step-by-step prose, and whether to use look, watch or a guide.")
     except Exception:
         logger.exception("butler:usage skill registration failed")
-    logger.info("Butler plugin registered: 10 tools, /butler (injected turn), CLI 'butler', 3 skills")
+    logger.info("Butler plugin registered: 10 tools, /butler (injected turn), CLI 'butler', 2 skills")

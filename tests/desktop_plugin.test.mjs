@@ -17,9 +17,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PLUGIN_JS = path.join(HERE, '..', 'desktop', 'plugin.js')
 const INTERNALS = [
   'summonButler', 'sendSummonText', 'sendSummonInjection', 'summonFromBar',
-  'summonFailureMessage', 'setPetClickClaim',
-  'startPetClickWatcher', 'stopPetClickWatcher', 'openSummonBar',
-  'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar', 'petCanvasNode',
+  'summonFailureMessage', 'openSummonBar',
+  'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar',
   'syncCompanionClaim', 'petStatusRowText', 'summonBarState',
   'readSummonDestination', 'setSummonDestination', 'getSummonDestination', 'butlerCommandText',
   'openFreshButlerSession', 'openButlerSession', 'createButlerSession', 'listButlerSessions',
@@ -30,49 +29,11 @@ const INTERNALS = [
   'watchHitLine', 'speechSnapshot'
 ]
 
-function makeDocument({
-  canvas = null,
-  selectors = ['canvas[aria-label$=" pet"]', 'canvas[aria-label="pet"]']
-} = {}) {
-  const listeners = []
-  const body = {
-    children: [],
-    appendChild(element) {
-      element.parentNode = body
-      body.children.push(element)
-      return element
-    },
-    removeChild(element) {
-      const index = body.children.indexOf(element)
-      if (index >= 0) body.children.splice(index, 1)
-      element.parentNode = null
-    }
-  }
-  return {
-    body,
-    listeners,
-    querySelector(selector) {
-      return selectors.includes(selector)
-        ? (typeof canvas === 'function' ? canvas() : canvas)
-        : null
-    },
-    createElement() {
-      return {
-        style: {},
-        attrs: {},
-        parentNode: null,
-        setAttribute(name, value) { this.attrs[name] = value }
-      }
-    },
-    addEventListener(type, listener, capture) {
-      listeners.push({ type, listener, capture })
-    },
-    removeEventListener(type, listener, capture) {
-      const index = listeners.findIndex(entry => entry.type === type
-        && entry.listener === listener && entry.capture === capture)
-      if (index >= 0) listeners.splice(index, 1)
-    }
-  }
+// The plugin no longer reads or mutates the host page: the only document
+// member it may touch is activeElement, and only to see whether focus is still
+// inside the plugin's own bar. This stub exposes exactly that.
+function makeDocument() {
+  return { activeElement: null }
 }
 
 function makeStorage(initial = {}) {
@@ -225,7 +186,21 @@ test('registers the "Ask the butler" global shortcut', async () => {
   assert.equal(typeof keybind.data.run, 'function')
 })
 
-test('register arms the chip and in-window receiver with no config key', async () => {
+test('the desktop plugin never reaches into the host page DOM', () => {
+  // The pet-click receiver was a document-wide capture listener plus a rect
+  // follower. Both are gone: the SDK slots and the companion chip own the
+  // surfaces now, so the source may not query, append to, or listen on the
+  // app's page at all.
+  const source = readFileSync(PLUGIN_JS, 'utf8')
+
+  assert.equal(source.includes('document.querySelector'), false)
+  assert.equal(source.includes('document.body.appendChild'), false)
+  assert.equal(source.includes("addEventListener('pointerdown'"), false)
+  assert.equal(source.includes('PET_CANVAS_SELECTORS'), false)
+  assert.equal(source.includes('petCanvasNode'), false)
+})
+
+test('register arms the companion chip with no config key', async () => {
   const calls = []
   const document = makeDocument()
   const env = await loadPlugin({
@@ -241,8 +216,6 @@ test('register arms the chip and in-window receiver with no config key', async (
     document
   })
 
-  assert.ok(document.listeners.some(entry => entry.type === 'pointerdown'),
-    'register armed the in-window listener without a stored key')
   const claims = calls.filter(call => call.path === '/summon/claim'
     && call.opts && call.opts.method === 'POST')
   assert.ok(claims.length >= 1, 'register synced the companion chip')
@@ -359,7 +332,7 @@ test('petless summon still sends and skips the companion double', async () => {
       }
       return {}
     },
-    document: makeDocument({ canvas: null })
+    document: makeDocument()
   })
 
   assert.equal((await env.api.summonButler('petless request')).ok, true)
@@ -591,66 +564,7 @@ test('denied injection falls back to /butler and toasts honestly', async () => {
   assert.match(toast.message, /could not host the full conversation/)
 })
 
-test('reach-in listener degrades silently when no pet canvas exists', async () => {
-  const document = makeDocument({ canvas: null })
-  const env = await loadPlugin({
-    host: defaultHost(),
-    rest: async () => ({ summon: { pet_click_claim: false } }),
-    document
-  })
-
-  assert.doesNotThrow(() => env.api.setPetClickClaim(true))
-  await Promise.resolve()
-  await Promise.resolve()
-
-  assert.equal(document.listeners.length, 1)
-  assert.equal(document.listeners[0].type, 'pointerdown')
-  assert.equal(document.listeners[0].capture, true)
-  assert.equal(document.body.children.length, 1)
-  assert.equal(document.body.children[0].style.opacity, '0')
-  assert.equal(env.consoleCalls.length, 0, 'no console spam')
-
-  assert.doesNotThrow(() => env.api.setPetClickClaim(false))
-  assert.equal(document.listeners.length, 0)
-  assert.equal(document.body.children.length, 0)
-  env.dispose()
-})
-
-test('capture-phase pet click summons only when the toggle is on', async () => {
-  const rect = { left: 40, top: 60, width: 80, height: 90, right: 120, bottom: 150 }
-  const canvas = { getBoundingClientRect: () => rect }
-  const document = makeDocument({ canvas })
-  const env = await loadPlugin({
-    host: defaultHost(),
-    rest: async () => ({ summon: { pet_click_claim: false } }),
-    document
-  })
-  const events = []
-  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
-  assert.equal(events.at(-1).open, false)
-
-  env.api.setPetClickClaim(true)
-  const armed = document.listeners[0].listener
-  armed({ button: 0, clientX: 80, clientY: 100 })
-  assert.equal(events.at(-1).open, true)
-  assert.equal(events.at(-1).origin, 'pet')
-
-  armed({ button: 0, clientX: 5, clientY: 5 })
-  assert.equal(events.at(-1).open, true, 'clicks outside the pet do not re-fire')
-
-  env.api.setPetClickClaim(false)
-  assert.equal(document.listeners.length, 0, 'disabling removes the capture listener')
-  assert.equal(document.body.children.length, 0, 'disabling removes the follow overlay')
-  unsubscribe()
-  env.dispose()
-})
-
-test('config loaded true arms the in-window receiver without a manual toggle', async () => {
-  // Reproduces the runtime condition: plugin register reads the gateway
-  // /config (which now round-trips the engine's file) and the toggle is on.
-  const rect = { left: 40, top: 60, width: 80, height: 90, right: 120, bottom: 150 }
-  const canvas = { getBoundingClientRect: () => rect }
-  const document = makeDocument({ canvas })
+test('config loaded true keeps the companion chip armed without a manual toggle', async () => {
   const calls = []
   const env = await loadPlugin({
     host: defaultHost(),
@@ -660,44 +574,12 @@ test('config loaded true arms the in-window receiver without a manual toggle', a
       if (requestPath === '/summon/claim') return { ok: true, enabled: true, running: true }
       return {}
     },
-    document
+    document: makeDocument()
   })
 
-  const listener = document.listeners.find(entry => entry.type === 'pointerdown')
-  assert.ok(listener, 'register() armed the capture listener from the config file')
-  const events = []
-  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
-  listener.listener({ button: 0, clientX: 80, clientY: 100 })
-  assert.equal(events.at(-1).open, true)
-  assert.equal(events.at(-1).origin, 'pet')
   const claim = calls.find(call => call.path === '/summon/claim' && call.opts?.method === 'POST')
-  assert.ok(claim, 'the companion chip is synced from the same config value')
+  assert.ok(claim, 'the companion chip is synced from the config value')
   assert.equal(claim.opts.body.enabled, true)
-  unsubscribe()
-  env.dispose()
-})
-
-test('the pet locator accepts the core bare aria-label="pet" spelling', async () => {
-  const rect = { left: 10, top: 10, width: 32, height: 32, right: 42, bottom: 42 }
-  const canvas = { getBoundingClientRect: () => rect }
-  const document = makeDocument({ canvas, selectors: ['canvas[aria-label="pet"]'] })
-  const env = await loadPlugin({
-    host: defaultHost(),
-    rest: async requestPath => requestPath === '/config'
-      ? { summon: { pet_click_claim: true } }
-      : { ok: true, enabled: true },
-    document
-  })
-
-  assert.equal(env.api.petCanvasNode(), canvas)
-  env.api.setPetClickClaim(true)
-  const listener = document.listeners.find(entry => entry.type === 'pointerdown')
-  const events = []
-  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
-  listener.listener({ button: 0, clientX: 20, clientY: 20 })
-  assert.equal(events.at(-1).open, true)
-  assert.equal(events.at(-1).origin, 'pet')
-  unsubscribe()
   env.dispose()
 })
 
@@ -1243,19 +1125,16 @@ test('a dead guide step does not steal the watch keep-alive', async () => {
   env.dispose()
 })
 
-test('the pane status row names the chip and in-app pet, and flashes once', async () => {
+test('the pane status row names the chip, and flashes once after a chip open', async () => {
   const env = await loadPlugin({
     host: defaultHost(), rest: async () => ({}), document: makeDocument()
   })
 
-  assert.equal(env.api.petStatusRowText({ claim: true, petFound: false }),
-    'chip: on · pet (in-app): not found')
-  assert.equal(env.api.petStatusRowText({ claim: true, petFound: true }),
-    'chip: on · pet (in-app): found')
-  assert.equal(env.api.petStatusRowText({ claim: true, petFound: true, flash: true }),
-    'chip: on · pet (in-app): found · → bar opened')
-  assert.equal(env.api.petStatusRowText({ claim: false, petFound: false }),
-    'chip: off · pet (in-app): not found', 'only the stored escape hatch can read off')
+  assert.equal(env.api.petStatusRowText({ claim: true }), 'chip: on')
+  assert.equal(env.api.petStatusRowText({ claim: true, flash: true }),
+    'chip: on · → bar opened')
+  assert.equal(env.api.petStatusRowText({ claim: false }),
+    'chip: off', 'only the stored escape hatch can read off')
   env.dispose()
 })
 
@@ -1278,33 +1157,6 @@ test('a pet-origin open publishes a new click sequence; dismiss and shortcut do 
 
   env.api.openSummonBar('shortcut')
   assert.equal(states.at(-1).petClickSeq, start + 1, 'the shortcut is not a pet click')
-
-  unsubscribe()
-  env.dispose()
-})
-
-test('a click while the claim is off never opens the bar', async () => {
-  const rect = { left: 40, top: 60, width: 80, height: 90, right: 120, bottom: 150 }
-  const canvas = { getBoundingClientRect: () => rect }
-  const document = makeDocument({ canvas })
-  const env = await loadPlugin({
-    host: defaultHost(),
-    rest: async () => ({ summon: { pet_click_claim: false } }),
-    document
-  })
-  const events = []
-  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
-
-  // A watcher can be alive before the authoritative config poll turns it on.
-  env.api.startPetClickWatcher()
-  const listener = document.listeners.find(entry => entry.type === 'pointerdown').listener
-  listener({ button: 0, clientX: 80, clientY: 100 })
-  assert.equal(events.at(-1).open, false, 'claim off ignores the pet click')
-
-  env.api.setPetClickClaim(true)
-  listener({ button: 0, clientX: 80, clientY: 100 })
-  assert.equal(events.at(-1).open, true, 'claim on opens the bar')
-  assert.equal(events.at(-1).origin, 'pet')
 
   unsubscribe()
   env.dispose()

@@ -251,104 +251,6 @@ def _summon_pet_double() -> bool:
         return False
 
 
-def _gateway_runner(ctx):
-    """The live gateway runner published for plugin injection, or None.
-
-    ``PluginContext._manager`` carries the same owner/injector tuple
-    ``hermes_cli.plugins.publish_gateway_message_host`` stamps, so the runner
-    (and its ``session_store``) is reachable without importing gateway state.
-    """
-    manager = getattr(ctx, "_manager", None)
-    host = getattr(manager, "_gateway_message_injector", None)
-    if not (isinstance(host, tuple) and len(host) == 2 and host[0] is not None):
-        try:
-            from hermes_cli import plugins as hermes_plugins
-
-            host = getattr(hermes_plugins, "_published_gateway_message_injector", None)
-        except Exception:
-            host = None
-    if isinstance(host, tuple) and len(host) == 2 and host[0] is not None:
-        return host[0]
-    return None
-
-
-def _entry_session_key(entry: Any) -> str | None:
-    if isinstance(entry, dict):
-        value = entry.get("session_key")
-    else:
-        value = getattr(entry, "session_key", None)
-    return value if isinstance(value, str) and value.strip() else None
-
-
-def _generated_local_route(store: Any, session_id: str) -> str | None:
-    """Ask the store's own key builder for the local DM route, if it exists.
-
-    This is only a fallback after a direct ``lookup_by_session_id`` miss: the
-    key template lives in ``gateway.session`` and the profile resolution lives
-    in the store, never in this plugin.
-    """
-    generate = getattr(store, "_generate_session_key", None)
-    if not callable(generate):
-        return None
-    try:
-        from gateway.config import Platform
-        from gateway.session import SessionSource
-
-        source = SessionSource(platform=Platform.LOCAL, chat_type="dm", chat_id=session_id)
-        route = generate(source)
-    except Exception:
-        return None
-    if not isinstance(route, str) or not route.strip():
-        return None
-    # A generated key only counts when the same store can resolve it.
-    lookup_key = getattr(store, "lookup_by_session_key", None)
-    if callable(lookup_key):
-        try:
-            return route if lookup_key(route) is not None else None
-        except Exception:
-            return None
-    return route
-
-
-def _resolve_session_route(ctx, session_id: str) -> tuple[str | None, str | None]:
-    """Derive the gateway routing key for a desktop session id.
-
-    Returns ``(route, detail)``. ``route`` is None when the gateway cannot
-    resolve the id; ``detail`` then carries the honest reason. A live runner's
-    store is authoritative; a bare ``local-…`` id is never used as a route.
-    """
-    runner = _gateway_runner(ctx)
-    if runner is None:
-        # No gateway host in this process: preserve the old caller-keyed path.
-        return session_id, None
-    store = getattr(runner, "session_store", None)
-    if store is None:
-        return None, f"gateway has no session store to resolve {session_id}"
-
-    lookup_id = getattr(store, "lookup_by_session_id", None)
-    if callable(lookup_id):
-        try:
-            route = _entry_session_key(lookup_id(session_id))
-        except Exception as exc:  # noqa: BLE001 - report, never 500 the send
-            return None, f"gateway session lookup failed for {session_id}: {exc}"
-        if route:
-            return route, None
-
-    # Already a routing key? Accept it only when the store confirms the row.
-    lookup_key = getattr(store, "lookup_by_session_key", None)
-    if callable(lookup_key):
-        try:
-            if lookup_key(session_id) is not None:
-                return session_id, None
-        except Exception:
-            pass
-
-    route = _generated_local_route(store, session_id)
-    if route:
-        return route, None
-    return None, f"no gateway session route for {session_id}"
-
-
 def _spool_path() -> Path:
     """The ask-field spool the companion appends to.
 
@@ -652,10 +554,11 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
     """Inject a framed butler turn into the session the desktop selected.
 
     The desktop resolves the destination (oldest Butler chat, or the fresh one it
-    just created) and sends its durable id. ``ctx.inject_message`` fails closed
-    when gateway injection is not allowed; the contract is a stable
-    ``{ok: false, reason: "injection_denied"}`` so the desktop can fall back to
-    the honest composer/slash path.
+    just created) and sends its durable chat id. Routing uses the supported
+    ``ctx.inject_message(..., session_key=<chat id>)`` seam: the host owns the
+    session-key rules, so this plugin never derives or reaches into them.
+    ``False`` means unroutable (or denied); the desktop then falls back to the
+    honest composer/slash path.
     """
     text = body.get("text") if isinstance(body, dict) else None
     session_id = body.get("session_id") if isinstance(body, dict) else None
@@ -670,21 +573,24 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
     inject = getattr(ctx, "inject_message", None)
     if not callable(inject):
         return {"ok": False, "reason": "injection_denied"}
-    route, detail = _resolve_session_route(ctx, session_id)
-    if route is None:
-        return {"ok": False, "reason": "unroutable_session", "detail": detail}
     # A LOOK row came from the ⌘⇧L door: its turn also asks for butler_say, so
     # the short answer lands beside the pointer instead of only in the chat.
     frame = _summon_frame(text, origin)
     try:
-        accepted = bool(inject(frame, role="user", session_key=route))
+        accepted = bool(inject(frame, role="user", session_key=session_id))
     except Exception:
-        logger.exception("butler summon injection failed")
+        logger.exception("butler summon injection failed for %s", session_id)
         accepted = False
     if not accepted:
-        return {"ok": False, "reason": "injection_denied",
-                "detail": f"gateway refused session_key {route}"}
-    return {"ok": True, "session": session_id, "session_key": route}
+        # One line, never a raise: the answer stays in chat. The host requires
+        # ``plugins.entries.butler.allow_gateway_injection: true`` for this seam,
+        # so name it or the refusal is not actionable.
+        logger.warning(
+            "butler summon unroutable for session %s; check "
+            "allow_gateway_injection: true for this plugin", session_id)
+        return {"error": "unroutable",
+                "hint": "the desktop session could not be reached; the answer stays in chat"}
+    return {"ok": True, "session": session_id}
 
 
 @router.post("/watch/ack")

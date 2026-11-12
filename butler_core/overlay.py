@@ -160,6 +160,17 @@ COMPANION_URL_TEMPLATE = (
     "v{version}/ButlerOverlay-universal"
 )
 
+#: SHA-256 of the reviewed v0.4.1 ``ButlerOverlay-universal`` asset. This is the
+#: digest a reviewer actually saw, so it is the one the download must match: the
+#: release's own ``.sha256`` asset travels with (and is re-uploaded beside) the
+#: binary, so it cannot prove what was reviewed. Update this in the commit that
+#: follows each release -- CI builds the asset after the tag, so the hash cannot
+#: exist before it. A mismatch is a refusal, not a repair: the compile-from-
+#: bundled-source fallback takes over.
+EXPECTED_HELPER_SHA256 = (
+    "45da2cf2f839420e9ba0caba2bd797c034a56c82c04614f27769219ae43730af"
+)
+
 #: A failed download is remembered for this long so an offline session does not
 #: pay the 6 s timeout on every single use. This is a suppression window, not a
 #: wait: nothing is delayed, the attempt is simply skipped. Two minutes keeps a
@@ -286,19 +297,6 @@ def _http_get(url):
                 pass
 
 
-def _parse_sha256(raw):
-    """The first token of a ``shasum`` file, or None when it is not a digest."""
-    try:
-        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-    except Exception:  # noqa: BLE001
-        return None
-    tokens = text.split()
-    if not tokens:
-        return None
-    candidate = tokens[0].lower()
-    return candidate if _SHA256_RE.match(candidate) else None
-
-
 def _release_buildinfo(url):
     """The release's own ``.buildinfo`` payload, or None when not published."""
     base = url.rpartition("/")[0]
@@ -354,20 +352,16 @@ def fetch_binary():
     """Download, verify, and install the attested universal helper.
 
     Returns ``(True, "downloaded")`` or ``(False, "download_failed: <reason>")``.
-    The release's own ``.sha256`` asset supplies the digest, so the binary and
-    the checksum travel together and a mismatch never reaches the executable.
+    The decision is the digest pinned in this tree (``EXPECTED_HELPER_SHA256``).
+    The release's own ``.sha256`` asset is deliberately NOT consulted: it travels
+    beside the binary, so a re-upload can replace both. A mismatch is a refusal,
+    not a repair -- the compile-from-bundled-source path takes over.
     """
     url = download_url()
     if not url:
         return False, "download_failed: no release url configured"
 
-    # Refuse to install what cannot be verified: no checksum, no download.
-    try:
-        expected = _parse_sha256(_http_get(url + ".sha256"))
-    except Exception as exc:  # noqa: BLE001
-        return False, "download_failed: sha256 asset unavailable: %s" % exc
-    if not expected:
-        return False, "download_failed: sha256 asset malformed"
+    expected = EXPECTED_HELPER_SHA256
 
     partial = binary_path() + ".download"
     try:
@@ -398,6 +392,7 @@ def fetch_binary():
         return False, "download_failed: %s" % exc
     if actual != expected:
         _remove_quietly(partial)
+        _journal("download_failed: digest not the pinned one")
         return False, "download_failed: sha256 mismatch"
 
     try:
@@ -421,9 +416,10 @@ def ensure_binary():
        ``source: "download"`` is NOT trusted in a working checkout (``.git`` in
        the plugin root): that asset may predate a local edit, so it compiles.
     2. ``downloaded`` - fetch the attested release asset, verify it against the
-       release's own SHA-256, and install it atomically. Skipped when
-       ``BUTLER_NO_DOWNLOAD`` is set, no ``.companion_url`` is shipped, or a
-       working checkout is rebuilding stale local source.
+       SHA-256 pinned in this tree (``EXPECTED_HELPER_SHA256``), and install it
+       atomically. Skipped when ``BUTLER_NO_DOWNLOAD`` is set, no
+       ``.companion_url`` is shipped, or a working checkout is rebuilding stale
+       local source.
     3. ``compiled`` - compile the bundled Swift source with ``swiftc``.
     4. ``(False, ...)`` - ``download_failed`` when a compile was attempted and
        failed too, ``swiftc_not_found`` when the source is there but no
@@ -796,6 +792,14 @@ class Overlay:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     bufsize=0,
+                    # The helper needs none of this process's credentials: spawn
+                    # with a minimal environment so provider keys are not
+                    # inherited by a long-lived screen/drawing child.
+                    env={
+                        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                        "HOME": os.environ.get("HOME", os.path.expanduser("~")),
+                        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+                    },
                 )
                 self.starting = False
                 self._start_reader()

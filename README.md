@@ -29,10 +29,11 @@ started with.
 
 First use downloads the ~1.2 MB universal arm64+x86_64 screen helper from this
 repository's attested GitHub release — published by CI with
-`actions/attest-build-provenance` — and verifies it against the release's
-SHA-256. No compiler needed. If the download fails and Command Line Tools are
-installed, Butler compiles the bundled Swift source instead (7–14 s). See
-[docs/](docs) for the build and provenance detail.
+`actions/attest-build-provenance` — and verifies it against a SHA-256 pinned in
+this repository's source. The file that runs must be the file that was reviewed;
+a mismatch is refused, never repaired. No compiler needed. If the download fails
+and Command Line Tools are installed, Butler compiles the bundled Swift source
+instead (7–14 s). See [docs/](docs) for the build and provenance detail.
 
 ## What you get
 
@@ -86,8 +87,9 @@ pictures, no OCR, no model looking at your screen.
 - **Nothing leaves the machine** except what the chat's own model provider
   already receives. No telemetry, no auto-updater.
 - **One download, ever.** The attested helper from this repository's release,
-  SHA-256 verified. Refuse it with `BUTLER_NO_DOWNLOAD=1` and it will compile the
-  bundled source locally when it can.
+  checked against a SHA-256 pinned in the source tree. Refuse it with
+  `BUTLER_NO_DOWNLOAD=1` and it will compile the bundled source locally when it
+  can.
 - **Guide-only by design.** Butler never types, clicks, or edits your files; it
   shows and verifies. A guide refuses to start under an unattended run, so a
   cron session cannot become a background screenreader.
@@ -175,8 +177,8 @@ service; it exits when nothing is watching and the pet is gone.
 - [docs/demo-script.md](docs/demo-script.md) — the 90-second walkthrough.
 - [docs/evidence-where-is-it.md](docs/evidence-where-is-it.md) — the field
   evidence behind the "where do I find X" use case.
-- [skills/](skills) — `butler:follow` (when to offer a guide), `butler:usage`
-  (when to suggest one at all), `butler:conventions` (contributor rules).
+- [skills/](skills) — `butler:follow` (when to offer a guide),
+  `butler:usage` (when to suggest one at all).
 - Tests: `pytest` and `npm test`.
 - Screenshots live in `docs/img`.
 

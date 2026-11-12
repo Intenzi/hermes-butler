@@ -85,6 +85,9 @@ def _download_layout(tmp_path, monkeypatch, *, buildinfo=None, source=SOURCE,
         src.unlink()
     (tmp_path / ".companion_url").write_text(URL_TEMPLATE + "\n", encoding="utf-8")
     monkeypatch.delenv(overlay.NO_DOWNLOAD_ENV, raising=False)
+    # The real pin names the released v0.4.1 asset, which is not this fixture:
+    # pin the fixture bytes here and let the mismatch test override the pin.
+    monkeypatch.setattr(overlay, "EXPECTED_HELPER_SHA256", _sha(BINARY))
     manifest = tmp_path / "plugin.yaml"
     manifest.write_text("name: butler\nversion: 9.9.9\n", encoding="utf-8")
     monkeypatch.setattr(overlay, "plugin_yaml_path", lambda: str(manifest))
@@ -208,7 +211,7 @@ def test_download_installs_the_verified_helper_and_its_buildinfo(
     assert overlay.ensure_binary() == (True, "downloaded")
 
     assert [url for url, _ in calls] == [
-        base + ".sha256", base, release_dir + "/.buildinfo"]
+        base, release_dir + "/.buildinfo"]
     assert all(timeout == overlay.DOWNLOAD_TIMEOUT for _, timeout in calls)
     assert exe.read_bytes() == BINARY
     assert exe.stat().st_mode & 0o111, "the helper must be executable"
@@ -245,7 +248,7 @@ def test_download_falls_back_to_a_renamed_buildinfo_sibling(
     assert overlay.ensure_binary() == (True, "downloaded")
 
     assert [url for url, _ in calls] == [
-        base + ".sha256", base, release_dir + "/.buildinfo",
+        base, release_dir + "/.buildinfo",
         base + ".buildinfo"]
     recorded = json.loads(info.read_text(encoding="utf-8"))
     assert recorded["source"] == "download"
@@ -375,13 +378,17 @@ def test_a_locally_compiled_matching_row_stays_present(tmp_path, monkeypatch):
     assert overlay.ensure_binary() == (True, "present")
 
 
-def test_a_sha256_mismatch_removes_the_partial_file_and_falls_through(
+def test_a_digest_mismatch_removes_the_partial_file_and_falls_through(
         tmp_path, monkeypatch):
+    # The blocker this pins: a re-uploaded asset carries its own matching
+    # .sha256, so that asset agreeing with the payload proves nothing. Only the
+    # digest committed in the tree may decide.
+    evil = b"\xcf\xfa\xed\xfere-uploaded helper\n"
     exe, _, _ = _download_layout(tmp_path, monkeypatch)
     base = URL_TEMPLATE.format(version="9.9.9")
     _mock_http(monkeypatch, {
-        base: BINARY,
-        base + ".sha256": _sha(b"some other binary entirely"),
+        base: evil,
+        base + ".sha256": _sha(evil),
     })
     lookups, runs = _stub_compiler(monkeypatch, works=False)
 
@@ -391,7 +398,7 @@ def test_a_sha256_mismatch_removes_the_partial_file_and_falls_through(
     assert detail.startswith("download_failed:")
     assert "sha256 mismatch" in detail
     assert not Path(str(exe) + ".download").exists(), "the partial file is removed"
-    assert exe.read_bytes() != BINARY, "an unverified binary is never installed"
+    assert exe.read_bytes() != evil, "an unverified binary is never installed"
     # The mismatch falls through to the compile step, which also cannot rescue
     # this machine; the reported reason stays the primary (download) failure.
     assert "swiftc" in lookups
@@ -399,10 +406,42 @@ def test_a_sha256_mismatch_removes_the_partial_file_and_falls_through(
     assert not Path(str(exe) + ".new").exists()
 
 
+def test_the_release_checksum_is_never_consulted(tmp_path, monkeypatch):
+    # The release's own .sha256 travels beside the binary, so a re-upload can
+    # replace both. It must not be fetched: the pinned digest is the only
+    # decision, which means exactly one request -- the asset itself.
+    exe, _, _ = _download_layout(tmp_path, monkeypatch)
+    base = URL_TEMPLATE.format(version="9.9.9")
+    calls = _mock_http(monkeypatch, {
+        base: BINARY,
+        base + ".sha256": _sha(b"some other binary entirely"),
+    })
+    monkeypatch.setattr(overlay, "shutil", types.SimpleNamespace(
+        which=lambda name: None))
+    monkeypatch.setattr(overlay, "subprocess", types.SimpleNamespace(
+        run=lambda *a, **k: pytest.fail("a pinned helper must not compile")))
+
+    assert overlay.ensure_binary() == (True, "downloaded")
+    urls = [url for url, _ in calls]
+    assert urls[0] == base, "the asset is fetched first"
+    assert not any(url.endswith(".sha256") for url in urls), "no checksum sidecar request"
+    assert exe.read_bytes() == BINARY
+
+
+def test_a_pinned_helper_digest_is_a_lowercase_sha256():
+    digest = overlay.EXPECTED_HELPER_SHA256
+
+    assert len(digest) == 64
+    assert digest == digest.lower()
+    assert all(char in "0123456789abcdef" for char in digest)
+    assert digest == (
+        "45da2cf2f839420e9ba0caba2bd797c034a56c82c04614f27769219ae43730af")
+
+
 def test_download_failure_with_nothing_to_compile_is_helper_unavailable(
         tmp_path, monkeypatch):
     _download_layout(tmp_path, monkeypatch, source=None)
-    _mock_http(monkeypatch, {})  # the .sha256 asset is unreachable
+    _mock_http(monkeypatch, {})  # neither the checksum nor the asset is reachable
     monkeypatch.setattr(overlay, "shutil", types.SimpleNamespace(
         which=lambda name: None))
     monkeypatch.setattr(overlay, "subprocess", types.SimpleNamespace(
@@ -411,19 +450,21 @@ def test_download_failure_with_nothing_to_compile_is_helper_unavailable(
     assert overlay.ensure_binary() == (False, "helper-unavailable")
 
 
-def test_download_refuses_to_install_without_the_published_sha256(
+def test_the_download_does_not_depend_on_a_sidecar_asset(
         tmp_path, monkeypatch):
+    # The pin is in the tree, so a release with no .sha256 beside it is still
+    # installable -- and still verified against the pinned digest.
     exe, _, _ = _download_layout(tmp_path, monkeypatch)
     base = URL_TEMPLATE.format(version="9.9.9")
     calls = _mock_http(monkeypatch, {base: BINARY})
     _stub_compiler(monkeypatch, works=False)
 
-    ok, detail = overlay.ensure_binary()
+    assert overlay.ensure_binary() == (True, "downloaded")
 
-    assert ok is False
-    assert detail.startswith("download_failed:")
-    assert [url for url, _ in calls] == [base + ".sha256"]
-    assert exe.read_bytes() != BINARY, "an unverified binary is never installed"
+    urls = [url for url, _ in calls]
+    assert urls[0] == base
+    assert not any(url.endswith(".sha256") for url in urls), "the sidecar is never requested"
+    assert exe.read_bytes() == BINARY, "the pinned digest verified the payload"
 
 
 def test_butler_no_download_refuses_the_network_and_compiles(

@@ -42,18 +42,21 @@ def test_plugin_registers_a_fixed_summon_bar_without_a_pet_claim_toggle() -> Non
     assert "Click the pet to ask the butler" not in source
     assert "writePetClickClaim" not in source
     assert "pet_click_claim" in source
-    assert "canvas[aria-label$=\" pet\"]" in source
-    assert "canvas[aria-label=\"pet\"]" in source
+    # The bar is an SDK titlebar slot; it never locates or overlays the app page.
+    assert "PET_CANVAS_SELECTORS" not in source
+    assert "document.querySelector" not in source
+    assert "document.body.appendChild" not in source
+    assert "addEventListener('pointerdown'" not in source
 
 
 def test_plugin_has_an_honest_chip_status_row_and_popout_bridge() -> None:
     source = PLUGIN_JS.read_text(encoding="utf-8")
 
-    assert "chip: ${claim ? 'on' : 'off'} · pet (in-app):" in source
+    assert "chip: ${claim ? 'on' : 'off'}" in source
     assert "petStatusRowText" in source
     assert "→ bar opened" in source
     assert "syncCompanionClaim(true)" in source
-    assert "setPetClickClaim(true)" in source
+    assert "setPetClickClaim" not in source
     assert "/summon/claim" in source
     assert "summon_pending" in source
     assert "/summon/ack" in source

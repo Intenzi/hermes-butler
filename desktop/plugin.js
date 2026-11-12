@@ -7,10 +7,9 @@
  * creates or focuses the "Butler" chat.
  *
  * SDK-first surface (routes, nav, palette, status bar, keybinds, host sessions,
- * composer submit). The one deliberate reach-in is the always-on pet-click
- * receiver: it only READS the pet canvas rect and observes pointerdown; it
- * never paints into the canvas and is torn down with the plugin.
- * Bubble rendering stays on the Python side via ctx.pet.say.
+ * composer submit). The plugin never reads or paints the Desktop app's page:
+ * the pet click receiver and its page overlay are gone. Bubble rendering stays
+ * on the Python side via ctx.pet.say.
  */
 import {
   Button,
@@ -44,10 +43,7 @@ const SUMMON_SEND_TIMEOUT_MS = 6000
 // between attempts, but at most this often.
 const SUMMON_LIVE_REFRESH_MS = 600
 const CONFIG_REFRESH_MS = 5000
-// Documented legacy locator for the petdex pet (the core pet canvas). Read-only:
-// we never paint into it and never edit Hermes core to add a hook. The bare
-// "pet" form is what the core emits when the pet has no displayName.
-const PET_CANVAS_SELECTORS = ['canvas[aria-label$=" pet"]', 'canvas[aria-label="pet"]']
+// The SDK status-line / speech beat cadence (not a DOM read).
 const PET_STATUS_REFRESH_MS = 2000
 // The host clamps a pet line's ttl to 30 s, so an ambient watch re-says its
 // count every 25 s: the pet must never look idle for half a minute while it is
@@ -104,14 +100,13 @@ let petSayTicks = 0
 let petLastTick = null
 
 // Summon door state. The bar component is the only visible surface; the
-// keybind and the installed-by-default pet-click listener just publish "open".
+// keybind, the status-bar launcher and the companion chip just publish "open".
 let summonOpen = false
 let summonOrigin = 'shortcut'
-// Increments on every pet-origin open; the pane row flashes when it changes.
+// Increments on every pet-origin open (the companion chip path); the pane row
+// flashes when it changes.
 let petClickSeq = 0
 const summonListeners = new Set()
-let petClickClaim = false
-let petClickWatcher = null
 let claimConfigTimer = null
 // Module-scope consumer for the companion chip's summon row. The hook inside
 // SummonBar only runs while that component is mounted; the chip click path must
@@ -119,9 +114,6 @@ let claimConfigTimer = null
 // fallback. lastPendingId dedupes a row that survives one poll before the ack.
 let summonPendingTimer = null
 let lastPendingId = null
-// Has the in-window core pet canvas ever been found while the receiver was on?
-// The pane chip uses this to say "armed" only when there is something to click.
-let petCanvasSeen = false
 // Destination picker state; localStorage is the cross-opening source of truth.
 let summonDestination = null
 
@@ -823,27 +815,13 @@ function butlerCommandText(value) {
   return /^\s*\//.test(text) ? text : `/butler ${text}`
 }
 
-function petCanvasNode() {
-  if (typeof document === 'undefined') return null
-  for (const selector of PET_CANVAS_SELECTORS) {
-    try {
-      const canvas = document.querySelector(selector)
-      if (canvas) return canvas
-    } catch (err) {
-      // Try the next documented spelling.
-    }
-  }
-  return null
-}
-
 /**
- * The pane's persistent two-field readout. The chip is on for an installed
- * plugin; `petFound` is the in-app canvas query and `flash` is the brief
- * confirmation after a claimed click opened the bar. It never becomes a
- * multi-line nag and it has no switch semantics.
+ * The pane's persistent chip readout. The chip is on for an installed plugin;
+ * `flash` is the brief confirmation after a chip-origin open raised the bar. It
+ * never becomes a multi-line nag and it has no switch semantics.
  */
-function petStatusRowText({ claim = true, petFound = false, flash = false } = {}) {
-  const row = `chip: ${claim ? 'on' : 'off'} · pet (in-app): ${petFound ? 'found' : 'not found'}`
+function petStatusRowText({ claim = true, flash = false } = {}) {
+  const row = `chip: ${claim ? 'on' : 'off'}`
   return flash ? `${row} · → bar opened` : row
 }
 
@@ -901,116 +879,6 @@ function configPetClickClaim(data) {
   return true
 }
 
-function startPetClickWatcher() {
-  if (petClickWatcher || typeof document === 'undefined' || !document.body) return
-  let overlay = null
-  let frame = null
-  let disposed = false
-  let lastRect = null
-  try {
-    overlay = document.createElement('div')
-    overlay.setAttribute('data-butler-pet-claim', '')
-    overlay.setAttribute('aria-hidden', 'true')
-    Object.assign(overlay.style, {
-      position: 'fixed', pointerEvents: 'none', zIndex: '2147483000',
-      left: '0px', top: '0px', width: '0px', height: '0px',
-      opacity: '0', borderRadius: '10px'
-    })
-    document.body.appendChild(overlay)
-  } catch (err) {
-    overlay = null
-  }
-
-  const follow = () => {
-    if (disposed) return
-    const canvas = petCanvasNode()
-    if (!canvas || !overlay) {
-      if (overlay) overlay.style.opacity = '0'
-      frame = window.requestAnimationFrame(follow)
-      return
-    }
-    try {
-      const rect = canvas.getBoundingClientRect()
-      if (!rect || rect.width <= 0 || rect.height <= 0) {
-        overlay.style.opacity = '0'
-      } else {
-        petCanvasSeen = true
-        const box = { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
-        if (!lastRect || Math.abs(lastRect.left - box.left) > 0.5
-          || Math.abs(lastRect.top - box.top) > 0.5
-          || Math.abs(lastRect.width - box.width) > 0.5
-          || Math.abs(lastRect.height - box.height) > 0.5) {
-          overlay.style.left = `${box.left}px`
-          overlay.style.top = `${box.top}px`
-          overlay.style.width = `${box.width}px`
-          overlay.style.height = `${box.height}px`
-          lastRect = box
-        }
-        overlay.style.opacity = '1'
-      }
-    } catch (err) {
-      if (overlay) overlay.style.opacity = '0'
-    }
-    frame = window.requestAnimationFrame(follow)
-  }
-
-  const onPointerDown = (event) => {
-    if (!petClickClaim || disposed) return
-    try {
-      if (event && typeof event.button === 'number' && event.button !== 0) return
-      const canvas = petCanvasNode()
-      if (!canvas) return
-      petCanvasSeen = true
-      const rect = canvas.getBoundingClientRect()
-      if (!rect || rect.width <= 0 || rect.height <= 0) return
-      const x = Number(event && event.clientX)
-      const y = Number(event && event.clientY)
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return
-      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
-        openSummonBar('pet')
-      }
-    } catch (err) {
-      // Never let the reach-in listener break the pet's own click handling.
-    }
-  }
-
-  try {
-    document.addEventListener('pointerdown', onPointerDown, true)
-  } catch (err) {
-    // A DOM without capture-phase events still leaves the shortcut working.
-  }
-  frame = window.requestAnimationFrame(follow)
-
-  petClickWatcher = {
-    dispose() {
-      if (disposed) return
-      disposed = true
-      try { document.removeEventListener('pointerdown', onPointerDown, true) } catch (err) { }
-      try { if (frame !== null) window.cancelAnimationFrame(frame) } catch (err) { }
-      frame = null
-      try { if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay) } catch (err) { }
-      overlay = null
-      petClickWatcher = null
-    }
-  }
-}
-
-function stopPetClickWatcher() {
-  if (petClickWatcher) petClickWatcher.dispose()
-}
-
-function setPetClickClaim(enabled) {
-  const next = Boolean(enabled)
-  if (!next) {
-    petClickClaim = false
-    petCanvasSeen = false
-    stopPetClickWatcher()
-    return
-  }
-  petClickClaim = true
-  startPetClickWatcher()
-}
-
 async function syncCompanionClaim(enabled) {
   if (!rest || typeof rest !== 'function') return false
   try {
@@ -1020,8 +888,8 @@ async function syncCompanionClaim(enabled) {
     })
     return Boolean(result && result.enabled === Boolean(enabled))
   } catch (err) {
-    // Companion unavailable is a degrade: the in-window listener and the
-    // shortcut still work, so this is not a toggle failure.
+    // Companion unavailable is a degrade: the shortcut and the status-bar
+    // launcher still work, so this is not a toggle failure.
     return false
   }
 }
@@ -1032,7 +900,6 @@ async function syncPetClickClaim() {
     const result = await rest('/config')
     // Missing/legacy responses resolve to on; only a stored false disarms.
     const enabled = configPetClickClaim(result)
-    setPetClickClaim(enabled)
     // Keep the pop-out chip on the same config value, and refresh its process
     // heartbeat so the companion's idle watchdog does not retire it.
     await syncCompanionClaim(enabled)
@@ -1662,10 +1529,6 @@ function LauncherButton({ compact = false }) {
 
 // ---------------------------------------------------------------- summon bar
 
-function clamp(value, min, max) {
-  return Math.min(Math.max(value, min), max)
-}
-
 /**
  * Floating "Ask the butler" bar. It is mounted once by the permanent titlebar
  * slot and only paints while the shortcut / pet click has opened it.
@@ -1675,7 +1538,6 @@ function SummonBar() {
   const [origin, setOrigin] = useState('shortcut')
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
-  const [position, setPosition] = useState(null)
   const [destination, setDestination] = useState(() => getSummonDestination())
   const inputRef = useRef(null)
   const barRef = useRef(null)
@@ -1729,44 +1591,6 @@ function SummonBar() {
     return () => window.clearTimeout(id)
   }, [open])
 
-  // Follow the pet while the bar is open; otherwise park upper-right. The
-  // same read-only locator the pet-click listener uses.
-  useEffect(() => {
-    if (!open) return undefined
-    let frame = null
-    let last = ''
-    const follow = () => {
-      const bar = barRef.current
-      const width = bar && bar.offsetWidth ? bar.offsetWidth : 360
-      const height = bar && bar.offsetHeight ? bar.offsetHeight : 48
-      let left = Math.max(12, window.innerWidth - width - 16)
-      let top = 16
-      const canvas = petCanvasNode()
-      if (canvas) {
-        try {
-          const rect = canvas.getBoundingClientRect()
-          if (rect && rect.width > 0 && rect.height > 0) {
-            left = rect.left - width - 14
-            if (left < 12) left = rect.right + 14
-            left = clamp(left, 12, Math.max(12, window.innerWidth - width - 12))
-            top = clamp(rect.top + rect.height / 2 - height / 2,
-              12, Math.max(12, window.innerHeight - height - 12))
-          }
-        } catch (err) {
-          // Keep the upper-right seat when the canvas is unreadable.
-        }
-      }
-      const key = `${Math.round(left)}:${Math.round(top)}`
-      if (key !== last) {
-        last = key
-        setPosition({ left: Math.round(left), top: Math.round(top) })
-      }
-      frame = window.requestAnimationFrame(follow)
-    }
-    follow()
-    return () => { if (frame !== null) window.cancelAnimationFrame(frame) }
-  }, [open])
-
   const close = () => {
     if (busyRef.current) return
     dismissSummonBar()
@@ -1808,7 +1632,6 @@ function SummonBar() {
 
   if (!open) return null
 
-  const placement = position || { left: undefined, top: 16 }
   const destinationButton = (value, label) => h('button', {
     type: 'button',
     disabled: busy,
@@ -1835,8 +1658,7 @@ function SummonBar() {
       }
     },
     style: {
-      position: 'fixed', left: placement.left === undefined ? undefined : placement.left,
-      top: placement.top, right: placement.left === undefined ? 16 : undefined,
+      position: 'fixed', top: 16, right: 16,
       width: 380, maxWidth: 'calc(100vw - 24px)',
       zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 7,
       padding: '10px 12px', borderRadius: 12,
@@ -1904,29 +1726,18 @@ function ButlerChipStatus() {
   }) || {}
   // Installed means on unless the stored escape hatch says false.
   const configured = configPetClickClaim(configQuery.data)
-  // Re-evaluated on a fixed 2 s clock while the pane is mounted, whether or
-  // not the chip is on: "not found" is the honest answer when the pet is
-  // popped out into its own OS window.
-  const [petFound, setPetFound] = useState(() => Boolean(petCanvasNode()))
   const [flash, setFlash] = useState(false)
   const flashTimerRef = useRef(null)
   const lastClickSeqRef = useRef(null)
-  const liveRef = useRef({ claim: true, petFound: false })
-  liveRef.current = { claim: configured, petFound }
+  const liveRef = useRef({ claim: true })
+  liveRef.current = { claim: configured }
 
   useEffect(() => {
-    // A null initial query must not disarm the register-time watcher: only a
+    // A null initial query must not disarm the register-time chip sync: only a
     // real config response (an explicit false) can turn the chip off.
     if (configQuery.data === null || configQuery.data === undefined) return
-    setPetClickClaim(configured)
+    syncCompanionClaim(configured)
   }, [configured, configQuery.data])
-
-  useEffect(() => {
-    const check = () => setPetFound(Boolean(petCanvasNode()))
-    check()
-    const id = window.setInterval(check, PET_STATUS_REFRESH_MS)
-    return () => window.clearInterval(id)
-  }, [])
 
   useEffect(() => subscribeSummonBar(state => {
     const seq = Number(state && state.petClickSeq) || 0
@@ -1936,9 +1747,8 @@ function ButlerChipStatus() {
     }
     if (seq === lastClickSeqRef.current) return
     lastClickSeqRef.current = seq
-    // Only a claimed in-app click gets the confirmation: a companion-chip open
-    // with no in-app pet must not pretend the row saw something.
-    if (!liveRef.current.claim || !liveRef.current.petFound) return
+    // Only an installed (claimed) chip gets the confirmation flash.
+    if (!liveRef.current.claim) return
     setFlash(true)
     if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current)
     flashTimerRef.current = window.setTimeout(() => {
@@ -1954,13 +1764,12 @@ function ButlerChipStatus() {
     }
   }, [])
 
-  const claimedAndFound = configured && petFound
-  const rowText = petStatusRowText({ claim: configured, petFound, flash })
-  const rowColor = flash ? '#f5c26b' : (claimedAndFound ? '#6fd39a' : '#8a8f98')
+  const rowText = petStatusRowText({ claim: configured, flash })
+  const rowColor = flash ? '#f5c26b' : (configured ? '#6fd39a' : '#8a8f98')
   const rowBorder = flash ? 'rgba(245,194,107,.4)'
-    : (claimedAndFound ? 'rgba(111,211,154,.35)' : 'rgba(255,255,255,.09)')
+    : (configured ? 'rgba(111,211,154,.35)' : 'rgba(255,255,255,.09)')
   const rowBackground = flash ? 'rgba(245,194,107,.10)'
-    : (claimedAndFound ? 'rgba(111,211,154,.08)' : 'rgba(255,255,255,.03)')
+    : (configured ? 'rgba(111,211,154,.08)' : 'rgba(255,255,255,.03)')
 
   return h('div', {
     role: 'status',
@@ -2612,14 +2421,11 @@ export default {
       }
     ])
 
-    // Installing the plugin is the opt-in: arm the in-window listener and the
-    // pop-out chip on register. The config poll still honours an explicit
-    // stored `false` (the manual escape hatch) after a plugin reload.
+    // Installing the plugin is the opt-in: arm the pop-out chip on register.
+    // The config poll still honours an explicit stored `false` (the manual
+    // escape hatch) after a plugin reload.
     try {
       ctx.onDispose(() => {
-        stopPetClickWatcher()
-        petClickClaim = false
-        petCanvasSeen = false
         summonOpen = false
         summonListeners.clear()
         try {
@@ -2632,7 +2438,6 @@ export default {
         summonPendingTimer = null
       })
     } catch (err) { }
-    setPetClickClaim(true)
     syncCompanionClaim(true)
     // Reconcile with the stored value (including an explicit false) and keep
     // the companion heartbeat fresh on the periodic tick.

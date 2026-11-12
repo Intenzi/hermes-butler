@@ -5,7 +5,6 @@ import json
 import os
 import sys
 import time
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -403,131 +402,72 @@ class FakePluginCtx:
         return self.accepted
 
 
-class FakeEntry:
-    def __init__(self, session_key):
-        self.session_key = session_key
-
-
-class FakeStore:
-    def __init__(self, by_id=None, by_key=None):
-        self.by_id = dict(by_id or {})
-        self.by_key = dict(by_key or {})
-        self.calls = []
-
-    def lookup_by_session_id(self, session_id):
-        self.calls.append(("id", session_id))
-        return self.by_id.get(session_id)
-
-    def lookup_by_session_key(self, session_key):
-        self.calls.append(("key", session_key))
-        return self.by_key.get(session_key)
-
-
-class ResolvingPluginCtx(FakePluginCtx):
-    """A plugin context whose manager publishes a live gateway runner."""
-
-    def __init__(self, store, accepted=True, raises=False):
-        super().__init__(accepted=accepted, raises=raises)
-        runner = SimpleNamespace(session_store=store)
-        self._manager = SimpleNamespace(
-            _gateway_message_injector=(runner, lambda **kwargs: True))
-
-
-def test_summon_send_derives_the_store_route_for_a_bare_local_id(
+def test_summon_send_routes_by_the_desktop_chat_id(
         client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    bare = "local-ec39b9cb"
-    route = "agent:main:local:dm:local-ec39b9cb"
-    store = FakeStore(by_id={bare: FakeEntry(route)})
-    ctx = ResolvingPluginCtx(store)
+    # The host owns the session-key rules: the desktop's durable chat id is
+    # handed straight to the supported injection seam, never re-derived here.
+    ctx = FakePluginCtx()
     monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
 
-    response = client.post("/summon/send", json={"text": "turn off wifi", "session_id": bare})
+    response = client.post("/summon/send", json={
+        "text": "turn off wifi",
+        "session_id": "local-ec39b9cb",
+    })
 
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "session": bare, "session_key": route}
+    assert response.json() == {"ok": True, "session": "local-ec39b9cb"}
     assert ctx.injected == [{
         "text": frame_summon_text("turn off wifi"),
         "role": "user",
-        "session_key": route,
+        "session_key": "local-ec39b9cb",
     }]
-    assert store.calls[0] == ("id", bare), "the runner's own store resolver was asked"
 
 
-def test_summon_send_accepts_an_already_full_route_only_when_the_store_knows_it(
-        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    route = "agent:main:local:dm:local-known"
-    store = FakeStore(by_key={route: FakeEntry(route)})
-    ctx = ResolvingPluginCtx(store)
+def test_summon_send_reports_false_as_unroutable_without_raising(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    ctx = FakePluginCtx(accepted=False)
     monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
 
-    response = client.post("/summon/send", json={"text": "fix it", "session_id": route})
+    response = client.post("/summon/send", json={
+        "text": "fix it",
+        "session_id": "ses_123",
+    })
 
-    assert response.json() == {"ok": True, "session": route, "session_key": route}
-    assert ctx.injected[0]["session_key"] == route
-
-
-class KeyBuildingStore(FakeStore):
-    """A store with no id lookup, only the gateway's own key builder."""
-
-    def __init__(self, route):
-        super().__init__(by_key={route: FakeEntry(route)})
-        self.route = route
-        self.generated = []
-
-    def lookup_by_session_id(self, session_id):
-        self.calls.append(("id", session_id))
-        return None
-
-    def _generate_session_key(self, source):
-        self.generated.append((source.platform.value, source.chat_type, source.chat_id))
-        return self.route
-
-
-def test_summon_send_falls_back_to_the_stores_own_key_builder(
-        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    bare = "local-generated"
-    route = "agent:main:local:dm:local-generated"
-    store = KeyBuildingStore(route)
-    ctx = ResolvingPluginCtx(store)
-    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
-
-    class FakeSource:
-        def __init__(self, platform, chat_type, chat_id):
-            self.platform = platform
-            self.chat_type = chat_type
-            self.chat_id = chat_id
-
-    gateway = types.ModuleType("gateway")
-    gateway.__path__ = []
-    gateway_config = types.ModuleType("gateway.config")
-    gateway_config.Platform = SimpleNamespace(LOCAL=SimpleNamespace(value="local"))
-    gateway_session = types.ModuleType("gateway.session")
-    gateway_session.SessionSource = FakeSource
-    monkeypatch.setitem(sys.modules, "gateway", gateway)
-    monkeypatch.setitem(sys.modules, "gateway.config", gateway_config)
-    monkeypatch.setitem(sys.modules, "gateway.session", gateway_session)
-
-    response = client.post("/summon/send", json={"text": "fix it", "session_id": bare})
-
-    assert response.json() == {"ok": True, "session": bare, "session_key": route}
-    assert store.generated == [("local", "dm", bare)]
-    assert ctx.injected[0]["session_key"] == route
-
-
-def test_summon_send_refuses_an_unknown_bare_id_as_unroutable(
-        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    store = FakeStore()
-    ctx = ResolvingPluginCtx(store)
-    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
-
-    response = client.post("/summon/send", json={"text": "fix it", "session_id": "local-missing"})
-
-    body = response.json()
     assert response.status_code == 200
-    assert body["ok"] is False
-    assert body["reason"] == "unroutable_session"
-    assert "local-missing" in body["detail"]
-    assert ctx.injected == [], "a bare id is never handed to inject_message as a route"
+    assert response.json() == {
+        "error": "unroutable",
+        "hint": "the desktop session could not be reached; the answer stays in chat",
+    }
+    assert len(ctx.injected) == 1
+    # The host's consent flag is the actionable cause; the journal must name it.
+    assert any("allow_gateway_injection" in record.message
+               for record in caplog.records)
+
+
+def test_summon_send_treats_a_raising_gateway_as_unroutable(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = FakePluginCtx(raises=True)
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={
+        "text": "fix it",
+        "session_id": "ses_123",
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "error": "unroutable",
+        "hint": "the desktop session could not be reached; the answer stays in chat",
+    }
+
+
+def test_plugin_api_has_no_gateway_private_names() -> None:
+    source = (ROOT / "dashboard" / "plugin_api.py").read_text(encoding="utf-8")
+
+    for private in ("_manager", "_published_gateway_message_injector",
+                    "_generate_session_key"):
+        assert private not in source, f"gateway internals leak: {private}"
 
 
 def test_summon_send_injects_the_exact_frame_into_the_selected_session(
@@ -541,48 +481,13 @@ def test_summon_send_injects_the_exact_frame_into_the_selected_session(
     })
 
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "session": "ses_123", "session_key": "ses_123"}
+    assert response.json() == {"ok": True, "session": "ses_123"}
     assert ctx.injected == [{
         "text": frame_summon_text("turn off wifi"),
         "role": "user",
         "session_key": "ses_123",
     }]
     assert ctx.injected[0]["text"].startswith("[butler summon] turn off wifi\n\n")
-
-
-def test_summon_send_returns_the_denied_contract_when_injection_is_refused(
-        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = FakePluginCtx(accepted=False)
-    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
-
-    response = client.post("/summon/send", json={
-        "text": "fix it",
-        "session_id": "ses_123",
-    })
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["ok"] is False
-    assert body["reason"] == "injection_denied"
-    assert body["detail"] == "gateway refused session_key ses_123"
-    assert len(ctx.injected) == 1
-
-
-def test_summon_send_fails_closed_when_injection_raises(
-        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = FakePluginCtx(raises=True)
-    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
-
-    response = client.post("/summon/send", json={
-        "text": "fix it",
-        "session_id": "ses_123",
-    })
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["ok"] is False
-    assert body["reason"] == "injection_denied"
-    assert body["detail"] == "gateway refused session_key ses_123"
 
 
 def test_summon_send_fails_closed_without_a_live_plugin_context(
@@ -835,7 +740,7 @@ def test_summon_send_frames_a_look_row_with_the_butler_say_instruction(
     })
 
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "session": "ses_123", "session_key": "ses_123"}
+    assert response.json() == {"ok": True, "session": "ses_123"}
     injected = ctx.injected[0]["text"]
     assert injected == frame_look_text(LOOK_ROW_TEXT)
     # One header, one question line, then the answer instruction.

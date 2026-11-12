@@ -209,6 +209,34 @@ def test_start_sends_one_pet_op_with_resolved_payload(tmp_path: Path, monkeypatc
     }
 
 
+def test_start_spawns_the_helper_with_a_minimal_environment(
+        tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _make_pet(tmp_path, "robotocat")
+    _write_config(tmp_path, "display:\n  pet:\n    slug: robotocat\n")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-must-not-leak")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anth-must-not-leak")
+
+    proc = _FakeProc()
+    captured = {}
+    monkeypatch.setattr(overlay, "build_if_needed", lambda: (True, "present"))
+
+    def fake_popen(args, **kwargs):
+        captured.update(kwargs)
+        return proc
+
+    monkeypatch.setattr(overlay.subprocess, "Popen", fake_popen)
+
+    ok, _ = overlay.Overlay().start(show_pet=False)
+
+    assert ok is True
+    env = captured["env"]
+    assert set(env) == {"PATH", "HOME", "LANG"}
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["PATH"] == os.environ["PATH"]
+
+
 def test_done_sends_the_farewell_op() -> None:
     proc = _FakeProc()
     controller = overlay.Overlay()
