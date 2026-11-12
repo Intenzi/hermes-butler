@@ -1786,3 +1786,32 @@ test('a refused injection is not retried on the next press', async () => {
 
   env.dispose()
 })
+
+test('the host gate is read once at startup and a false answer skips injection', async () => {
+  const calls = []
+  const rest = async (path) => {
+    calls.push(path)
+    if (path === '/injection-gate') return { allowed: false }
+    if (path === '/state') return { summon_pending: { id: 'p1', text: 'hi', destination: 'recent' } }
+    if (path === '/summon/ack') return { ok: true }
+    if (path === '/journal') return { ok: true }
+    if (path === '/summon/send') return { ok: true }
+    return {}
+  }
+  const host = defaultHost({
+    request: async (method, params) => {
+      if (method === 'session.list') return [{ id: 'chat-1', title: 'Butler', created_at: 2 }]
+      if (method === 'session.resume') return { session_id: params.session_id }
+      if (method === 'prompt.submit') return { status: 'streaming' }
+      throw new Error(`unexpected ${method}`)
+    }
+  })
+  const env = await loadPlugin({ host, rest, document: makeDocument() })
+  await new Promise(resolve => setTimeout(resolve, 10))
+
+  assert.ok(calls.includes('/injection-gate'), 'the gate is asked once at startup')
+  assert.equal(await env.api.pollSummonPending(), true)
+  assert.equal(calls.filter(path => path === '/summon/send').length, 0,
+    'a false gate means injection is never attempted')
+  env.dispose()
+})

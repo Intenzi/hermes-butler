@@ -1910,6 +1910,19 @@ export default {
     // the companion heartbeat fresh on the periodic tick.
     try { syncPetClickClaim() } catch (err) { }
     startClaimConfigPolling(ctx)
+    // Ask the host once whether it will accept an injected turn. The flag is a
+    // config sibling the plugin cannot read directly, so the answer comes from
+    // our own API and the send path only ever needs an `if`.
+    Promise.resolve(rest && rest('/injection-gate'))
+      .then(gate => {
+        if (gate && gate.allowed === false) {
+          injectionAllowed = false
+          jsJournal('inject gate off at startup: RPC carries sends')
+        } else if (gate && gate.allowed === true) {
+          injectionAllowed = true
+        }
+      })
+      .catch(() => {})
     startSummonPendingPolling(ctx)
     startPetSpeechPolling(ctx)
   }
