@@ -6,8 +6,8 @@
  * for finished ones. The status bar carries a small Butler launcher that
  * creates or focuses the "Butler" chat.
  *
- * SDK-first surface (routes, nav, palette, status bar, keybinds, host sessions,
- * composer submit). The plugin never reads or paints the Desktop app's page:
+ * SDK-first surface (routes, nav, palette, status bar, host sessions, composer
+ * submit). The plugin never reads or paints the Desktop app's page:
  * the pet click receiver and its page overlay are gone. Bubble rendering stays
  * on the Python side via ctx.pet.say.
  */
@@ -15,11 +15,9 @@ import {
   Button,
   Codicon,
   EmptyState,
-  KEYBINDS_AREA,
   PALETTE_AREA,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
-  TITLEBAR_AREAS,
   cn,
   host,
   useQuery
@@ -32,7 +30,6 @@ const ROUTE = '/butler'
 const REFRESH_MS = 1500
 const HISTORY_PAGE = 8
 const BUTLER_TITLE = 'Butler'
-const SUMMON_PLACEHOLDER = 'Ask the butler for a guide…'
 // The in-place open re-renders the primary and the Butler composer mounts a
 // few frames later; a zero-delay first submit loses that mount race outright.
 // Give it a real grace, then keep re-deriving the live address for six seconds.
@@ -53,8 +50,6 @@ const WATCH_TTL_MS = 30000
 // A watch that ended (the app quit, the user stopped it) gets one line, long
 // enough to read once, then the pane row is gone.
 const WATCH_ENDED_TTL_MS = 9000
-// The click-flash is a confirmation, not a readout: keep it brief.
-const SUMMON_FLASH_MS = 1500
 // A fresh session frees the shared display title by renaming the prior chat.
 // Identity is the id; the sentence after it is only how the chat reads.
 const BUTLER_PREVIOUS_TITLE = 'Butler (previous)'
@@ -99,22 +94,13 @@ let launcherTargetAliases = []
 let petSayTicks = 0
 let petLastTick = null
 
-// Summon door state. The bar component is the only visible surface; the
-// keybind, the status-bar launcher and the companion chip just publish "open".
-let summonOpen = false
-let summonOrigin = 'shortcut'
-// Increments on every pet-origin open (the companion chip path); the pane row
-// flashes when it changes.
-let petClickSeq = 0
-const summonListeners = new Set()
 let claimConfigTimer = null
-// Module-scope consumer for the companion chip's summon row. The hook inside
-// SummonBar only runs while that component is mounted; the chip click path must
-// not depend on that, so the pending watcher lives here and the hook is only a
-// fallback. lastPendingId dedupes a row that survives one poll before the ack.
+// Module-scope consumer for the companion chip's summon row. The pending
+// watcher lives here so a host that never mounts a pane surface still consumes
+// the row. lastPendingId dedupes a row that survives one poll before the ack.
 let summonPendingTimer = null
 let lastPendingId = null
-// Destination picker state; localStorage is the cross-opening source of truth.
+// Destination default; localStorage is the cross-load source of truth.
 let summonDestination = null
 
 function h(type, props, ...children) {
@@ -798,69 +784,18 @@ function getSummonDestination() {
   return summonDestination
 }
 
-function setSummonDestination(value) {
-  summonDestination = value === SUMMON_NEW ? SUMMON_NEW : SUMMON_EXISTING
-  try {
-    const store = localStore()
-    if (store) store.setItem(SUMMON_DESTINATION_KEY, summonDestination)
-  } catch (err) {
-    // A storage-denied renderer still keeps the choice for this session.
-  }
-  return summonDestination
-}
-
-/** The bar always sends the slash form; plain chat still sends plain turns. */
+/** The slash form still frames a butler turn; plain chat sends plain turns. */
 function butlerCommandText(value) {
   const text = asText(value) || ''
   return /^\s*\//.test(text) ? text : `/butler ${text}`
 }
 
 /**
- * The pane's persistent chip readout. The chip is on for an installed plugin;
- * `flash` is the brief confirmation after a chip-origin open raised the bar. It
- * never becomes a multi-line nag and it has no switch semantics.
+ * The pane's persistent chip readout. The chip is on for an installed plugin.
+ * It never becomes a multi-line nag and it has no switch semantics.
  */
-function petStatusRowText({ claim = true, flash = false } = {}) {
-  const row = `chip: ${claim ? 'on' : 'off'}`
-  return flash ? `${row} · → bar opened` : row
-}
-
-/** The shared publish payload: open state plus the pet-click confirmation seq. */
-function summonBarState() {
-  return { open: summonOpen, origin: summonOrigin, petClickSeq }
-}
-
-function subscribeSummonBar(listener) {
-  summonListeners.add(listener)
-  try {
-    listener(summonBarState())
-  } catch (err) {
-    // A broken listener must not break the summon.
-  }
-  return () => { summonListeners.delete(listener) }
-}
-
-function publishSummonBar() {
-  const state = summonBarState()
-  for (const listener of [...summonListeners]) {
-    try {
-      listener(state)
-    } catch (err) {
-      // Keep the remaining listeners alive.
-    }
-  }
-}
-
-function openSummonBar(origin = 'shortcut') {
-  if (origin === 'pet') petClickSeq += 1
-  summonOpen = true
-  summonOrigin = origin
-  publishSummonBar()
-}
-
-function dismissSummonBar() {
-  summonOpen = false
-  publishSummonBar()
+function petStatusRowText({ claim = true } = {}) {
+  return `chip: ${claim ? 'on' : 'off'}`
 }
 
 function configPetClickClaim(data) {
@@ -888,8 +823,8 @@ async function syncCompanionClaim(enabled) {
     })
     return Boolean(result && result.enabled === Boolean(enabled))
   } catch (err) {
-    // Companion unavailable is a degrade: the shortcut and the status-bar
-    // launcher still work, so this is not a toggle failure.
+    // Companion unavailable is a degrade: the companion shortcut and the
+    // status-bar launcher still work, so this is not a toggle failure.
     return false
   }
 }
@@ -1081,15 +1016,15 @@ function ackSummonPending(pendingId) {
  * Consume one companion summon row from /state.
  *
  * A row WITH text is the local ask field: the text is posted straight to the
- * Butler chat and the row acked — the bar never opens and Hermes is never
- * raised. Its `destination` ("new" or the default "recent") picks the chat.
- * A row with `origin === "look"` is the ⌘⇧L door: the same in-place send, but
- * the injected text names the control and app under the cursor first.
- * A row WITHOUT text is the legacy chip/marker click, which keeps opening the
- * bar exactly as before.
+ * Butler chat and the row acked — no surface opens and Hermes is never raised.
+ * Its `destination` ("new" or the default "recent") picks the chat. A row with
+ * `origin === "look"` is the ⌘⇧L door: the same in-place send, but the injected
+ * text names the control and app under the cursor first. A row WITHOUT text is
+ * a legacy chip/marker click the renderer no longer emits; it is acked and
+ * dropped, since the surface it used to open is gone.
  *
- * This runs at module scope because the SummonBar hook is unmounted on hosts
- * that never painted the titlebar slot (the live failure: the row sat for 12 s).
+ * This runs at module scope so a host that never mounts a pane surface still
+ * consumes the row (the live failure: the row sat for 12 s).
  * Returns true only for an id this module has not consumed yet.
  */
 function pollSummonPending() {
@@ -1103,19 +1038,16 @@ function pollSummonPending() {
       lastPendingId = pendingId
       const text = asText(pending && pending.text)
       if (!text) {
-        try {
-          openSummonBar('pet')
-        } catch (err) {
-          // The click still must not keep the row alive.
-        }
+        // No surface to open any more: consume the row so it does not pin the
+        // poll, and keep the same one-ack-per-id contract.
         ackSummonPending(pendingId)
         return true
       }
       // The ask field chooses per send: only an exact "new" mints a chat.
       const destination = asText(pending && pending.destination) === 'new'
         ? 'new' : 'recent'
-      // A LOOK row is a text row with an element attached: the bar never opens,
-      // and the injected turn leads with the control the user pointed at.
+      // A LOOK row is a text row with an element attached, and the injected
+      // turn leads with the control the user pointed at.
       const isLook = asText(pending && pending.origin) === 'look'
       const outgoing = isLook ? lookPendingText(pending) : text
       // Send in place. A failed send still acks: the text was typed once, and
@@ -1141,7 +1073,7 @@ function pollSummonPending() {
     .catch(() => false)
 }
 
-/** Watch the summon row even when the SummonBar hook never mounts. */
+/** Watch the companion summon row from module scope on every host. */
 function startSummonPendingPolling(ctx) {
   const tick = () => { pollSummonPending().catch(() => {}) }
   try {
@@ -1155,7 +1087,7 @@ function startSummonPendingPolling(ctx) {
   try {
     summonPendingTimer = window.setInterval(tick, REFRESH_MS)
   } catch (err) {
-    // No timer surface: the in-window listener and the shortcut still work.
+    // No timer surface: the host still delivers the row on its next mount.
   }
 }
 
@@ -1330,7 +1262,7 @@ function summonErrorText(error) {
   return asText(error.message) || asText(error) || ''
 }
 
-/** Exact, human-readable failure toast for the bar (never a dead-silent send). */
+/** Exact, human-readable failure toast for the send path (never a dead-silent send). */
 function summonFailureMessage(result) {
   const reason = asText(result && result.reason) || 'failed'
   const label = SUMMON_REASON_LABELS[reason] || reason
@@ -1490,8 +1422,11 @@ async function summonButler(text, options = {}) {
 }
 
 /**
- * Bar-facing submit outcome: owns the success toast/double and the honest
- * failure toast. On failure the caller keeps the typed text in the input.
+ * Submit outcome for the shared summon send: owns the success toast/double and
+ * the honest failure toast. On failure the caller keeps the typed text.
+ *
+ * The web bar was its only caller; it stays as the shared outcome seam, while
+ * the pending-text path reports through its own chip helpers.
  */
 async function summonFromBar(value, options = {}) {
   let result
@@ -1527,196 +1462,6 @@ function LauncherButton({ compact = false }) {
   }, 'Butler')
 }
 
-// ---------------------------------------------------------------- summon bar
-
-/**
- * Floating "Ask the butler" bar. It is mounted once by the permanent titlebar
- * slot and only paints while the shortcut / pet click has opened it.
- */
-function SummonBar() {
-  const [open, setOpen] = useState(false)
-  const [origin, setOrigin] = useState('shortcut')
-  const [text, setText] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [destination, setDestination] = useState(() => getSummonDestination())
-  const inputRef = useRef(null)
-  const barRef = useRef(null)
-  const busyRef = useRef(false)
-  busyRef.current = busy
-
-  // The companion chip cannot touch the desktop renderer directly; the engine
-  // publishes a one-shot summon_pending row in /state instead. The bar is the
-  // always-mounted surface, so it consumes that row and opens the SAME picker.
-  const pendingQuery = useQuery({
-    queryKey: ['butler', 'summon-pending'],
-    queryFn: () => (typeof rest === 'function' ? rest('/state') : Promise.resolve({})),
-    refetchInterval: REFRESH_MS,
-    refetchOnMount: 'always'
-  }) || {}
-  const pending = pendingQuery.data && pendingQuery.data.summon_pending
-  const pendingId = asText(pending && pending.id)
-  const pendingText = asText(pending && pending.text)
-  const seenPendingRef = useRef(null)
-  useEffect(() => {
-    if (!pendingId || seenPendingRef.current === pendingId) return
-    // A text row is the in-place ask field. The module poll sends it and acks;
-    // opening the bar (or acking here) would both violate "no bar" and race the
-    // send away.
-    if (pendingText) return
-    seenPendingRef.current = pendingId
-    openSummonBar('pet')
-    if (typeof rest !== 'function') return
-    try {
-      const ack = rest('/summon/ack', { method: 'POST', body: { id: pendingId } })
-      if (ack && typeof ack.catch === 'function') ack.catch(() => {})
-    } catch (err) {
-      // The row stays unconsumed; a later poll retries the ack.
-    }
-  }, [pendingId, pendingText])
-
-  useEffect(() => subscribeSummonBar(state => {
-    setOpen(state.open)
-    setOrigin(state.origin)
-  }), [])
-
-  useEffect(() => {
-    if (!open) return undefined
-    setText('')
-    // Re-read the persisted choice on every opening. Focus stays on the text
-    // input; the destination buttons are Tab-reachable after it.
-    setDestination(getSummonDestination())
-    const id = window.setTimeout(() => {
-      try { inputRef.current && inputRef.current.focus() } catch (err) { }
-    }, 0)
-    return () => window.clearTimeout(id)
-  }, [open])
-
-  const close = () => {
-    if (busyRef.current) return
-    dismissSummonBar()
-  }
-
-  const chooseDestination = next => {
-    const value = setSummonDestination(next)
-    setDestination(value)
-  }
-
-  // Blur inside the bar (including Tab onto the destination buttons) keeps it
-  // open; only leaving the bar dismisses it. The zero-delay re-check gives a
-  // click on a picker button a chance to take focus first.
-  const onBarBlur = event => {
-    if (busyRef.current) return
-    const next = event && event.relatedTarget
-    const bar = barRef.current
-    if (next && bar && typeof bar.contains === 'function' && bar.contains(next)) return
-    window.setTimeout(() => {
-      if (busyRef.current) return
-      const active = typeof document === 'undefined' ? null : document.activeElement
-      if (active && bar && typeof bar.contains === 'function' && bar.contains(active)) return
-      dismissSummonBar()
-    }, 0)
-  }
-
-  const submit = async () => {
-    if (busyRef.current) return
-    const value = text.trim()
-    if (!value) return
-    setBusy(true)
-    const outcome = await summonFromBar(value, { destination })
-    setBusy(false)
-    // Failure keeps the typed text in the bar so the user can retry; only a
-    // real send clears and dismisses it. The toast names the exact reason.
-    if (outcome.clearText) setText('')
-    if (outcome.dismiss) dismissSummonBar()
-  }
-
-  if (!open) return null
-
-  const destinationButton = (value, label) => h('button', {
-    type: 'button',
-    disabled: busy,
-    'aria-pressed': destination === value,
-    onClick: () => chooseDestination(value),
-    style: {
-      cursor: busy ? 'default' : 'pointer', fontSize: 11, lineHeight: 1.3,
-      color: destination === value ? '#eceef1' : '#9aa3ad',
-      background: destination === value ? 'rgba(122,134,255,.26)' : 'transparent',
-      border: 'none', borderRadius: 6, padding: '4px 9px',
-      outline: 'none'
-    }
-  }, label)
-
-  return h('div', {
-    ref: barRef,
-    role: 'dialog',
-    'aria-label': 'Ask the butler',
-    onBlur: onBarBlur,
-    onKeyDown: event => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        if (!busyRef.current) dismissSummonBar()
-      }
-    },
-    style: {
-      position: 'fixed', top: 16, right: 16,
-      width: 380, maxWidth: 'calc(100vw - 24px)',
-      zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 7,
-      padding: '10px 12px', borderRadius: 12,
-      background: 'var(--ui-bg-elevated, #1f2126)',
-      border: '1px solid var(--ui-border, rgba(255,255,255,.14))',
-      boxShadow: '0 12px 34px rgba(0,0,0,.38)'
-    }
-  },
-    h('div', { style: { display: 'flex', alignItems: 'center', gap: 7 } },
-      h('span', { style: { fontSize: 13, fontWeight: 600, color: '#eceef1' } }, 'Ask the butler'),
-      h('span', { style: { flex: 1 } }),
-      h('span', { style: { fontSize: 10, color: '#8a8f98' } },
-        busy ? 'Sending…' : (origin === 'pet' ? 'from your pet' : 'Enter to send · Esc to dismiss'))
-    ),
-    h('input', {
-      ref: inputRef,
-      type: 'text',
-      value: text,
-      placeholder: SUMMON_PLACEHOLDER,
-      disabled: busy,
-      'aria-label': 'Ask the butler for a guide',
-      onChange: event => setText(event.target.value),
-      onKeyDown: event => {
-        if (event.key === 'Escape') {
-          event.preventDefault()
-          if (!busyRef.current) dismissSummonBar()
-          return
-        }
-        if (event.key === 'Enter') {
-          event.preventDefault()
-          submit()
-        }
-      },
-      style: {
-        width: '100%', boxSizing: 'border-box', fontSize: 13,
-        color: '#eceef1', background: 'rgba(255,255,255,.06)',
-        border: '1px solid rgba(255,255,255,.12)', borderRadius: 8,
-        padding: '8px 10px', outline: 'none'
-      }
-    }),
-    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-      h('span', { style: { fontSize: 10.5, color: '#8a8f98' } }, 'Send to'),
-      h('div', {
-        role: 'group',
-        'aria-label': 'Summon destination',
-        style: {
-          display: 'inline-flex', padding: 2, borderRadius: 8, gap: 2,
-          background: 'rgba(255,255,255,.05)',
-          border: '1px solid rgba(255,255,255,.09)'
-        }
-      },
-        destinationButton(SUMMON_EXISTING, 'Butler chat'),
-        destinationButton(SUMMON_NEW, 'New session')
-      )
-    )
-  )
-}
-
 function ButlerChipStatus() {
   const configQuery = useQuery({
     queryKey: ['butler', 'config'],
@@ -1726,11 +1471,6 @@ function ButlerChipStatus() {
   }) || {}
   // Installed means on unless the stored escape hatch says false.
   const configured = configPetClickClaim(configQuery.data)
-  const [flash, setFlash] = useState(false)
-  const flashTimerRef = useRef(null)
-  const lastClickSeqRef = useRef(null)
-  const liveRef = useRef({ claim: true })
-  liveRef.current = { claim: configured }
 
   useEffect(() => {
     // A null initial query must not disarm the register-time chip sync: only a
@@ -1739,37 +1479,10 @@ function ButlerChipStatus() {
     syncCompanionClaim(configured)
   }, [configured, configQuery.data])
 
-  useEffect(() => subscribeSummonBar(state => {
-    const seq = Number(state && state.petClickSeq) || 0
-    if (lastClickSeqRef.current === null) {
-      lastClickSeqRef.current = seq
-      return
-    }
-    if (seq === lastClickSeqRef.current) return
-    lastClickSeqRef.current = seq
-    // Only an installed (claimed) chip gets the confirmation flash.
-    if (!liveRef.current.claim) return
-    setFlash(true)
-    if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current)
-    flashTimerRef.current = window.setTimeout(() => {
-      flashTimerRef.current = null
-      setFlash(false)
-    }, SUMMON_FLASH_MS)
-  }), [])
-
-  useEffect(() => () => {
-    if (flashTimerRef.current !== null) {
-      window.clearTimeout(flashTimerRef.current)
-      flashTimerRef.current = null
-    }
-  }, [])
-
-  const rowText = petStatusRowText({ claim: configured, flash })
-  const rowColor = flash ? '#f5c26b' : (configured ? '#6fd39a' : '#8a8f98')
-  const rowBorder = flash ? 'rgba(245,194,107,.4)'
-    : (configured ? 'rgba(111,211,154,.35)' : 'rgba(255,255,255,.09)')
-  const rowBackground = flash ? 'rgba(245,194,107,.10)'
-    : (configured ? 'rgba(111,211,154,.08)' : 'rgba(255,255,255,.03)')
+  const rowText = petStatusRowText({ claim: configured })
+  const rowColor = configured ? '#6fd39a' : '#8a8f98'
+  const rowBorder = configured ? 'rgba(111,211,154,.35)' : 'rgba(255,255,255,.09)'
+  const rowBackground = configured ? 'rgba(111,211,154,.08)' : 'rgba(255,255,255,.03)'
 
   return h('div', {
     role: 'status',
@@ -2393,23 +2106,6 @@ export default {
         render: () => h(LauncherButton, { compact: true })
       },
       {
-        id: 'summon',
-        area: KEYBINDS_AREA,
-        data: {
-          id: 'butler.summon',
-          label: 'Ask the butler',
-          category: 'view',
-          defaults: ['mod+shift+a'],
-          run: () => openSummonBar('shortcut')
-        }
-      },
-      {
-        id: 'summon-bar',
-        area: TITLEBAR_AREAS.right,
-        order: 60,
-        render: () => h(SummonBar, {})
-      },
-      {
         id: 'open',
         area: PALETTE_AREA,
         data: {
@@ -2426,8 +2122,6 @@ export default {
     // escape hatch) after a plugin reload.
     try {
       ctx.onDispose(() => {
-        summonOpen = false
-        summonListeners.clear()
         try {
           if (claimConfigTimer !== null) window.clearInterval(claimConfigTimer)
         } catch (err) { }

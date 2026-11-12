@@ -17,21 +17,20 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PLUGIN_JS = path.join(HERE, '..', 'desktop', 'plugin.js')
 const INTERNALS = [
   'summonButler', 'sendSummonText', 'sendSummonInjection', 'summonFromBar',
-  'summonFailureMessage', 'openSummonBar',
-  'spawnSummonDouble', 'configPetClickClaim', 'subscribeSummonBar',
-  'syncCompanionClaim', 'petStatusRowText', 'summonBarState',
-  'readSummonDestination', 'setSummonDestination', 'getSummonDestination', 'butlerCommandText',
+  'summonFailureMessage',
+  'spawnSummonDouble', 'configPetClickClaim',
+  'syncCompanionClaim', 'petStatusRowText',
+  'readSummonDestination', 'getSummonDestination', 'butlerCommandText',
   'openFreshButlerSession', 'openButlerSession', 'createButlerSession', 'listButlerSessions',
-  'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey', 'dismissSummonBar',
+  'sessionTargetId', 'sessionKeyNamespace', 'expectedSummonSessionKey',
   'startSummonPendingPolling', 'pollSummonPending',
   'petSpeechBeat', 'speakButlerAnswer', 'petStatusLine', 'watchStatusLine',
   'watchIsActive', 'watchEndedLine', 'watchPaneText', 'WatchRow', 'stopWatch',
   'watchHitLine', 'speechSnapshot'
 ]
 
-// The plugin no longer reads or mutates the host page: the only document
-// member it may touch is activeElement, and only to see whether focus is still
-// inside the plugin's own bar. This stub exposes exactly that.
+// The plugin never reads or mutates the host page. The stub keeps a document in
+// the vm context so a regression that reaches for one has a defined surface.
 function makeDocument() {
   return { activeElement: null }
 }
@@ -175,17 +174,6 @@ function makeClock(start = 0) {
   }
 }
 
-test('registers the "Ask the butler" global shortcut', async () => {
-  const env = await loadPlugin({ host: defaultHost(), rest: async () => ({}), document: makeDocument() })
-  const keybind = env.contributions.find(item => item.area === 'keybinds')
-
-  assert.ok(keybind, 'KEYBINDS_AREA contribution exists')
-  assert.equal(keybind.data.label, 'Ask the butler')
-  assert.equal(keybind.data.id, 'butler.summon')
-  assert.equal(keybind.data.defaults.join(','), 'mod+shift+a')
-  assert.equal(typeof keybind.data.run, 'function')
-})
-
 test('the desktop plugin never reaches into the host page DOM', () => {
   // The pet-click receiver was a document-wide capture listener plus a rect
   // follower. Both are gone: the SDK slots and the companion chip own the
@@ -198,6 +186,20 @@ test('the desktop plugin never reaches into the host page DOM', () => {
   assert.equal(source.includes("addEventListener('pointerdown'"), false)
   assert.equal(source.includes('PET_CANVAS_SELECTORS'), false)
   assert.equal(source.includes('petCanvasNode'), false)
+})
+
+test('the web summon bar is gone and the pending-text path survives', () => {
+  const source = readFileSync(PLUGIN_JS, 'utf8')
+
+  // The React bar and its titlebar slot / keybind are gone: the companion's
+  // Carbon chord owns ⌘⇧A and the Swift field owns the visible input.
+  assert.equal(source.includes('SummonBar'), false, 'no web bar component')
+  assert.equal(source.includes("id: 'summon-bar'"), false, 'no titlebar slot')
+  assert.equal(source.includes("id: 'butler.summon'"), false, 'no shadowed keybind')
+  // The LOOK answer path is the reason the module-scope consumer stays.
+  assert.ok(source.includes('startSummonPendingPolling'), 'pending poll is armed')
+  assert.ok(source.includes('sendPendingSummonText(outgoing'),
+    'a text pending row is still sent')
 })
 
 test('register arms the companion chip with no config key', async () => {
@@ -463,7 +465,7 @@ test('summon honors a runtime id returned by openSession', async () => {
   assert.deepEqual(submitted, ['stored-1', 'runtime-7'])
 })
 
-test('bar failure keeps the text and toasts the exact reason plus an unseated draft', async () => {
+test('summon failure keeps the text and toasts the exact reason plus an unseated draft', async () => {
   const clock = makeClock()
   const notifications = []
   const draftCalls = []
@@ -489,8 +491,8 @@ test('bar failure keeps the text and toasts the exact reason plus an unseated dr
 
   assert.equal(outcome.result.ok, false)
   assert.equal(outcome.result.reason, 'no_visible_composer')
-  assert.equal(outcome.clearText, false, 'the typed text stays in the bar')
-  assert.equal(outcome.dismiss, false, 'the bar stays open for a retry')
+  assert.equal(outcome.clearText, false, 'the text stays for a retry')
+  assert.equal(outcome.dismiss, false, 'the surface stays open for a retry')
   assert.deepEqual(draftCalls, [{ id: 's1', text: '/butler fix my wifi' }])
   const toast = notifications.find(notification => notification.kind === 'error')
   assert.ok(toast, 'a failure toast was shown')
@@ -498,7 +500,7 @@ test('bar failure keeps the text and toasts the exact reason plus an unseated dr
   assert.match(toast.message, /Draft seat: not seated\./)
 })
 
-test('bar failure reports a seated draft without claiming the send succeeded', async () => {
+test('summon failure reports a seated draft without claiming the send succeeded', async () => {
   const clock = makeClock()
   const notifications = []
   const host = defaultHost({
@@ -650,7 +652,7 @@ test('a successful injection keeps the gateway routing key for debugging', async
   env.dispose()
 })
 
-test('summon bar injects into the existing destination and shows the success toast', async () => {
+test('summon injects into the existing destination and shows the success toast', async () => {
   const notifications = []
   const injected = []
   const submitted = []
@@ -1125,65 +1127,39 @@ test('a dead guide step does not steal the watch keep-alive', async () => {
   env.dispose()
 })
 
-test('the pane status row names the chip, and flashes once after a chip open', async () => {
+test('the pane status row names the chip', async () => {
   const env = await loadPlugin({
     host: defaultHost(), rest: async () => ({}), document: makeDocument()
   })
 
   assert.equal(env.api.petStatusRowText({ claim: true }), 'chip: on')
-  assert.equal(env.api.petStatusRowText({ claim: true, flash: true }),
-    'chip: on · → bar opened')
   assert.equal(env.api.petStatusRowText({ claim: false }),
     'chip: off', 'only the stored escape hatch can read off')
   env.dispose()
 })
 
-test('a pet-origin open publishes a new click sequence; dismiss and shortcut do not', async () => {
-  const env = await loadPlugin({
-    host: defaultHost(), rest: async () => ({}), document: makeDocument()
+test('the stored destination is read on first use and the slash fallback frames a turn',
+  async () => {
+    const storage = makeStorage()
+    const first = await loadPlugin({
+      host: defaultHost(), rest: async () => ({}), document: makeDocument(), storage
+    })
+    assert.equal(first.api.readSummonDestination(), 'existing')
+    assert.equal(first.api.getSummonDestination(), 'existing')
+    assert.equal(first.api.butlerCommandText('fix it'), '/butler fix it')
+    assert.equal(first.api.butlerCommandText('/butler already'), '/butler already')
+    first.dispose()
+
+    const second = await loadPlugin({
+      host: defaultHost(),
+      rest: async () => ({}),
+      document: makeDocument(),
+      storage: makeStorage({ 'butler.summon.destination': 'new' })
+    })
+    assert.equal(second.api.getSummonDestination(), 'new')
+    assert.equal(second.api.readSummonDestination(), 'new')
+    second.dispose()
   })
-  const states = []
-  const unsubscribe = env.api.subscribeSummonBar(state => states.push(state))
-  const start = states.at(-1).petClickSeq
-
-  env.api.openSummonBar('pet')
-  assert.equal(states.at(-1).open, true)
-  assert.equal(states.at(-1).origin, 'pet')
-  assert.equal(states.at(-1).petClickSeq, start + 1, 'a pet click bumps the flash sequence')
-
-  env.api.dismissSummonBar()
-  assert.equal(states.at(-1).open, false)
-  assert.equal(states.at(-1).petClickSeq, start + 1, 'dismiss is not a click')
-
-  env.api.openSummonBar('shortcut')
-  assert.equal(states.at(-1).petClickSeq, start + 1, 'the shortcut is not a pet click')
-
-  unsubscribe()
-  env.dispose()
-})
-
-test('destination choice persists across plugin loads in localStorage', async () => {
-  const storage = makeStorage()
-  const first = await loadPlugin({
-    host: defaultHost(), rest: async () => ({}), document: makeDocument(), storage
-  })
-  assert.equal(first.api.readSummonDestination(), 'existing')
-  assert.equal(first.api.butlerCommandText('fix it'), '/butler fix it')
-  assert.equal(first.api.butlerCommandText('/butler already'), '/butler already')
-
-  first.api.setSummonDestination('new')
-  assert.equal(storage.values.get('butler.summon.destination'), 'new')
-  first.dispose()
-
-  const second = await loadPlugin({
-    host: defaultHost(), rest: async () => ({}), document: makeDocument(), storage
-  })
-  assert.equal(second.api.getSummonDestination(), 'new')
-  assert.equal(second.api.readSummonDestination(), 'new')
-  second.api.setSummonDestination('existing')
-  assert.equal(storage.values.get('butler.summon.destination'), 'existing')
-  second.dispose()
-})
 
 test('register arms the module summon-pending timer next to the config poll', async () => {
   const env = await loadPlugin({
@@ -1196,7 +1172,7 @@ test('register arms the module summon-pending timer next to the config poll', as
   env.dispose()
 })
 
-test('the module poll opens the bar and acks once per unseen pending id', async () => {
+test('the module poll acks a text-less legacy row once per unseen pending id', async () => {
   let statePayload = { summon_pending: { id: 'pending-1' } }
   const calls = []
   const rest = async (requestPath, opts) => {
@@ -1206,37 +1182,30 @@ test('the module poll opens the bar and acks once per unseen pending id', async 
     return {}
   }
   const env = await loadPlugin({ host: defaultHost(), rest, document: makeDocument() })
-  const events = []
-  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
-  const seqBefore = events.at(-1).petClickSeq
 
   assert.equal(await env.api.pollSummonPending(), true)
-  assert.equal(events.at(-1).open, true, 'the chip click opens the same bar')
-  assert.equal(events.at(-1).origin, 'pet')
-  assert.equal(events.at(-1).petClickSeq, seqBefore + 1, 'a chip summon flashes once')
+  assert.equal(calls.filter(call => call.path === '/summon/send').length, 0,
+    'a legacy marker row has no surface left and sends nothing')
   let acks = calls.filter(call => call.path === '/summon/ack')
   assert.equal(acks.length, 1)
   assert.equal(acks[0].opts.method, 'POST')
   assert.equal(acks[0].opts.body.id, 'pending-1')
 
   // The row can survive one poll interval before the ack lands: dedupe by id
-  // must not reopen the bar and must not send a second ack.
+  // must not consume it twice.
   assert.equal(await env.api.pollSummonPending(), false)
-  assert.equal(events.at(-1).petClickSeq, seqBefore + 1)
   assert.equal(calls.filter(call => call.path === '/summon/ack').length, 1)
 
   // A second click is a new id and is consumed again.
   statePayload = { summon_pending: { id: 'pending-2' } }
   assert.equal(await env.api.pollSummonPending(), true)
-  assert.equal(events.at(-1).petClickSeq, seqBefore + 2)
   acks = calls.filter(call => call.path === '/summon/ack')
   assert.deepEqual(acks.map(call => call.opts.body.id), ['pending-1', 'pending-2'])
 
-  unsubscribe()
   env.dispose()
 })
 
-test('a text pending row sends to the newest Butler chat and never opens the bar',
+test('a text pending row sends to the newest Butler chat in place',
   async () => {
     const statePayload = {
       summon_pending: { id: 'pending-text', text: 'turn off wifi', origin: 'chip' }
@@ -1264,9 +1233,6 @@ test('a text pending row sends to the newest Butler chat and never opens the bar
       notify: payload => notifications.push(payload)
     })
     const env = await loadPlugin({ host, rest, document: makeDocument() })
-    const events = []
-    const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
-    const seqBefore = events.at(-1).petClickSeq
 
     assert.equal(await env.api.pollSummonPending(), true)
 
@@ -1279,17 +1245,14 @@ test('a text pending row sends to the newest Butler chat and never opens the bar
       'plain ask-field rows keep sending without an origin')
     const acks = calls.filter(call => call.path === '/summon/ack')
     assert.deepEqual(acks.map(call => call.opts.body.id), ['pending-text'])
-    assert.equal(events.at(-1).open, false, 'a text row never opens the bar')
-    assert.equal(events.at(-1).petClickSeq, seqBefore)
     assert.equal(notifications.length, 1)
     assert.equal(notifications[0].kind, 'success')
     assert.equal(notifications[0].message, 'Sent to Butler')
 
-    unsubscribe()
     env.dispose()
   })
 
-test('a look row frames the control and the question, never opens the bar', async () => {
+test('a look row frames the control and the question in place', async () => {
   const statePayload = {
     summon_pending: {
       id: 'pending-look',
@@ -1326,10 +1289,6 @@ test('a look row frames the control and the question, never opens the bar', asyn
     notify: payload => notifications.push(payload)
   })
   const env = await loadPlugin({ host, rest, document: makeDocument() })
-  const events = []
-  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
-  const seqBefore = events.at(-1).petClickSeq
-  const barBefore = events.at(-1).open
 
   assert.equal(await env.api.pollSummonPending(), true)
 
@@ -1346,15 +1305,12 @@ test('a look row frames the control and the question, never opens the bar', asyn
     injected.includes('Control: Button "Export" (enabled) at 10,20,30,40'),
     'the control renders role, label, enabled state and box')
   assert.ok(injected.includes('\nQuestion: what does this export?'), 'the question is asked')
-  assert.equal(events.at(-1).open, barBefore, 'a look row never opens the bar')
-  assert.equal(events.at(-1).petClickSeq, seqBefore)
   assert.deepEqual(
     calls.filter(call => call.path === '/summon/ack').map(call => call.opts.body.id),
     ['pending-look'])
   assert.equal(notifications.length, 1)
   assert.equal(notifications[0].message, 'Asked about that control')
 
-  unsubscribe()
   env.dispose()
 })
 
@@ -1549,7 +1505,7 @@ test('a failed fresh-chat create reports session_create_failed and sends nothing
     env.dispose()
   })
 
-test('a text-less pending row still opens the bar and posts no send', async () => {
+test('a text-less pending row is consumed and posts no send', async () => {
   const calls = []
   const rest = async (requestPath, opts) => {
     calls.push({ path: requestPath, opts })
@@ -1558,17 +1514,13 @@ test('a text-less pending row still opens the bar and posts no send', async () =
     return {}
   }
   const env = await loadPlugin({ host: defaultHost(), rest, document: makeDocument() })
-  const events = []
-  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
 
   assert.equal(await env.api.pollSummonPending(), true)
 
-  assert.equal(events.at(-1).open, true)
   assert.equal(calls.filter(call => call.path === '/summon/send').length, 0)
   assert.deepEqual(calls.filter(call => call.path === '/summon/ack')
     .map(call => call.opts.body.id), ['pending-legacy'])
 
-  unsubscribe()
   env.dispose()
 })
 
@@ -1616,7 +1568,7 @@ test('a failing /state never throws out of the module poll', async () => {
   env.dispose()
 })
 
-test('a failed ack still opens the bar and never throws', async () => {
+test('a failed ack still consumes the row and never throws', async () => {
   const env = await loadPlugin({
     host: defaultHost(),
     rest: async requestPath => {
@@ -1626,13 +1578,9 @@ test('a failed ack still opens the bar and never throws', async () => {
     },
     document: makeDocument()
   })
-  const events = []
-  const unsubscribe = env.api.subscribeSummonBar(state => events.push(state))
 
   assert.equal(await env.api.pollSummonPending(), true)
-  assert.equal(events.at(-1).open, true, 'the bar opens even when the ack fails')
 
-  unsubscribe()
   env.dispose()
 })
 
