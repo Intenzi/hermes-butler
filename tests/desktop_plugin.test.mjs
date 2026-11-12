@@ -372,6 +372,40 @@ test('summon ladder waits 300 ms, retries at 150 ms, and ends on the second succ
   assert.equal(submittedAt[1], 450)
 })
 
+test('summon opens a background chat so its composer can take the send', async () => {
+  // A chat that is not on screen has no mounted composer, so submit fails
+  // closed. One SDK open mounts it and the next submit lands -- this is what a
+  // background butler chat needs, and it never touches the app's page.
+  const clock = makeClock()
+  const opened = []
+  let mounted = false
+  const submittedAt = []
+  const host = defaultHost({
+    request: async method => method === 'session.list'
+      ? [{ id: 's1', title: 'Butler', created_at: 1 }]
+      : [],
+    openSession: async id => { opened.push(id); mounted = true; return true },
+    composer: {
+      submit() {
+        submittedAt.push(clock.now())
+        return mounted
+      },
+      setDraft: async () => false
+    }
+  })
+  const env = await loadPlugin({ host, rest: async () => ({}), document: makeDocument() })
+
+  const result = await env.api.sendSummonText('s1', 'answer this', {
+    now: clock.now,
+    wait: clock.wait
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.send, 'composer.submit')
+  assert.deepEqual(opened, ['s1'], 'the target chat is opened exactly once')
+  assert.ok(submittedAt.length >= 2, 'the send is retried after the open')
+})
+
 test('summon ladder keeps retrying until the 6 s budget is spent', async () => {
   const clock = makeClock()
   const submittedAt = []

@@ -1153,6 +1153,11 @@ async function sendSummonText(target, text, options = {}) {
   let nextRefreshAt = now()
   let lastError = null
   let attempts = 0
+  // A chat that is not on screen has no mounted composer, so `submit` fails
+  // closed for it. Opening the target through the SDK (never by driving the
+  // page) mounts its composer, which is the difference between "sent" and
+  // "seat a draft and hope".
+  let openedTarget = false
   const startedAt = now()
   const firstAttemptAt = startedAt + graceMs
   const deadline = startedAt + timeoutMs
@@ -1191,6 +1196,19 @@ async function sendSummonText(target, text, options = {}) {
         if (targetId === launcherTargetId) launcherTargetId = currentTarget
       }
       nextRefreshAt = now() + refreshMs
+    }
+
+    // One SDK open, after the first submit rounds have missed: a chat that is
+    // already mounted never pays for this, and a background chat gets a
+    // composer it can answer through.
+    if (!openedTarget && typeof host.openSession === 'function' && now() - startedAt > 600) {
+      openedTarget = true
+      try {
+        const opened = await host.openSession(currentTarget, { intent: 'in-place' })
+        for (const id of openResultIds(opened)) addTargetIds(candidates, id)
+      } catch (err) {
+        lastError = err
+      }
     }
 
     const nextAttemptAt = Math.min(deadline, now() + retryMs)
