@@ -847,42 +847,6 @@ function notifyLookAnswered() {
   }
 }
 
-async function sendPendingSummonText(text, destination = 'recent', options = {}) {
-  const target = await resolveChipSendTarget(destination)
-  if (!target) {
-    // "new" was asked for: never report a send that did not happen.
-    return {
-      ok: false,
-      reason: destination === 'new' ? 'session_create_failed' : 'no_session'
-    }
-  }
-  const body = { text, session_id: target }
-  // Only the LOOK door stamps an origin: the route then frames the turn with
-  // the "answer on the pet" instruction. Plain ask-field rows stay unchanged.
-  const origin = asText(options && options.origin)
-  if (origin) body.origin = origin
-  try {
-    const response = await rest('/summon/send', {
-      method: 'POST',
-      body
-    })
-    if (response && response.ok === true) {
-      // A successful send proves the chat is in use: it is now the newest
-      // tracked id even if a title match, not the tracked list, resolved it.
-      rememberChatIds(target)
-      return { ok: true, session_id: target, destination }
-    }
-    return {
-      ok: false,
-      reason: asText(response && response.reason) || 'send_failed',
-      detail: asText(response && response.detail),
-      error: response && response.error
-    }
-  } catch (err) {
-    return { ok: false, reason: 'send_failed', error: err }
-  }
-}
-
 function ackSummonPending(pendingId) {
   // Fire and forget: a failed ack never stops the poll and the row is already
   // deduped, so the same action cannot run twice for this id.
@@ -936,45 +900,58 @@ function pollSummonPending() {
       // Send in place. A failed send still acks: the text was typed once, and
       // retrying silently is worse than telling the user exactly why it failed.
       jsJournal(`poll send ${destination} look=${isLook} len=${outgoing.length}`)
-      // The pet's field resolves a destination and then has to try every door,
-      // exactly like the bar does. It used to call the composer ladder alone,
-      // so a chat that was not on screen ended the chain with a toast and the
-      // RPC/injection doors below were never reached.
-      const composer = sendPendingSummonText(outgoing, destination, isLook ? { origin: 'look' } : {})
-      return composer
-        .then(async result => {
-          jsJournal(`send result ok=${!!(result && result.ok)} reason=${asText(result && result.reason) || '-'} session=${asText(result && result.session) || '-'}`)
-          if (result && result.ok) return result
-          // A composer failure can come back without an address (no mounted
-          // chat at all); the resolver owns that answer, so ask it again rather
-          // than giving up on a send that never had a chat to try.
-          let targetId = asText(result && result.session)
-          if (!targetId) targetId = asText(await resolveChipSendTarget(destination).catch(() => null))
+      // Two doors, in the order that matches how the pet is used: you are
+      // outside Hermes, so a chat's composer is not mounted and driving it is
+      // not an option. Injection continues an existing chat; RPC creates one
+      // when there is nothing to continue. When both fail the send is reported;
+      // a third door cannot help.
+      return resolveChipSendTarget(destination)
+        .catch(() => null)
+        .then(async resolved => {
+          // "new" never borrows an address: a failed mint must report
+          // session_create_failed rather than send to the last opened chat.
+          const targetId = asText(resolved)
+            || (destination === 'new' ? '' : asText(launcherTargetId))
           if (!targetId) {
-            jsJournal('rpc fallback skipped: no target')
-            return result
+            jsJournal(`no target for destination=${destination}`)
+            return {
+              ok: false,
+              reason: destination === 'new' ? 'session_create_failed' : 'no_session',
+              destination
+            }
+          }
+          const injected = await sendSummonInjection(
+            targetId, outgoing, isLook ? { origin: 'look' } : {})
+          jsJournal(`inject ok=${!!(injected && injected.ok)} reason=${asText(injected && injected.reason) || '-'}`)
+          if (injected && injected.ok) {
+            // A landed send proves the chat is in use: it is now the newest
+            // tracked id even when a title match, not the tracked list, found it.
+            rememberChatIds(targetId)
+            return injected
           }
           const rpc = await sendSummonRpc(targetId, outgoing)
-          jsJournal(`rpc fallback ok=${!!(rpc && rpc.ok)} reason=${asText(rpc && rpc.reason) || '-'}`)
-          if (rpc && rpc.ok) {
-            if (isLook) notifyLookAnswered()
-            else notifyChipSendSuccess(destination)
-            return rpc
+          jsJournal(`rpc ok=${!!(rpc && rpc.ok)} reason=${asText(rpc && rpc.reason) || '-'}`)
+          if (rpc && rpc.ok) return rpc
+          // Neither door took the turn: report the last door's reason, but keep
+          // the injection transport error so the toast names the real cause.
+          return {
+            ...(rpc || {}),
+            reason: asText(rpc && rpc.reason)
+              || asText(injected && injected.reason)
+              || 'send_failed',
+            error: (rpc && rpc.error) || (injected && injected.error),
+            injection_reason: injected && injected.reason,
+            injection_error: injected && injected.error
           }
-          const injected = await sendSummonInjection(targetId, outgoing)
-          jsJournal(`inject fallback ok=${!!(injected && injected.ok)} reason=${asText(injected && injected.reason) || '-'}`)
-          return injected && injected.ok ? injected : result
         })
         .then(result => {
           if (result && result.ok) {
-            if (isLook) {
-              notifyLookAnswered()
-            } else {
-              notifyChipSendSuccess(destination)
-            }
+            if (isLook) notifyLookAnswered()
+            else notifyChipSendSuccess(destination)
           } else {
             notifyChipSendFailure(result)
           }
+          return result
         })
         .catch(err => notifyChipSendFailure({ reason: 'send_failed', error: err }))
         .then(() => {
@@ -1117,8 +1094,8 @@ async function sendSummonRpc(target, text) {
   }
 
   // The frame is what tells the model this came from the pet. Injection applies
-  // it server-side (butler_core/summon.py) and the composer fallback applies it
-  // with `/butler <text>`; a raw prompt.submit would lose it entirely, so route
+  // it server-side (butler_core/summon.py) and this RPC door applies it with
+  // `/butler <text>`; a raw prompt.submit would lose it entirely, so route
   // through the same slash door. An already-framed LOOK row ("[butler look] …")
   // is passed through untouched.
   const framed = /^\s*\[butler /.test(text) ? text : butlerCommandText(text)
@@ -1178,7 +1155,7 @@ function expectedSummonSessionKey(profile, sessionId) {
   return `agent:${sessionKeyNamespace(profile)}:local:dm:${id}`
 }
 
-async function sendSummonInjection(target, text) {
+async function sendSummonInjection(target, text, options = {}) {
   const targetId = asText(target)
   if (!targetId) {
     return { ok: false, reason: 'no_session', error: null, session: null }
@@ -1188,9 +1165,16 @@ async function sendSummonInjection(target, text) {
   }
   try {
     const sessionKey = expectedSummonSessionKey(hostProfileName(), targetId)
+    const body = sessionKey
+      ? { text, session_id: targetId, session_key: sessionKey }
+      : { text, session_id: targetId }
+    // Only the LOOK door stamps an origin: the route then frames the turn with
+    // the "answer on the pet" instruction. Plain ask-field rows stay unchanged.
+    const origin = asText(options && options.origin)
+    if (origin) body.origin = origin
     const response = await rest('/summon/send', {
       method: 'POST',
-      body: sessionKey ? { text, session_id: targetId, session_key: sessionKey } : { text, session_id: targetId }
+      body
     })
     if (response && response.ok === true) {
       return {

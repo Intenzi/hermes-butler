@@ -167,7 +167,7 @@ test('the desktop plugin never reaches into the host page DOM', () => {
   assert.equal(source.includes('petCanvasNode'), false)
 })
 
-test('the web summon bar is gone and the pending-text path survives', () => {
+test('the web summon bar is gone and the two-door pending send survives', () => {
   const source = readFileSync(PLUGIN_JS, 'utf8')
 
   // The React bar and its titlebar slot / keybind are gone: the companion's
@@ -177,8 +177,14 @@ test('the web summon bar is gone and the pending-text path survives', () => {
   assert.equal(source.includes("id: 'butler.summon'"), false, 'no shadowed keybind')
   // The LOOK answer path is the reason the module-scope consumer stays.
   assert.ok(source.includes('startSummonPendingPolling'), 'pending poll is armed')
-  assert.ok(source.includes('sendPendingSummonText(outgoing'),
-    'a text pending row is still sent')
+  // A text row goes out through the injection door first and the RPC door
+  // second; the composer ladder that used to sit in front of both is gone.
+  assert.match(source, /sendSummonInjection\(\s*targetId,\s*outgoing/,
+    'a text pending row is still sent through the injection door')
+  assert.match(source, /sendSummonRpc\(targetId, outgoing\)/,
+    'the RPC door is reached when injection cannot continue the chat')
+  assert.equal(source.includes('sendPendingSummonText'), false,
+    'no composer send path survives')
 })
 
 test('register arms the companion chip with no config key', async () => {
@@ -531,7 +537,8 @@ test('a text pending row sends to the newest Butler chat in place',
     const sends = calls.filter(call => call.path === '/summon/send')
     assert.equal(sends.length, 1)
     assert.equal(sends[0].opts.method, 'POST')
-    assert.equal(sends[0].opts.body.text, 'turn off wifi')
+    assert.equal(sends[0].opts.body.text, 'turn off wifi',
+      'injection gets the bare text; the gateway adds the [butler summon] frame')
     assert.equal(sends[0].opts.body.session_id, 'new-chat')
     assert.equal('origin' in sends[0].opts.body, false,
       'plain ask-field rows keep sending without an origin')
@@ -818,6 +825,7 @@ test('a text-less pending row is consumed and posts no send', async () => {
 
 test('a failed in-place send still acks the row and notifies the reason', async () => {
   const calls = []
+  const requests = []
   const notifications = []
   const rest = async (requestPath, opts) => {
     calls.push({ path: requestPath, opts })
@@ -829,20 +837,31 @@ test('a failed in-place send still acks the row and notifies the reason', async 
     return {}
   }
   const host = defaultHost({
-    request: async method => (method === 'session.list'
-      ? [{ id: 'chat-1', title: 'Butler', created_at: 1 }]
-      : []),
+    request: async (method, props) => {
+      requests.push({ method, props })
+      if (method === 'session.list') return [{ id: 'chat-1', title: 'Butler', created_at: 1 }]
+      if (method === 'session.resume') return { session_id: props.session_id }
+      // The second door takes the turn but hands back no admission receipt.
+      if (method === 'prompt.submit') return {}
+      return []
+    },
     notify: payload => notifications.push(payload)
   })
   const env = await loadPlugin({ host, rest, document: makeDocument() })
 
   assert.equal(await env.api.pollSummonPending(), true)
 
+  // Injection failed, so the RPC door was tried for the same chat.
+  const submit = requests.find(entry => entry.method === 'prompt.submit')
+  assert.ok(submit, 'the second door carried the text when injection failed')
+  assert.equal(submit.props.session_id, 'chat-1')
+  assert.equal(submit.props.text, '/butler hi', 'the failover keeps the butler frame')
   assert.deepEqual(calls.filter(call => call.path === '/summon/ack')
     .map(call => call.opts.body.id), ['pending-fail'])
   assert.equal(notifications.length, 1)
   assert.equal(notifications[0].kind, 'error')
-  assert.match(notifications[0].message, /gateway down/)
+  assert.match(notifications[0].message, /gateway down/,
+    'the toast names the transport failure, not only the last empty receipt')
   env.dispose()
 })
 

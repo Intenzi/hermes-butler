@@ -62,9 +62,12 @@ def test_plugin_has_an_honest_chip_status_row_and_popout_bridge() -> None:
     assert "/summon/claim" in source
     assert "summon_pending" in source
     assert "/summon/ack" in source
-    # The LOOK answer path: the module-scope consumer still sends a text row.
+    # The LOOK answer path: the module-scope consumer still sends a text row,
+    # over the two doors that can reach a chat the pet field cannot see.
     assert "startSummonPendingPolling" in source
-    assert "sendPendingSummonText" in source
+    assert "sendSummonInjection" in source
+    assert "sendSummonRpc" in source
+    assert "sendPendingSummonText" not in source
 
 
 def test_plugin_surfaces_unroutable_session_and_the_resolved_route() -> None:
