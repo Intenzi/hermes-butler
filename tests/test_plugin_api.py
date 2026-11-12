@@ -404,8 +404,9 @@ class FakePluginCtx:
 
 def test_summon_send_routes_by_the_desktop_chat_id(
         client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The host owns the session-key rules: the desktop's durable chat id is
-    # handed straight to the supported injection seam, never re-derived here.
+    # The host owns the session-key rules: the desktop's durable chat id travels
+    # as a chat descriptor, so the host builds the key (agent:main:local:dm:…)
+    # instead of us guessing at it.
     ctx = FakePluginCtx()
     monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
 
@@ -419,8 +420,15 @@ def test_summon_send_routes_by_the_desktop_chat_id(
     assert ctx.injected == [{
         "text": frame_summon_text("turn off wifi"),
         "role": "user",
-        "session_key": "local-ec39b9cb",
+        "origin": {
+            "platform": "local",
+            "chat_type": "dm",
+            "chat_id": "local-ec39b9cb",
+        },
     }]
+    # A bare id as session_key is what made every send unroutable; it must not
+    # come back through another door.
+    assert "session_key" not in ctx.injected[0]
 
 
 def test_summon_send_reports_false_as_unroutable_without_raising(
@@ -485,7 +493,7 @@ def test_summon_send_injects_the_exact_frame_into_the_selected_session(
     assert ctx.injected == [{
         "text": frame_summon_text("turn off wifi"),
         "role": "user",
-        "session_key": "ses_123",
+        "origin": {"platform": "local", "chat_type": "dm", "chat_id": "ses_123"},
     }]
     assert ctx.injected[0]["text"].startswith("[butler summon] turn off wifi\n\n")
 
@@ -771,7 +779,7 @@ def test_summon_send_keeps_the_summon_frame_without_the_look_origin(
     assert ctx.injected == [{
         "text": frame_summon_text("turn off wifi"),
         "role": "user",
-        "session_key": "ses_123",
+        "origin": {"platform": "local", "chat_type": "dm", "chat_id": "ses_123"},
     }]
     assert "butler_say" not in ctx.injected[0]["text"]
 

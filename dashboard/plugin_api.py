@@ -576,8 +576,18 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
     # A LOOK row came from the ⌘⇧L door: its turn also asks for butler_say, so
     # the short answer lands beside the pointer instead of only in the chat.
     frame = _summon_frame(text, origin)
+    # `session_key` is the host's *session* key (`agent:main:local:dm:local-…`),
+    # not the bare chat id the desktop sends. Handing over the id as a key made
+    # every send unroutable ("Plugin message injection was not routed"). Passing
+    # the chat as an `origin` lets the host build the key itself, which is the
+    # public route: gateway/plugin_keyless_inject.py owns the template.
+    chat_origin = {
+        "platform": "local",
+        "chat_type": "dm",
+        "chat_id": session_id,
+    }
     try:
-        accepted = bool(inject(frame, role="user", session_key=session_id))
+        accepted = bool(inject(frame, role="user", origin=chat_origin))
     except Exception:
         logger.exception("butler summon injection failed for %s", session_id)
         accepted = False
