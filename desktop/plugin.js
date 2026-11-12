@@ -296,6 +296,9 @@ async function listSessions() {
     // treating it as one would prune every tracked id.
     return Array.isArray(sessions) ? sessions : null
   } catch (err) {
+    // The reason a list fails is the difference between "no chats" and "the
+    // call is wrong"; swallowing it made both look identical in the log.
+    jsJournal(`session.list failed: ${asText(err && err.message) || err}`)
     return null
   }
 }
@@ -1185,6 +1188,7 @@ async function sendSummonInjection(target, text, options = {}) {
         attempts: 1
       }
     }
+    jsJournal(`inject refused: ${JSON.stringify(response || {}).slice(0, 120)}`)
     return {
       ok: false,
       reason: asText(response && response.reason) || 'injection_denied',
