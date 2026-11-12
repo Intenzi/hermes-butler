@@ -87,10 +87,11 @@ let claimConfigTimer = null
 // watcher lives here so a host that never mounts a pane surface still consumes
 // the row. lastPendingId dedupes a row that survives one poll before the ack.
 let summonPendingTimer = null
-// The injection gate (`plugins.entries.<id>.allow_gateway_injection`) is read by
-// the host once per session and cannot change without a gateway restart, so one
+// The host's injection gate cannot change without a gateway restart, so one
 // refusal is enough: after it, the field goes straight to RPC instead of paying
-// for a call that will be refused every time.
+// for a call that will be refused every time. Asking the gate up front would
+// mean reading the user's config ourselves -- a side-door the review's spirit
+// rules out, for a saving of one request per session.
 let injectionAllowed = null
 let lastPendingId = null
 function h(type, props, ...children) {
@@ -1910,19 +1911,6 @@ export default {
     // the companion heartbeat fresh on the periodic tick.
     try { syncPetClickClaim() } catch (err) { }
     startClaimConfigPolling(ctx)
-    // Ask the host once whether it will accept an injected turn. The flag is a
-    // config sibling the plugin cannot read directly, so the answer comes from
-    // our own API and the send path only ever needs an `if`.
-    Promise.resolve(rest && rest('/injection-gate'))
-      .then(gate => {
-        if (gate && gate.allowed === false) {
-          injectionAllowed = false
-          jsJournal('inject gate off at startup: RPC carries sends')
-        } else if (gate && gate.allowed === true) {
-          injectionAllowed = true
-        }
-      })
-      .catch(() => {})
     startSummonPendingPolling(ctx)
     startPetSpeechPolling(ctx)
   }

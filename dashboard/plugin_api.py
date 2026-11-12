@@ -29,9 +29,6 @@ from butler_core import paths as bp_paths  # noqa: E402  (import after sys.path 
 router = APIRouter()
 logger = logging.getLogger("hermes.plugins.butler.api")
 
-_UNSET = object()
-_INJECTION_GATE: Any = _UNSET
-
 HISTORY_LIMIT = 50
 CONFIG_KEY = "summon.pet_click_claim"
 
@@ -380,41 +377,6 @@ def _drop_stale_guide(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _injection_gate() -> bool | None:
-    """Whether the host will accept ``ctx.inject_message`` right now.
-
-    The gate is ``plugins.entries.<id>.allow_gateway_injection`` in the profile's
-    ``config.yaml`` -- a sibling of the plugin's own ``settings``, so neither the
-    plugin's ``config_schema`` nor ``ctx.get_config()`` reaches it. Reading the
-    file is the only way to answer before making the call; ``None`` means "could
-    not tell", and the desktop then simply tries.
-
-    The flag cannot change without a gateway restart, so one answer per process is
-    enough.
-    """
-    global _INJECTION_GATE
-    if _INJECTION_GATE is not _UNSET:
-        return _INJECTION_GATE
-    value: bool | None = None
-    for candidate in (
-        Path.home() / ".hermes" / "config.yaml",
-        Path(os.environ.get("HERMES_HOME", "")) / "config.yaml" if os.environ.get("HERMES_HOME") else None,
-    ):
-        if candidate is None or not candidate.exists():
-            continue
-        try:
-            import yaml
-
-            raw = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
-            entry = ((raw.get("plugins") or {}).get("entries") or {}).get("butler") or {}
-            value = entry.get("allow_gateway_injection") is True
-            break
-        except Exception:  # noqa: BLE001 - an unreadable config is "unknown"
-            value = None
-    _INJECTION_GATE = value
-    return value
-
-
 def _read_state() -> dict[str, Any]:
     data: dict[str, Any] = {}
     for path in _state_candidates():
@@ -726,16 +688,6 @@ def watch_stop() -> dict[str, Any]:
 @router.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "plugin": "butler"}
-
-
-@router.get("/injection-gate")
-def injection_gate() -> dict[str, Any]:
-    """Whether ``ctx.inject_message`` will be accepted, so the desktop can skip it.
-
-    ``None`` means "could not tell from config" -- the desktop then tries once and
-    remembers the refusal.
-    """
-    return {"allowed": _injection_gate()}
 
 
 @router.get("/state")
