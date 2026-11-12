@@ -1144,6 +1144,40 @@ async function sendSummonRpc(target, text) {
   return { ok: true, send: 'rpc', session: chosen, attempts: 1 }
 }
 
+/**
+ * The gateway names a local DM session `agent:<ns>:local:dm:<chat id>`, where the
+ * namespace is `main` for the default profile. `ctx.inject_message` needs that
+ * whole key -- not the bare chat id, which routes nowhere -- and it is the only
+ * way to reach a chat that exists without the app having it on screen.
+ */
+function hostProfileName() {
+  try {
+    const state = host && host.state
+    for (const atom of [state && state.focusedSessionProfile, state && state.profile]) {
+      if (atom && typeof atom.get === 'function') {
+        const value = asText(atom.get())
+        if (value) return value
+      }
+    }
+  } catch (err) {
+    // An older host without host.state simply falls back to the default profile.
+  }
+  return 'default'
+}
+
+function sessionKeyNamespace(profile) {
+  const name = asText(profile)
+  if (!name || name === 'default') return 'main'
+  return name === 'main' ? 'main~' : name
+}
+
+/** The exact key the gateway reports for a local DM routed to this session. */
+function expectedSummonSessionKey(profile, sessionId) {
+  const id = asText(sessionId)
+  if (!id) return null
+  return `agent:${sessionKeyNamespace(profile)}:local:dm:${id}`
+}
+
 async function sendSummonInjection(target, text) {
   const targetId = asText(target)
   if (!targetId) {
@@ -1153,9 +1187,10 @@ async function sendSummonInjection(target, text) {
     return { ok: false, reason: 'injection_unavailable', error: null, session: targetId }
   }
   try {
+    const sessionKey = expectedSummonSessionKey(hostProfileName(), targetId)
     const response = await rest('/summon/send', {
       method: 'POST',
-      body: { text, session_id: targetId }
+      body: sessionKey ? { text, session_id: targetId, session_key: sessionKey } : { text, session_id: targetId }
     })
     if (response && response.ok === true) {
       return {

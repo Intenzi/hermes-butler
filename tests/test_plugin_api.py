@@ -847,3 +847,44 @@ def test_the_answer_tool_and_state_share_one_say_file(
     # A second answer replaces the row and /state sees it without a restart.
     engine.say("The second answer.")
     assert client.get("/state").json()["say"]["text"] == "The second answer."
+
+def test_summon_send_prefers_the_gateway_session_key(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The precise route is the key (`agent:main:local:dm:<id>`); the origin is
+    # only the retry for a host that cannot resolve the key. One call, no
+    # descriptor, when the desktop sends both.
+    ctx = FakePluginCtx()
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={
+        "text": "turn off wifi",
+        "session_id": "local-ec39b9cb",
+        "session_key": "agent:main:local:dm:local-ec39b9cb",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert len(ctx.injected) == 1, "the origin retry must not fire after a routed key"
+    assert ctx.injected[0]["session_key"] == "agent:main:local:dm:local-ec39b9cb"
+    assert "origin" not in ctx.injected[0]
+
+
+def test_summon_send_falls_back_to_the_origin_when_the_key_misses(
+        client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    class KeyMissCtx(FakePluginCtx):
+        def inject_message(self, text, **kwargs):
+            self.injected.append({"text": text, **kwargs})
+            return "origin" in kwargs
+
+    ctx = KeyMissCtx()
+    monkeypatch.setattr(plugin_api, "_plugin_context", lambda: ctx)
+
+    response = client.post("/summon/send", json={
+        "text": "turn off wifi",
+        "session_id": "local-ec39b9cb",
+        "session_key": "agent:main:local:dm:local-ec39b9cb",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert [("session_key" in call) for call in ctx.injected] == [True, False]

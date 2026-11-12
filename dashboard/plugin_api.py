@@ -563,9 +563,11 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
     text = body.get("text") if isinstance(body, dict) else None
     session_id = body.get("session_id") if isinstance(body, dict) else None
     origin = body.get("origin") if isinstance(body, dict) else None
+    session_key = body.get("session_key") if isinstance(body, dict) else None
     text = text.strip() if isinstance(text, str) else ""
     session_id = session_id.strip() if isinstance(session_id, str) else ""
     origin = origin.strip().lower() if isinstance(origin, str) else ""
+    session_key = session_key.strip() if isinstance(session_key, str) else ""
     if not text or not session_id:
         raise HTTPException(status_code=400, detail="text and session_id are required")
 
@@ -586,11 +588,31 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
         "chat_type": "dm",
         "chat_id": session_id,
     }
-    try:
-        accepted = bool(inject(frame, role="user", origin=chat_origin))
-    except Exception:
-        logger.exception("butler summon injection failed for %s", session_id)
-        accepted = False
+    # Two supported shapes, key first:
+    #   * `session_key` names the exact live session (`agent:main:local:dm:…`).
+    #     It is the precise route, and the desktop can build it from the chat id.
+    #   * `origin` lets the host build that key itself, but only for a chat that
+    #     already had a human turn -- "a plugin can continue a chat, not open one".
+    # Trying the key first means the common case costs one call; the origin retry
+    # keeps working where the key does not resolve (older builds, other profiles).
+    attempts: list[tuple[str, bool]] = []
+    accepted = False
+    if session_key:
+        try:
+            accepted = bool(inject(frame, role="user", session_key=session_key))
+        except Exception:
+            logger.exception("butler summon injection failed for %s", session_id)
+            accepted = False
+        attempts.append(("session_key", accepted))
+    if not accepted:
+        try:
+            accepted = bool(inject(frame, role="user", origin=chat_origin))
+        except Exception:
+            logger.exception("butler summon injection failed for %s", session_id)
+            accepted = False
+        attempts.append(("origin", accepted))
+    if accepted and len(attempts) > 1:
+        logger.info("butler summon routed via %s after %s", attempts[-1][0], attempts[0][0])
     if not accepted:
         # One line, never a raise: the answer stays in chat. The host requires
         # ``plugins.entries.butler.allow_gateway_injection: true`` for this seam,
