@@ -978,6 +978,7 @@ def _on_overlay_event(event):
         _handle_watch_message(event)
         return
     if op == "summon_text":
+        _journal_summon("engine-summon_text-received")
         text = event.get("text")
         if not isinstance(text, str) or not text.strip():
             return
@@ -2082,6 +2083,18 @@ def _clear_guard_note(s):
     guard = state.pop("guard_note", None)
     if guard and state.get("note") == guard:
         state["note"] = None
+
+
+def _journal_summon(stage):
+    """One line per stage of a summon, in the same log the companion writes.
+
+    A press that silently does nothing is indistinguishable from a press that
+    never arrived; this makes each hop visible instead of guessed at.
+    """
+    try:
+        bp_overlay.journal_click(stage)
+    except Exception:  # noqa: BLE001 - a journal must never break a send
+        pass
 
 
 def _journal_token(value, limit=40):

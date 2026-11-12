@@ -603,6 +603,24 @@ def summon_send(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "session": session_id}
 
 
+@router.post("/journal")
+def journal(body: dict[str, Any]) -> dict[str, Any]:
+    """Append one desktop-side line to the same log the companion writes.
+
+    The pet's field is drawn by Swift, the send is decided by JavaScript and the
+    turn is started by Python; without one shared log a silent press cannot be
+    traced to the hop that dropped it.
+    """
+    line = body.get("line") if isinstance(body, dict) else None
+    if not isinstance(line, str) or not line.strip():
+        raise HTTPException(status_code=400, detail="line is required")
+    try:
+        _load_overlay_module().journal_click("js:%s" % line.strip()[:160])
+    except Exception:  # noqa: BLE001 - logging must never fail the caller
+        logger.debug("butler journal write failed", exc_info=True)
+    return {"ok": True}
+
+
 @router.post("/watch/ack")
 def watch_ack() -> dict[str, Any]:
     """Acknowledge the hit announcement, which outlives its watch.

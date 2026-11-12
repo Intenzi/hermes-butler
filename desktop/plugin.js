@@ -1048,10 +1048,12 @@ function pollSummonPending() {
         ? 'new' : 'recent'
       // A LOOK row is a text row with an element attached, and the injected
       // turn leads with the control the user pointed at.
+      jsJournal(`poll row id=${asText(pending && pending.id)} text=${asText(text).length}`)
       const isLook = asText(pending && pending.origin) === 'look'
       const outgoing = isLook ? lookPendingText(pending) : text
       // Send in place. A failed send still acks: the text was typed once, and
       // retrying silently is worse than telling the user exactly why it failed.
+      jsJournal(`poll send ${destination} look=${isLook} len=${outgoing.length}`)
       return sendPendingSummonText(outgoing, destination, isLook ? { origin: 'look' } : {})
         .then(result => {
           if (result && result.ok) {
@@ -1074,6 +1076,22 @@ function pollSummonPending() {
 }
 
 /** Watch the companion summon row from module scope on every host. */
+/**
+ * One line into the shared log (same file the companion writes). A press that
+ * does nothing has to be traceable to the hop that dropped it: Swift writes
+ * `ask-submit`, Python writes `engine-summon_text-received`, this side writes
+ * `js:*` for the poll, the send attempt and the outcome.
+ */
+function jsJournal(line) {
+  try {
+    if (typeof rest !== 'function') return
+    const pending = rest('/journal', { method: 'POST', body: { line: String(line).slice(0, 140) } })
+    if (pending && typeof pending.catch === 'function') pending.catch(() => {})
+  } catch (err) {
+    // A log must never break a send.
+  }
+}
+
 function startSummonPendingPolling(ctx) {
   const tick = () => { pollSummonPending().catch(() => {}) }
   try {
@@ -1347,6 +1365,7 @@ async function sendSummonRpc(target, text) {
     }
   }
 
+  jsJournal(`rpc choose=${chosen || 'none'} tracked=${candidates.length} rows=${Array.isArray(rows) ? rows.length : 'err'}`)
   if (!chosen) {
     if (Array.isArray(rows)) {
       // The list is authoritative: no tracked id survived it, so mint one.
@@ -1396,6 +1415,7 @@ async function sendSummonRpc(target, text) {
   }
 
   rememberChatIds(chosen)
+  jsJournal(`rpc sent session=${chosen}`)
   return { ok: true, send: 'rpc', session: chosen, attempts: 1 }
 }
 
