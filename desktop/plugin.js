@@ -873,7 +873,10 @@ function startClaimConfigPolling(ctx) {
  */
 async function resolveChipSendTarget(destination = 'recent') {
   const wantsNew = destination === 'new'
-  if (!host || typeof host.request !== 'function') return null
+  if (!host || typeof host.request !== 'function') {
+    jsJournal('resolve no host.request')
+    return null
+  }
   try {
     const rows = await listSessions()
     if (wantsNew) {
@@ -1054,7 +1057,35 @@ function pollSummonPending() {
       // Send in place. A failed send still acks: the text was typed once, and
       // retrying silently is worse than telling the user exactly why it failed.
       jsJournal(`poll send ${destination} look=${isLook} len=${outgoing.length}`)
-      return sendPendingSummonText(outgoing, destination, isLook ? { origin: 'look' } : {})
+      // The pet's field resolves a destination and then has to try every door,
+      // exactly like the bar does. It used to call the composer ladder alone,
+      // so a chat that was not on screen ended the chain with a toast and the
+      // RPC/injection doors below were never reached.
+      const composer = sendPendingSummonText(outgoing, destination, isLook ? { origin: 'look' } : {})
+      return composer
+        .then(async result => {
+          jsJournal(`send result ok=${!!(result && result.ok)} reason=${asText(result && result.reason) || '-'} session=${asText(result && result.session) || '-'}`)
+          if (result && result.ok) return result
+          // A composer failure can come back without an address (no mounted
+          // chat at all); the resolver owns that answer, so ask it again rather
+          // than giving up on a send that never had a chat to try.
+          let targetId = asText(result && result.session)
+          if (!targetId) targetId = asText(await resolveChipSendTarget(destination).catch(() => null))
+          if (!targetId) {
+            jsJournal('rpc fallback skipped: no target')
+            return result
+          }
+          const rpc = await sendSummonRpc(targetId, outgoing)
+          jsJournal(`rpc fallback ok=${!!(rpc && rpc.ok)} reason=${asText(rpc && rpc.reason) || '-'}`)
+          if (rpc && rpc.ok) {
+            if (isLook) notifyLookAnswered()
+            else notifyChipSendSuccess(destination)
+            return rpc
+          }
+          const injected = await sendSummonInjection(targetId, outgoing)
+          jsJournal(`inject fallback ok=${!!(injected && injected.ok)} reason=${asText(injected && injected.reason) || '-'}`)
+          return injected && injected.ok ? injected : result
+        })
         .then(result => {
           if (result && result.ok) {
             if (isLook) {
@@ -1093,7 +1124,9 @@ function jsJournal(line) {
 }
 
 function startSummonPendingPolling(ctx) {
-  const tick = () => { pollSummonPending().catch(() => {}) }
+  const tick = () => {
+    pollSummonPending().catch(err => jsJournal(`poll threw ${asText(err && err.message) || err}`))
+  }
   try {
     if (ctx && typeof ctx.setInterval === 'function') {
       ctx.setInterval(tick, REFRESH_MS)
@@ -1343,6 +1376,7 @@ function summonFailureMessage(result) {
 async function sendSummonRpc(target, text) {
   const targetId = asText(target)
   if (!targetId || !host || typeof host.request !== 'function') {
+    jsJournal(`rpc unavailable target=${targetId || '-'} host=${!!host} request=${!!(host && host.request)}`)
     return { ok: false, reason: 'no_rpc', session: targetId || null }
   }
 

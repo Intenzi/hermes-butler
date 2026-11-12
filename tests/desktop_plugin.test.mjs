@@ -2451,3 +2451,43 @@ test('rpc send refuses to claim a send without an admission receipt', async () =
   assert.equal(result.ok, false)
   assert.equal(result.reason, 'prompt_submit_empty')
 })
+
+test('the pet field reaches a background chat over RPC when no composer is mounted', async () => {
+  // The regression this covers: the field called the composer ladder alone, so a
+  // chat that was not on screen ended the chain with a toast and the RPC door
+  // was never tried. The row must still land.
+  const calls = []
+  const acks = []
+  const statePayload = {
+    summon_pending: { id: 'pending-rpc', text: 'turn off wifi', destination: 'recent' }
+  }
+  const rest = async (requestPath, opts) => {
+    calls.push({ path: requestPath, opts })
+    if (requestPath === '/state') return statePayload
+    if (requestPath === '/summon/ack') { acks.push(opts.body.id); return { ok: true } }
+    if (requestPath === '/summon/send') return { ok: false, reason: 'injection_denied' }
+    if (requestPath === '/journal') return { ok: true }
+    return {}
+  }
+  const host = defaultHost({
+    request: async (method, params) => {
+      calls.push({ path: `rpc:${method}`, opts: { params } })
+      if (method === 'session.list') return [{ id: 'live-1', title: 'Butler', created_at: 2 }]
+      if (method === 'session.resume') return { session_id: params.session_id }
+      if (method === 'prompt.submit') return { status: 'streaming' }
+      throw new Error(`unexpected ${method}`)
+    },
+    composer: { submit: () => false, setDraft: async () => false }
+  })
+  const env = await loadPlugin({ host, rest, document: makeDocument() })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+
+  const submit = calls.find(call => call.path === 'rpc:prompt.submit')
+  assert.ok(submit, 'the RPC door carried the text')
+  assert.equal(submit.opts.params.text, 'turn off wifi')
+  assert.equal(submit.opts.params.session_id, 'live-1')
+  assert.deepEqual(acks, ['pending-rpc'], 'the row is acked once the send landed')
+
+  env.dispose()
+})
