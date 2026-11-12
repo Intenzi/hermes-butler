@@ -87,6 +87,11 @@ let claimConfigTimer = null
 // watcher lives here so a host that never mounts a pane surface still consumes
 // the row. lastPendingId dedupes a row that survives one poll before the ack.
 let summonPendingTimer = null
+// The injection gate (`plugins.entries.<id>.allow_gateway_injection`) is read by
+// the host once per session and cannot change without a gateway restart, so one
+// refusal is enough: after it, the field goes straight to RPC instead of paying
+// for a call that will be refused every time.
+let injectionAllowed = null
 let lastPendingId = null
 function h(type, props, ...children) {
   let key = undefined
@@ -923,9 +928,20 @@ function pollSummonPending() {
               destination
             }
           }
-          const injected = await sendSummonInjection(
-            targetId, outgoing, isLook ? { origin: 'look' } : {})
-          jsJournal(`inject ok=${!!(injected && injected.ok)} reason=${asText(injected && injected.reason) || '-'}`)
+          let injected = { ok: false, reason: 'injection_skipped' }
+          if (injectionAllowed !== false) {
+            injected = await sendSummonInjection(
+              targetId, outgoing, isLook ? { origin: 'look' } : {})
+            jsJournal(`inject ok=${!!(injected && injected.ok)} reason=${asText(injected && injected.reason) || '-'}`)
+            if (injected && injected.ok) {
+              injectionAllowed = true
+            } else if (asText(injected && injected.reason) === 'injection_denied') {
+              // Refused by the host's gate: remember it, so the next press does
+              // not spend a round trip proving the same thing.
+              injectionAllowed = false
+              jsJournal('inject gate off: RPC carries sends from here')
+            }
+          }
           if (injected && injected.ok) {
             // A landed send proves the chat is in use: it is now the newest
             // tracked id even when a title match, not the tracked list, found it.

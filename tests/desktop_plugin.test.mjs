@@ -1750,3 +1750,39 @@ test('a look row keeps its own frame on the RPC door', async () => {
   assert.equal(result.ok, true)
   assert.equal(seen[0], looked, 'an already-framed row is never wrapped twice')
 })
+
+test('a refused injection is not retried on the next press', async () => {
+  // The host reads the gate once per session; re-proving it every press is a
+  // wasted round trip. First row: inject refused, RPC carries it. Second row:
+  // inject is skipped entirely.
+  let sends = 0
+  let rpcSubmits = 0
+  let statePayload = { summon_pending: { id: 'p1', text: 'one', destination: 'recent' } }
+  const rest = async (path, opts) => {
+    if (path === '/state') return statePayload
+    if (path === '/summon/ack') return { ok: true }
+    if (path === '/journal') return { ok: true }
+    if (path === '/summon/send') { sends += 1; return { ok: false, reason: 'injection_denied' } }
+    return {}
+  }
+  const host = defaultHost({
+    request: async (method, params) => {
+      if (method === 'session.list') return [{ id: 'chat-1', title: 'Butler', created_at: 2 }]
+      if (method === 'session.resume') return { session_id: params.session_id }
+      if (method === 'prompt.submit') { rpcSubmits += 1; return { status: 'streaming' } }
+      throw new Error(`unexpected ${method}`)
+    }
+  })
+  const env = await loadPlugin({ host, rest, document: makeDocument() })
+
+  assert.equal(await env.api.pollSummonPending(), true)
+  assert.equal(sends, 1, 'the first press tries injection once')
+  assert.equal(rpcSubmits, 1, 'and RPC carries it')
+
+  statePayload = { summon_pending: { id: 'p2', text: 'two', destination: 'recent' } }
+  assert.equal(await env.api.pollSummonPending(), true)
+  assert.equal(sends, 1, 'the refused gate is not re-proven')
+  assert.equal(rpcSubmits, 2, 'the second press went straight to RPC')
+
+  env.dispose()
+})
