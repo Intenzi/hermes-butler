@@ -6,8 +6,8 @@
  * for finished ones. The status bar carries a small Butler launcher that
  * creates or focuses the "Butler" chat.
  *
- * SDK-first surface (routes, nav, palette, status bar, host sessions, composer
- * submit). The plugin never reads or paints the Desktop app's page:
+ * SDK-first surface (routes, nav, palette, status bar, host sessions). The
+ * plugin never reads or paints the Desktop app's page:
  * the pet click receiver and its page overlay are gone. Bubble rendering stays
  * on the Python side via ctx.pet.say.
  */
@@ -30,15 +30,6 @@ const ROUTE = '/butler'
 const REFRESH_MS = 1500
 const HISTORY_PAGE = 8
 const BUTLER_TITLE = 'Butler'
-// The in-place open re-renders the primary and the Butler composer mounts a
-// few frames later; a zero-delay first submit loses that mount race outright.
-// Give it a real grace, then keep re-deriving the live address for six seconds.
-const SUMMON_SEND_GRACE_MS = 300
-const SUMMON_SEND_RETRY_MS = 150
-const SUMMON_SEND_TIMEOUT_MS = 6000
-// A full session.list per 150 ms retry would hammer the gateway. Re-derive
-// between attempts, but at most this often.
-const SUMMON_LIVE_REFRESH_MS = 600
 const CONFIG_REFRESH_MS = 5000
 // The SDK status-line / speech beat cadence (not a DOM read).
 const PET_STATUS_REFRESH_MS = 2000
@@ -66,9 +57,6 @@ const TRACKED_CHAT_IDS_LIMIT = 3
 // One page of session.list. Hitting this page boundary means the response may
 // be truncated, so absence from it is not confirmed absence.
 const SESSION_LIST_LIMIT = 200
-const SUMMON_DESTINATION_KEY = 'butler.summon.destination'
-const SUMMON_EXISTING = 'existing'
-const SUMMON_NEW = 'new'
 
 let rest = null
 let petCtx = null
@@ -100,9 +88,6 @@ let claimConfigTimer = null
 // the row. lastPendingId dedupes a row that survives one poll before the ack.
 let summonPendingTimer = null
 let lastPendingId = null
-// Destination default; localStorage is the cross-load source of truth.
-let summonDestination = null
-
 function h(type, props, ...children) {
   let key = undefined
   const p = {}
@@ -315,16 +300,6 @@ async function listSessions() {
   }
 }
 
-/**
- * Full session list, title filter deliberately absent.
- *
- * A renamed chat is still the Butler chat; only the legacy fallback in
- * `legacyButlerChat` may look at titles.
- */
-async function listButlerSessions() {
-  return listSessions()
-}
-
 function normalizeTrackedChatIds(value) {
   const ids = []
   for (const entry of asArray(value)) {
@@ -369,36 +344,6 @@ function rememberChatIds(...values) {
 function sessionTargetId(row) {
   return asText(row && (row.resolved_id || row.stored_session_id
     || row.id || row.session_id))
-}
-
-/** Profile the live gateway is routed to, as the gateway names it in a key. */
-function hostProfileName() {
-  try {
-    const state = host && host.state
-    for (const atom of [state && state.focusedSessionProfile, state && state.profile]) {
-      if (atom && typeof atom.get === 'function') {
-        const value = asText(atom.get())
-        if (value) return value
-      }
-    }
-  } catch (err) {
-    // An older host without host.state simply skips key verification.
-  }
-  return null
-}
-
-/** `agent:<ns>` uses `main` for the default profile and `main~` for a literal main. */
-function sessionKeyNamespace(profile) {
-  const name = asText(profile)
-  if (!name || name === 'default') return 'main'
-  return name === 'main' ? 'main~' : name
-}
-
-/** The key the gateway must report for a local DM routed to this exact session. */
-function expectedSummonSessionKey(profile, sessionId) {
-  const id = asText(sessionId)
-  if (!id) return null
-  return `agent:${sessionKeyNamespace(profile)}:local:dm:${id}`
 }
 
 /** A collision rename that keeps the sentence readable and unique per old id. */
@@ -471,12 +416,6 @@ function uniqueIds(...values) {
   }
   for (const value of values) add(value)
   return ids
-}
-
-function addTargetIds(list, values) {
-  for (const id of uniqueIds(values)) {
-    if (!list.includes(id)) list.push(id)
-  }
 }
 
 /**
@@ -677,45 +616,6 @@ function notifyLauncherFailure() {
   }
 }
 
-function notifySummonFailure(message) {
-  try {
-    host && host.notify && host.notify({
-      kind: 'error',
-      title: 'Butler',
-      message: message || 'Could not send that request to the Butler chat on this desktop build.'
-    })
-  } catch (err) {
-    // A missing toast surface must not break the summon.
-  }
-}
-
-function notifySummonSuccess(result) {
-  const destination = result && result.destination
-  const fresh = destination === SUMMON_NEW
-  let message = fresh ? 'Summoned → fresh Butler session' : 'Summoned → Butler chat (existing)'
-  let kind = 'success'
-  if (result && result.fallback) {
-    // Injection was denied/unavailable, so the chip path carried the request.
-    // Say so: the user must not read this as the full agent conversation.
-    kind = 'warning'
-    const reason = asText(result.injection_reason) || 'injection_unavailable'
-    const reasonLabel = reason === 'injection_denied'
-      ? 'was denied'
-      : reason === 'unroutable_session'
-        ? 'could not route this session (session not routable through the gateway)'
-        : 'was unavailable'
-    message += ` — gateway injection ${reasonLabel}`
-      + ' (' + reason + '); sent /butler instead, so this chat could not host the full conversation.'
-    const detail = asText(result.injection_detail)
-    if (detail) message += ` — ${detail}`
-  }
-  try {
-    host && host.notify && host.notify({ kind, title: 'Butler', message })
-  } catch (err) {
-    // A missing toast surface must not break the send.
-  }
-}
-
 /**
  * Focus the tracked Butler chat, or create one.
  *
@@ -753,13 +653,7 @@ async function openButlerSession() {
   }
 }
 
-// ------------------------------------------------------------ summon door
-
-function wait(ms) {
-  return new Promise(resolve => window.setTimeout(resolve, ms))
-}
-
-// ------------------------------------------------------- summon destination
+// ------------------------------------------------------------- local storage
 
 function localStore() {
   try {
@@ -767,21 +661,6 @@ function localStore() {
   } catch (err) {
     return null
   }
-}
-
-function readSummonDestination() {
-  try {
-    const store = localStore()
-    return store && store.getItem(SUMMON_DESTINATION_KEY) === SUMMON_NEW
-      ? SUMMON_NEW : SUMMON_EXISTING
-  } catch (err) {
-    return SUMMON_EXISTING
-  }
-}
-
-function getSummonDestination() {
-  if (summonDestination === null) summonDestination = readSummonDestination()
-  return summonDestination
 }
 
 /** The slash form still frames a butler turn; plain chat sends plain turns. */
@@ -1142,173 +1021,6 @@ function startSummonPendingPolling(ctx) {
   }
 }
 
-/**
- * Send a summon message to the Butler chat through the SDK composer door.
- * `host.composer.submit(sessionId, text)` is a real programmatic send (as if
- * the user typed + pressed Enter), not a draft seat. The exact session's
- * composer must be mounted, so right after a focus/create we give the app a
- * real mount grace, then retry for six seconds while re-deriving the address
- * from the live session list. If no mounted surface ever claims the send, the
- * text is seated as a draft and the caller gets the exact failure reason.
- */
-async function refreshSummonTarget(fallback) {
-  const rows = await listSessions()
-  const wanted = asText(fallback)
-  // Prefer the exact row the retry is addressing: ids are identity, so a
-  // renamed chat still answers here.
-  if (Array.isArray(rows) && wanted) {
-    const row = rows.find(entry => rowTargetIds(entry).includes(wanted))
-    if (row) {
-      const target = sessionTargetId(row) || wanted
-      return { target, ids: uniqueIds(wanted, rowTargetIds(row)) }
-    }
-  }
-  const tracked = trackedButlerChat(rows)
-  if (tracked) return { target: tracked.target, ids: tracked.ids }
-  const row = mostRecentSession(rows)
-  if (!row) return null
-  const ids = rowTargetIds(row)
-  const target = sessionTargetId(row) || wanted || ids[0]
-  if (!target && !ids.length) return null
-  return { target, ids }
-}
-
-function timingOption(value, fallback) {
-  const number = Number(value)
-  return Number.isFinite(number) && number >= 0 ? number : fallback
-}
-
-async function sendSummonText(target, text, options = {}) {
-  const targetId = asText(target)
-  if (!targetId) {
-    return { ok: false, reason: 'no_session', seated: false, error: null, session: null, attempts: 0 }
-  }
-  if (!host || !host.composer) {
-    return { ok: false, reason: 'no_composer', seated: false, error: null, session: targetId, attempts: 0 }
-  }
-
-  const now = typeof options.now === 'function' ? options.now : () => Date.now()
-  const delay = typeof options.wait === 'function' ? options.wait : wait
-  const graceMs = timingOption(options.graceMs, SUMMON_SEND_GRACE_MS)
-  const retryMs = timingOption(options.retryMs, SUMMON_SEND_RETRY_MS)
-  const timeoutMs = timingOption(options.timeoutMs, SUMMON_SEND_TIMEOUT_MS)
-  const refreshMs = timingOption(options.refreshMs, SUMMON_LIVE_REFRESH_MS)
-  const canRefresh = options.refresh !== false
-  const canSubmit = typeof host.composer.submit === 'function'
-  const canDraft = typeof host.composer.setDraft === 'function'
-  const candidates = uniqueIds(
-    targetId,
-    targetId === launcherTargetId ? launcherTargetAliases : []
-  )
-  let currentTarget = targetId
-  let nextRefreshAt = now()
-  let lastError = null
-  let attempts = 0
-  // A chat that is not on screen has no mounted composer, so `submit` fails
-  // closed for it. Opening the target through the SDK (never by driving the
-  // page) mounts its composer, which is the difference between "sent" and
-  // "seat a draft and hope".
-  let openedTarget = false
-  const startedAt = now()
-  const firstAttemptAt = startedAt + graceMs
-  const deadline = startedAt + timeoutMs
-
-  while (canSubmit) {
-    const current = now()
-    if (current < firstAttemptAt) {
-      if (firstAttemptAt >= deadline) break
-      await delay(firstAttemptAt - current)
-      continue
-    }
-    if (current >= deadline) break
-
-    attempts += 1
-    for (const id of [...candidates]) {
-      try {
-        if (host.composer.submit(id, text)) {
-          if (targetId === launcherTargetId) launcherTargetId = id
-          return { ok: true, send: 'composer.submit', session: id, attempts }
-        }
-      } catch (err) {
-        lastError = err
-      }
-    }
-
-    if (now() >= deadline) break
-
-    // A stored id can be stale while the mounted surface answers for the
-    // runtime id it resumed under. Re-read the live row between attempts.
-    if (canRefresh && now() >= nextRefreshAt) {
-      const live = await refreshSummonTarget(currentTarget)
-      if (live) {
-        addTargetIds(candidates, live.ids)
-        addTargetIds(candidates, live.target)
-        currentTarget = live.target || currentTarget
-        if (targetId === launcherTargetId) launcherTargetId = currentTarget
-      }
-      nextRefreshAt = now() + refreshMs
-    }
-
-    // One SDK open, after the first submit rounds have missed: a chat that is
-    // already mounted never pays for this, and a background chat gets a
-    // composer it can answer through.
-    if (!openedTarget && typeof host.openSession === 'function' && now() - startedAt > 600) {
-      openedTarget = true
-      try {
-        const opened = await host.openSession(currentTarget, { intent: 'in-place' })
-        for (const id of openResultIds(opened)) addTargetIds(candidates, id)
-      } catch (err) {
-        lastError = err
-      }
-    }
-
-    const nextAttemptAt = Math.min(deadline, now() + retryMs)
-    if (nextAttemptAt <= now()) break
-    await delay(nextAttemptAt - now())
-  }
-
-  // No submit verb (older host) or no mounted surface ever claimed it. Seat
-  // the text as the honest fallback and say exactly why the send failed.
-  let reason = canSubmit ? 'no_visible_composer' : 'no_programmatic_send'
-  let seated = false
-  if (canDraft) {
-    let draftThrew = false
-    for (const id of candidates) {
-      try {
-        if (await host.composer.setDraft(id, text)) {
-          seated = true
-          currentTarget = id
-          if (targetId === launcherTargetId) launcherTargetId = id
-          break
-        }
-      } catch (err) {
-        draftThrew = true
-        lastError = err
-      }
-    }
-    if (draftThrew && !seated) reason = 'draft_failed'
-  }
-  return {
-    ok: false,
-    seated,
-    reason,
-    error: lastError,
-    session: currentTarget,
-    attempts
-  }
-}
-
-async function spawnSummonDouble() {
-  if (!rest || typeof rest !== 'function') return false
-  try {
-    const result = await rest('/summon/pet', { method: 'POST' })
-    return Boolean(result && result.pet)
-  } catch (err) {
-    // No companion is a petless/overlay-missing path, not a send failure.
-    return false
-  }
-}
-
 const SUMMON_REASON_LABELS = {
   no_session: 'no session',
   no_composer: 'no composer',
@@ -1329,33 +1041,6 @@ function summonErrorText(error) {
   if (!error) return ''
   if (typeof error === 'string') return asText(error) || ''
   return asText(error.message) || asText(error) || ''
-}
-
-/** Exact, human-readable failure toast for the send path (never a dead-silent send). */
-function summonFailureMessage(result) {
-  const reason = asText(result && result.reason) || 'failed'
-  const label = SUMMON_REASON_LABELS[reason] || reason
-  let message = `Could not summon: ${label}`
-  if (label !== reason) message += ` (${reason})`
-  const error = summonErrorText(result && result.error) || summonErrorText(result && result.injection_error)
-  if (error) message += ` — ${error}`
-  const detail = asText(result && result.detail)
-  if (detail && detail !== error) message += ` — ${detail}`
-  const expectedKey = asText(result && result.expected_session_key)
-  const actualKey = asText(result && result.session_key)
-  if (expectedKey && !detail) {
-    message += ` — gateway session key ${actualKey || 'unknown'}; expected ${expectedKey}`
-  }
-  const injectionReason = asText(result && result.injection_reason)
-  if (injectionReason) {
-    message += `. Full-conversation injection was unavailable (${injectionReason}); /butler fallback also failed`
-  }
-  if (result && result.seated) {
-    message += '. Draft seat: seated. Press Enter in the Butler composer to send it.'
-  } else {
-    message += '. Draft seat: not seated.'
-  }
-  return message
 }
 
 /**
@@ -1491,145 +1176,6 @@ async function sendSummonInjection(target, text) {
   } catch (err) {
     return { ok: false, reason: 'injection_unavailable', error: err, session: targetId }
   }
-}
-
-/**
- * New destination: create the session first, let the focus settle (openSession
- * in-place plus the same 300 ms mount grace the composer path used), then keep
- * the fresh stored/runtime ids. Never falls back to the oldest Butler chat.
- */
-async function openFreshButlerSession(options = {}) {
-  if (launcherBusy) return launcherState(false, 'busy')
-  launcherBusy = true
-  launcherTargetId = null
-  launcherTargetAliases = []
-  try {
-    // The old titled chats are only renamed here: their ids stay untouched,
-    // and the fresh send below is addressed by the id create returns.
-    const previous = await listButlerSessions()
-    const created = await createButlerSession(previous)
-    if (!created || !created.ok) return created || launcherState(false, 'session_create_failed')
-    const delay = typeof options.wait === 'function' ? options.wait : wait
-    await delay(timingOption(options.graceMs, SUMMON_SEND_GRACE_MS))
-    return created
-  } catch (err) {
-    return launcherState(false, 'session_create_failed', err)
-  } finally {
-    launcherBusy = false
-  }
-}
-
-/** Resolve the chosen Butler chat, inject a real agent turn, then own the visual. */
-async function summonButler(text, options = {}) {
-  const message = asText(text)
-  if (!message) return { ok: false, reason: 'empty', destination: SUMMON_EXISTING }
-  const destination = options.destination === SUMMON_NEW
-    || (options.destination === undefined && getSummonDestination() === SUMMON_NEW)
-    ? SUMMON_NEW : SUMMON_EXISTING
-  const opened = destination === SUMMON_NEW
-    ? await openFreshButlerSession(options)
-    : await openButlerSession()
-  if (!opened || !opened.ok) {
-    return {
-      ok: false,
-      reason: (opened && opened.reason) || 'no_session',
-      error: opened && opened.error,
-      destination,
-      phase: 'session'
-    }
-  }
-  const target = asText(opened.target) || asText(launcherTargetId)
-  if (!target) return { ok: false, reason: 'no_session', destination, phase: 'session' }
-
-  const injection = await sendSummonInjection(target, message)
-  if (injection.ok) {
-    if (destination === SUMMON_NEW) {
-      // The fresh id is the whole point of this destination. Round 5 proved the
-      // gateway reports the routing key; verify it names THIS id, not the old
-      // chat the titled-create bug used to resolve.
-      const expectedKey = expectedSummonSessionKey(hostProfileName(), target)
-      const actualKey = asText(injection.session_key)
-      if (expectedKey && actualKey && actualKey !== expectedKey) {
-        return {
-          ok: false,
-          reason: 'session_key_mismatch',
-          error: null,
-          detail: `gateway routed to ${actualKey}; expected ${expectedKey}`,
-          session: target,
-          session_key: actualKey,
-          expected_session_key: expectedKey,
-          destination,
-          phase: 'send'
-        }
-      }
-    }
-    return { ...injection, destination }
-  }
-
-  // Preserve the grounded chip ladder:
-  // composer.submit('/butler <text>') reaches the slash handler, which reports
-  // honestly instead of opening a full conversation. A fresh send must never
-  // re-derive the most recent Butler chat during this fallback.
-  const fallback = await sendSummonText(target, butlerCommandText(message), {
-    ...options,
-    refresh: options.refresh !== undefined ? options.refresh : destination !== SUMMON_NEW
-  })
-  if (fallback.ok) {
-    return {
-      ...fallback,
-      session: fallback.session || target,
-      destination,
-      fallback: true,
-      injection_reason: injection.reason,
-      injection_error: injection.error,
-      injection_detail: injection.detail
-    }
-  }
-
-  // Last door, and the only one that works when the tracked chat is a draft the
-  // gateway never created: reach it over JSON-RPC, minting a real chat if none
-  // of the tracked ids exist any more.
-  const rpc = await sendSummonRpc(target, message)
-  if (rpc.ok) {
-    return { ...rpc, destination, injection_reason: injection.reason }
-  }
-  // Nothing took the turn. Report the composer ladder's outcome (it seats the
-  // text for a retry) and keep the RPC's reason beside it for the journal.
-
-  return {
-    ...fallback,
-    session: fallback.session || target,
-    destination,
-    fallback: true,
-    injection_reason: injection.reason,
-    injection_error: injection.error,
-    injection_detail: injection.detail,
-    rpc_reason: rpc.reason,
-    rpc_error: rpc.error
-  }
-}
-
-/**
- * Submit outcome for the shared summon send: owns the success toast/double and
- * the honest failure toast. On failure the caller keeps the typed text.
- *
- * The web bar was its only caller; it stays as the shared outcome seam, while
- * the pending-text path reports through its own chip helpers.
- */
-async function summonFromBar(value, options = {}) {
-  let result
-  try {
-    result = await summonButler(value, options)
-  } catch (err) {
-    result = { ok: false, reason: 'threw', error: err, seated: false, destination: getSummonDestination() }
-  }
-  if (result.ok) {
-    notifySummonSuccess(result)
-    await spawnSummonDouble()
-    return { result, clearText: true, dismiss: true }
-  }
-  notifySummonFailure(summonFailureMessage(result))
-  return { result, clearText: false, dismiss: false }
 }
 
 function LauncherButton({ compact = false }) {

@@ -75,23 +75,6 @@ def test_plugin_surfaces_unroutable_session_and_the_resolved_route() -> None:
     assert "session_key" in source
 
 
-def test_plugin_uses_the_composer_submit_send_path_with_a_honest_draft_fallback() -> None:
-    source = PLUGIN_JS.read_text(encoding="utf-8")
-
-    assert "host.composer.submit" in source
-    assert "setDraft" in source
-    assert "no_programmatic_send" in source
-
-
-def test_plugin_keeps_the_stored_destination_and_the_slash_fallback() -> None:
-    source = PLUGIN_JS.read_text(encoding="utf-8")
-
-    assert "butler.summon.destination" in source
-    assert "localStorage" in source
-    assert "/butler " in source
-    assert "Summoned → fresh Butler session" in source
-
-
 def test_plugin_has_no_pane_header_pet_visibility_hint() -> None:
     source = PLUGIN_JS.read_text(encoding="utf-8")
 
@@ -108,5 +91,4 @@ def test_plugin_posts_the_summon_send_route_with_a_session_id_and_keeps_the_fall
     assert "session_id" in source
     assert "injection_denied" in source
     assert "injection_unavailable" in source
-    assert "sendSummonText" in source
     assert "butlerCommandText" in source
